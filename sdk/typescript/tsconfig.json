@@ -1,0 +1,13 @@
+{
+  "//": "基础编译选项；ESM/CJS/test 各自 extends 并覆盖 module/outDir。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "ESNext.Disposable"],
+    "strict": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  }
+}

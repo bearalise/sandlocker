@@ -1,0 +1,26 @@
+# SandLocker Python SDK packaging.
+#
+# Design constraint: zero third-party dependencies (pure stdlib), matching the project's
+# hand-written-HTTP convention. [project.dependencies] stays empty — do not add requests/httpx.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandlocker"
+version = "0.1.0"
+description = "SandLocker microVM sandbox control-plane Python SDK (stdlib-only thin client)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SandLocker contributors" }]
+keywords = ["sandbox", "firecracker", "microvm", "code-execution"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Richardo1o1/sandlocker"
+Repository = "https://github.com/Richardo1o1/sandlocker"
+Contract = "https://github.com/Richardo1o1/sandlocker/blob/main/contracts/openapi.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]

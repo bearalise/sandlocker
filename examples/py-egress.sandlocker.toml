@@ -1,0 +1,31 @@
+# SandLocker 模板示例（M2-Q8 allow-network 构建）——真 Python + pip 依赖。
+#
+# 构建：sudo ./target/release/sl-node --build examples/py-egress.sandlocker.toml --json
+#   ① 构建沙箱 boot 进具名 netns（veth + tap + host NAT masquerade）→ RUN 步骤有**真出口**：
+#      pip 能连 PyPI 装依赖，装好的包落进模板 rootfs。
+#   ② 预烘焙沙箱**不联网**（快照干净）。
+#
+# 要点：
+#   - build_network="allow-all" 需 **root**（ip/nft/netns）——非 root 会 fail-closed 报错，不静默离线。
+#     deny（默认）仍 rootless。
+#   - 上行网卡自动探测默认路由 dev；可 --uplink <iface> 显式指定。
+#   - guest DNS 默认 1.1.1.1，可用环境变量 SL_BUILD_DNS 覆盖（NAT 会把 UDP53 出 uplink）。
+#   - 构建期无 whitelist 强制（本 PR 只做 allow-all；whitelist 真 gate 待独立 PR）。
+
+name = "py-egress"
+from = "docker://python:3.12-slim"
+
+# RUN：构建期在沙箱内顺序执行，任一非 0 即 fail-fast。此处联网装依赖。
+run = [
+  "python3 --version",
+  "pip install --no-cache-dir requests",
+  "python3 -c 'import requests; print(\"requests\", requests.__version__)'",
+]
+
+start_cmd = "sleep 86400"
+
+# 构建期真出口（对照：deny=离线；whitelist=本 PR 未强制，仍离线）。
+build_network = "allow-all"
+
+# python:slim 装依赖后偏大，给足内存避免预烘焙 OOM（默认 128M）。
+mem_mib = 512

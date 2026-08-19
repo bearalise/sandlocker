@@ -1,0 +1,87 @@
+// SandLocker 控制面 gRPC 契约（双描述占位，M1 W8）。
+//
+// D3 护栏「契约先行（OpenAPI + Protobuf 双描述）」。M1 仅实现 REST（见 openapi.yaml）；
+// 本 .proto 为 gRPC 服务端的契约占位，**服务端实现延后 M2**（避免本周引入 tonic+tokio 重架构）。
+// 字段与 REST 契约语义一致；生成代码/服务端在 M2 落地。
+syntax = "proto3";
+
+package sandlocker.v1;
+
+// 沙箱生命周期服务（M2 实现）。
+service Sandboxes {
+  rpc Create (CreateSandboxRequest) returns (Sandbox);
+  rpc Get (GetSandboxRequest) returns (SandboxMeta);
+  rpc List (ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc Delete (DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  rpc KeepAlive (KeepAliveRequest) returns (KeepAliveResult);  // M2 W2（M2-Q9）：滑 idle 窗，不越 TTL 硬顶
+  rpc Exec (ExecRequest) returns (ExecResult);
+}
+
+// 模板服务（M2 实现；M1 用 CLI `sandlocker build` 单发）。
+service Templates {
+  rpc List (ListTemplatesRequest) returns (ListTemplatesResponse);
+}
+
+message CreateSandboxRequest {
+  string template = 1;
+  uint32 cpu = 2;       // 默认 2
+  uint32 mem_mib = 3;   // 默认 512
+  int64 ttl_secs = 4;   // 默认 300（绝对硬顶）
+  int64 idle_secs = 5;  // 缺省 = ttl（空闲窗口）
+  map<string, string> env = 6;
+}
+
+message Sandbox {
+  string id = 1;
+  string state = 2;        // running
+  string machine_id = 3;
+  string template = 4;
+  uint64 total_ms = 5;
+  uint64 copy_ms = 6;
+  uint64 api_ready_ms = 7;
+  uint64 load_ms = 8;
+  uint64 resume_ms = 9;
+}
+
+message SandboxMeta {
+  string id = 1;
+  uint32 vcpus = 2;
+  uint32 mem_mib = 3;
+  int64 ttl_secs = 4;
+  int64 idle_secs = 5;
+  int64 created_at = 6;
+  int64 ttl_deadline = 7;
+  string template = 8;
+  map<string, string> labels = 9;
+}
+
+message GetSandboxRequest { string id = 1; }
+message DeleteSandboxRequest { string id = 1; }
+message DeleteSandboxResponse {}
+
+message ListSandboxesRequest {}
+message ListSandboxesResponse { repeated SandboxMeta sandboxes = 1; }
+
+message KeepAliveRequest { string id = 1; }
+message KeepAliveResult {
+  string id = 1;
+  int64 lease_deadline = 2;  // 续期后的空闲回收窗到期（unix 秒）
+  int64 ttl_deadline = 3;    // TTL 绝对硬顶到期（keepalive 不改动）
+}
+
+message ExecRequest {
+  string id = 1;
+  string cmd = 2;
+}
+message ExecResult {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+}
+
+message Template {
+  string name = 1;
+  string version = 2;
+}
+message ListTemplatesRequest {}
+message ListTemplatesResponse { repeated Template templates = 1; }

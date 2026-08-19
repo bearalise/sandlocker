@@ -1,0 +1,40 @@
+{
+  "name": "sandlocker",
+  "version": "0.1.0",
+  "description": "SandLocker TypeScript SDK — 零运行时依赖的薄 REST 客户端（对标 Python SDK / contracts/openapi.yaml）",
+  "license": "Apache-2.0",
+  "author": "SandLocker",
+  "homepage": "https://github.com/Richardo1o1/sandlocker",
+  "keywords": ["sandbox", "firecracker", "microvm", "code-execution"],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node ./scripts/fixup-cjs.mjs",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test \"dist-test/**/*.test.js\"",
+    "clean": "rm -rf dist dist-cjs dist-test"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.14.0"
+  }
+}

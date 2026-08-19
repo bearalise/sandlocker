@@ -1,0 +1,332 @@
+# SandLocker 控制面 REST 契约（v1alpha，M1 W8）。
+#
+# D3 护栏「契约先行」：本文件是权威描述，`crates/sl-node/src/api.rs` 实现与之逐一对齐，
+# W9 Python SDK 据此生成。M1 单机版仅实现下列端点子集；pause/resume/fork、鉴权、配额、
+# 端口签名 URL、gRPC 服务端属 M2+（见各端点注与 `sandlocker.proto`）。
+#
+# 传输：手写极简 HTTP/1.1（仅 Content-Length + Connection: close，不支持 chunked/keep-alive）。
+# 默认监听 127.0.0.1:7878（本地环回，无 TLS/鉴权；M3 加 mTLS + 令牌）。
+openapi: 3.0.3
+info:
+  title: SandLocker Control-Plane API
+  version: 1.0.0-alpha
+  description: >
+    SandLocker 微 VM 沙箱控制面。M1 单机一体化（`sandlocker up` = `sl-node --serve`）。
+servers:
+  - url: http://127.0.0.1:7878
+    description: 本地守护（sandlocker up）
+
+paths:
+  /v1/sandboxes:
+    post:
+      summary: 创建沙箱（走快照恢复，~130ms）
+      operationId: createSandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSandboxRequest'
+      responses:
+        '201':
+          description: 已创建并运行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sandbox'
+        '400':
+          $ref: '#/components/responses/Error'
+        '500':
+          $ref: '#/components/responses/Error'
+    get:
+      summary: 列出沙箱
+      operationId: listSandboxes
+      responses:
+        '200':
+          description: 沙箱元数据数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SandboxMeta'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      summary: 取单个沙箱元数据
+      operationId: getSandbox
+      responses:
+        '200':
+          description: 沙箱元数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SandboxMeta'
+        '404':
+          $ref: '#/components/responses/Error'
+    delete:
+      summary: 销毁沙箱（杀进程 + 清目录 + 删 store 键）
+      operationId: deleteSandbox
+      responses:
+        '204':
+          description: 已销毁
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/keepalive:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 续期（在线滑 idle lease 窗，避免空闲回收）
+      description: >
+        M2 W2（M2-Q9）：只滑动空闲回收窗，不延长 TTL 绝对硬顶——过硬顶 keepalive 救不了。
+        返回续期后的 idle lease 到期与不变的 TTL 硬顶到期（unix 秒）。
+      operationId: keepAliveSandbox
+      responses:
+        '200':
+          description: 已续期
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeepAliveResult'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/exec:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 在沙箱内执行命令（缓冲式，返 exit/stdout/stderr）
+      description: >
+        M1 缓冲式：命令跑完才返回聚合输出。流式 stdout（SSE/WebSocket）与 PTY 属 M2。
+      operationId: execInSandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecRequest'
+      responses:
+        '200':
+          description: 执行结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/files/{path}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - name: path
+        in: path
+        required: true
+        description: 沙箱内绝对路径（前导 / 可省；支持多段 a/b/c）
+        schema:
+          type: string
+    put:
+      summary: 写文件（body 原始字节 → guest base64 解码落盘）
+      description: M1 经 exec+base64 桥接，需 guest 有 base64 applet。原生大文件 fs 属 M2。
+      operationId: putFile
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '204':
+          description: 已写入
+        '500':
+          $ref: '#/components/responses/Error'
+    get:
+      summary: 读文件（guest base64 → 解码为原始字节）
+      operationId: getFile
+      responses:
+        '200':
+          description: 文件内容
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      summary: 取沙箱引导/串口日志（console.load.log）
+      operationId: getLogs
+      responses:
+        '200':
+          description: 日志文本
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/templates:
+    get:
+      summary: 列已注册模板（M1：模板=预烘焙快照）
+      operationId: listTemplates
+      responses:
+        '200':
+          description: 模板数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Template'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /v1/templates:build:
+    post:
+      summary: 构建模板（M1 未实现，返 501）
+      description: >
+        M1 单机版用 CLI `sandlocker build <file.toml>`（= `sl-node --build`）单发构建；
+        经守护的异步构建属 M2。本端点当前恒返 501。
+      operationId: buildTemplate
+      responses:
+        '501':
+          $ref: '#/components/responses/Error'
+
+components:
+  parameters:
+    SandboxId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    Error:
+      description: 错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    CreateSandboxRequest:
+      type: object
+      required: [template]
+      properties:
+        template:
+          type: string
+          description: 已注册模板名（经 template/<name>/latest 解析到目录）
+        cpu:
+          type: integer
+          default: 2
+        mem:
+          type: integer
+          description: 内存 MiB
+          default: 512
+        ttl:
+          type: integer
+          description: 绝对存活硬顶（秒）
+          default: 300
+        idle:
+          type: integer
+          description: 空闲回收窗口（秒，缺省 = ttl）
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: 注入为沙箱 labels/元数据
+    Sandbox:
+      type: object
+      properties:
+        id:
+          type: string
+        state:
+          type: string
+          example: running
+        machine_id:
+          type: string
+        template:
+          type: string
+        total_ms:
+          type: integer
+        copy_ms:
+          type: integer
+        api_ready_ms:
+          type: integer
+        load_ms:
+          type: integer
+        resume_ms:
+          type: integer
+    SandboxMeta:
+      type: object
+      properties:
+        id:
+          type: string
+        vcpus:
+          type: integer
+        mem_mib:
+          type: integer
+        ttl_secs:
+          type: integer
+        idle_secs:
+          type: integer
+        created_at:
+          type: integer
+        ttl_deadline:
+          type: integer
+        template:
+          type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+    ExecRequest:
+      type: object
+      required: [cmd]
+      properties:
+        cmd:
+          type: string
+          description: 传给 guest sh -c 的命令行
+    ExecResult:
+      type: object
+      properties:
+        exit_code:
+          type: integer
+        stdout:
+          type: string
+        stderr:
+          type: string
+    KeepAliveResult:
+      type: object
+      properties:
+        id:
+          type: string
+        lease_deadline:
+          type: integer
+          description: 续期后的空闲回收窗到期（unix 秒）
+        ttl_deadline:
+          type: integer
+          description: TTL 绝对硬顶到期（unix 秒，keepalive 不改动；可为 null）
+          nullable: true
+    Template:
+      type: object
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+          description: 内容寻址版本（构建输入哈希派生）
+    Error:
+      type: object
+      properties:
+        error:
+          type: string

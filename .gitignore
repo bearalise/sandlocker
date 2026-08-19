@@ -1,0 +1,40 @@
+# Rust
+target/
+
+# Go
+/bin/
+*.test
+*.out
+
+# 构建产物（rootfs/内核/快照等本地工件）
+/build/
+dist/
+**/dist-test
+node_modules/
+# mdBook 文档站构建产物（book.toml src=docs → 输出 ./book）
+/book/
+*.img
+*.ext4
+*.log
+
+# 本地免 sudo 构建工具链（scripts/build-kernel.sh 回退用）
+/.toolchain/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Python（SDK / 场景脚本产物）
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/lib/
+.pytest_cache/
+
+# 密钥
+.env
+.env.*

@@ -1,0 +1,17 @@
+# mdBook site config. Source is docs/; build output goes to ./book (gitignored).
+# Preview: mdbook serve --open ; build: mdbook build ; CI publish: .github/workflows/docs.yml.
+[book]
+title = "SandLocker"
+description = "A secure code-execution sandbox built on Firecracker microVMs"
+authors = ["SandLocker contributors"]
+language = "en"
+src = "docs"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/Richardo1o1/sandlocker"
+edit-url-template = "https://github.com/Richardo1o1/sandlocker/edit/main/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

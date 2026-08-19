@@ -1,0 +1,13 @@
+[package]
+name = "sl-envd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sl-envd"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+sl-proto = { path = "../sl-proto" }

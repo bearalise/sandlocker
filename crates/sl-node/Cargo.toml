@@ -1,0 +1,27 @@
+[package]
+name = "sl-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sl-node"
+path = "src/main.rs"
+
+[dependencies]
+sl-proto = { path = "../sl-proto" }
+sl-store = { path = "../sl-store" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# W6 模板构建（仅宿主 builder 用，不进 musl guest sl-envd）：
+#   toml —— sandlocker.toml DSL 解析；sha2 —— 内容寻址；ed25519-dalek —— 产物分离签名。
+toml = "0.8"
+sha2 = "0.10"
+ed25519-dalek = "2"
+# M2 W3 OCI 镜像当 rootfs 来源（M2-Q12 / ADR-18 / D5，仅宿主 builder 用，不进 guest sl-envd）：
+#   ureq —— 同步 HTTP + 内置 rustls（registry v2 拉取，无 tokio，守全同步哲学；拒 oci-client 异步链）；
+#   flate2 —— gzip 层解压（默认 miniz_oxide 纯 Rust 后端，无 C）；tar —— tar 层展平（whiteout/符号链）。
+ureq = { version = "2", features = ["tls"] }
+flate2 = "1"
+tar = "0.4"

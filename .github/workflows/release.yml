@@ -1,0 +1,65 @@
+# release — v0.x 发布流水线（tag 触发）。
+#
+# 供应链（PRD 8.2）：版本化产物 + SHA256 校验 + CycloneDX SBOM（syft）+ cosign keyless 签名。
+# cosign keyless 用 GitHub OIDC 签名（无需存储私钥；证书绑定本仓库 workflow 身份，
+# 可用 `cosign verify-blob --certificate-identity ... --certificate-oidc-issuer ...` 验签）。
+#
+# 触发：推送 `v*` tag（如 `git tag v0.1.0 && git push origin v0.1.0`）。
+# 注：本流水线的签名与 Release 步依赖 CI 的 tag + OIDC，未在本地端到端验证（见 docs/RELEASING.md）。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 创建 Release
+  id-token: write   # cosign keyless（OIDC）
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 工具链（含 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: 组装产物（构建 + SHA256SUMS）
+        run: scripts/release.sh
+
+      - name: 生成 CycloneDX SBOM（syft）
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/sbom.cdx.json
+
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: cosign keyless 签名（SHA256SUMS + SBOM）
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cd dist
+          cosign sign-blob --yes SHA256SUMS         --output-signature SHA256SUMS.sig         --output-certificate SHA256SUMS.pem
+          cosign sign-blob --yes sbom.cdx.json      --output-signature sbom.cdx.json.sig      --output-certificate sbom.cdx.json.pem
+
+      - name: 创建 GitHub Release（附产物 + 校验 + SBOM + 签名）
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/sl-node
+            dist/sandlocker
+            dist/sl-envd
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
+            dist/sbom.cdx.json
+            dist/sbom.cdx.json.sig
+            dist/sbom.cdx.json.pem

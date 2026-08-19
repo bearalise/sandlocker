@@ -1,0 +1,15 @@
+[package]
+name = "sandlocker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 用户面 CLI（PRD 7.6）——纯 REST 客户端，不依赖 sl-node 内部实现。
+# `up`/`build` 通过定位同目录的 `sl-node` 兄弟二进制转发；run/ps/exec/logs/snapshot 走 HTTP。
+[[bin]]
+name = "sandlocker"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

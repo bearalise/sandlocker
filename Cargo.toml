@@ -1,0 +1,36 @@
+# SandLocker workspace — the runtime layer is Rust (ADR-3).
+# Crates: sl-proto (vsock frames) / sl-envd (guest PID 1) / sl-node (host Firecracker backend) /
+#         sl-store (metadata) / sandlocker (CLI).
+[workspace]
+resolver = "2"
+members = [
+    "crates/sl-proto",
+    "crates/sl-envd",
+    "crates/sl-node",
+    "crates/sl-store",
+    "crates/sandlocker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A secure code-execution sandbox built on Firecracker microVMs — open source, self-host first."
+repository = "https://github.com/Richardo1o1/sandlocker"
+homepage = "https://github.com/Richardo1o1/sandlocker"
+authors = ["SandLocker contributors"]
+keywords = ["sandbox", "firecracker", "microvm", "code-execution", "isolation"]
+categories = ["virtualization", "command-line-utilities"]
+
+[workspace.dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# sl-envd 走 musl 静态链接（<10MB 目标，ADR-18/6.2）；体积优先
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

@@ -1,0 +1,41 @@
+# SandLocker 模板 DSL 示例（M1 W6 / ADR-19 build-as-sandbox）
+#
+# 构建：sl-node --build examples/hello.sandlocker.toml [--json] [--store DIR]
+#   ① 构建沙箱：boot 可写 rootfs 副本 → 注入 COPY → 顺序跑 RUN（写落盘持久化）→ sync 关机。
+#   ② 模板沙箱：新鲜 boot 已构建 rootfs → 到 D5 预烘焙点（start_cmd 已拉起、应用未跑）→ pause → 快照。
+# 产物：build/templates/hello/<version>/{rootfs.ext4,vmstate,mem,manifest.json,manifest.sig}
+#   + 注册进 sl-store（template/hello/<version> 存 manifest，template/hello/latest 存版本指针）。
+# 内容寻址（sha256 over rootfs||vmstate||mem）+ ed25519 分离签名（~/.sandlocker/signing.key）。
+#
+# 注意 TOML 语义：所有顶层标量/数组键必须写在任何 [table]（如 [env]）之前——
+# 一旦出现 [env] 表头，其后的键都归属该表。故 [env] 放在文件末尾。
+
+name = "hello"
+# version 省略 → 由构建输入哈希派生（ADR-16：模板 × 内核 × VMM），产物内容寻址仍记入 manifest。
+# from 省略 → 走基座 rootfs（--rootfs，默认 build/rootfs/rootfs.ext4）。
+
+workdir = "/app"
+
+# RUN：构建期在沙箱内顺序执行（/bin/sh -c），任一非 0 退出即 fail-fast。
+run = [
+  "mkdir -p /app",
+  "echo \"$GREETING\" > /app/greeting.txt",
+  "date -u > /app/built-at.txt || true",
+]
+
+# start_cmd（ADR-18：唯一自动拉起的入口，预烘焙点前 setsid 后台起）。
+# 注意：本周 start_cmd 经 `setsid sh -c '<cmd>'` 拉起，暂不支持内含单引号。
+start_cmd = "sleep 86400"
+
+# build_network：deny（默认）= 构建期真离线，端到端可跑；allow-all/whitelist 需 netns（真出口待 jailer-netns）。
+build_network = "deny"
+
+# 构建/预烘焙 microVM 规格（缺省 1 vCPU / 128 MiB）。大镜像（如 OCI 的 python/node）boot 到预烘焙点
+# 易 128M OOM，按需调高即可（vcpu 1..=32，mem_mib ≥128）。改这两项会换 build_id（快照内容随之变）。
+# vcpu = 1
+# mem_mib = 128
+
+# ADR-18：ENV/WORKDIR/USER 于构建期物化进 /etc/sl-envd/env，恢复后由 sl-envd 施加。
+[env]
+GREETING = "hello from sandlocker"
+LANG = "C.UTF-8"

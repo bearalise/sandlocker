@@ -1,0 +1,404 @@
+# 基准 CI（PRD 13 章风险表：M0 即建立，每 PR 跑冷启动/恢复/密度基准回归）
+#
+# 分层（M0 W1 决策：runner 要求分层，64C/128G 仅密度需要）：
+#   validate      — PR 触发，托管 runner：脚本语法检查 + 内核可构建性（带缓存）
+#   bench-light   — PR 触发，托管 runner（ubuntu-latest 自带 /dev/kvm）：
+#                   冷启动/销毁对账等轻量基准（W4 落地 bench-*.sh 后自动纳入）
+#   bench-density — 仅 schedule（每周）+ 手动触发，自有 bare-metal runner（64C/128G）：
+#                   密度实测；runner 缺席不会阻塞 PR（按需租用后手动 dispatch）
+name: bench
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 2 * * 1'   # 每周一 02:23 UTC（密度回归，runner 在册时才有效）
+  workflow_dispatch:
+
+jobs:
+  # 特权集成（需 root：device-mapper / nftables / netns）：
+  #   ① dm-thin 探针（D2 前置，M1 W1）——托管 runner 能否 device-mapper thin provisioning。
+  #   ② Q5 销毁对账（M1 W3）——sl-node dmthin 存储管理器：base origin + per-sandbox thin snapshot，
+  #      CoW 正确（写不污染 base）+ 销毁释放独有块无孤儿。
+  #   ③ Q7 nftables 策略对账（M1 W5）——sl-node nftfw 后端：per-sandbox table 默认 drop +
+  #      IP/端口白名单，无策略拒绝 / 加 allow 放行 / 销毁删表无残留，`nft list` 可审计。
+  #   ④ M2-Q1 起步：live 出口门禁对账（M2 W1）——sl-node netlive：具名 netns + veth + NAT 出口
+  #      + tap 拓扑，门禁默认 drop / 加 allow 放行 / NAT masquerade 已铺 / 销毁无残留。
+  dmthin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 探测 dm-thin 可用性（机制，sudo）
+        run: sudo bash scripts/verify-dmthin.sh
+      - name: 安装 nftables（Q7 需，ip/iproute2 托管 runner 自带）
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+      - name: 构建 sl-node
+        run: cargo build -p sl-node --release
+      - name: Q5 销毁对账（sl-node 存储管理器，root 直呼）
+        run: sudo ./target/release/sl-node --dmthin-reconcile --cycles 5 --json
+      - name: Q7 nftables 策略对账（sl-node nftfw 后端，root 直呼）
+        run: sudo ./target/release/sl-node --nftfw-reconcile --json
+      - name: M2-Q1 起步 live 出口门禁对账（sl-node netlive，root 直呼）
+        run: |
+          out=$(sudo ./target/release/sl-node --net-gate-reconcile --json)
+          echo "$out"
+          echo "$out" | grep -q '"metric":"net_gate"' || { echo "缺 net_gate 指标"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "net_gate 未过"; exit 1; }
+
+  # M2 W2 方案 A：真 microVM live e2e（root + nft + /dev/kvm 同 job 齐备）——
+  #   现有 job 无一同时具备 root+nft+ip+KVM（dmthin 有 root+nft 但不起 VM；bench-light 有 KVM 但 rootless）。
+  #   本 job 冷启动一台**真 microVM** 进 per-instance 具名 netns，证其真实出口被 forward-hook 门禁
+  #   deny 默认 / add_allow 放行（证据=nft forward 链 drop/accept 计数器），审计门禁+NAT，销毁无残留；
+  #   再跑 bench-net-timing.sh **root/live 档**验真实非 0 margin。KVM 缺失则 skip（不误报红）。
+  net-live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 nftables + iproute2（live 门禁 / netns / NAT 需）
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+      - name: 安装内核构建依赖
+        run: sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target，sl-envd 静态）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态）
+        # 必须在 build-rootfs.sh 之前：该脚本把 sl-envd 静态二进制叠加为 /sbin/sl-envd，缺失即报错退 1。
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs（Alpine busybox，含 nc/ip）
+        run: scripts/build-rootfs.sh
+      - name: M2-Q1 真 VM live 出口门禁对账（--net-live-reconcile，root+KVM+nft）
+        # 冷启动真 microVM 进具名 netns → forward-hook 门禁 resume 前 ensure（deny 默认）→ guest 出口
+        # 无 allow 被拒 / add_allow 后放行 → 审计（policy drop + 放行元素 + NAT masquerade）→ 销毁无残留。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 M2-Q1 真 VM live 门禁对账"
+            exit 0
+          fi
+          out=$(sudo ./target/release/sl-node --net-live-reconcile build/rootfs --json)
+          echo "$out"
+          echo "$out" | grep -q '"metric":"net_live"' || { echo "::error::缺 net_live 指标"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::net_live 真 VM 对账未 pass"; exit 1; }
+          echo "M2-Q1 PASS：真 microVM 出口 deny 默认 / add_allow 放行 / 审计 / 销毁无残留"
+      - name: Q4 网络时序探针 root/live 档（真门禁 ensure，margin 真实非 0）
+        # 复用 bench-net-timing.sh：root+nft+ip 齐时自动走 live 档（--net-live），断言每轮
+        # policy_before_resume=true 且 margin_us_min>0（真门禁真钉在 resume 前）。KVM 缺失则 skip。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 Q4 时序 live 档"
+            exit 0
+          fi
+          # -E 保留 HOME（$HOME/.cargo/env 可源）；显式传 PATH 绕过 sudo secure_path（cargo 在 ~/.cargo/bin）。
+          out=$(sudo -E env "PATH=$PATH" scripts/bench/bench-net-timing.sh)
+          echo "$out"
+          echo "$out" | grep -q '"mode":"root-live"' || { echo "::error::时序探针未走 root-live 档"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::Q4 时序 live 档未 pass"; exit 1; }
+          echo "Q4 PASS：root/live 时序探针 margin 真实非 0 且策略先于 resume"
+
+  # M2-Q8：allow-network 构建（构建期真 egress）——root + KVM + network。
+  #   allow-all 模板 --build：构建沙箱 boot 进具名 netns（veth+tap+host NAT）→ RUN 有真出口。
+  #   证据 = guest 内 `nslookup one.one.one.one` 经 resolv.conf=1.1.1.1 解析成功（UDP53 经 NAT 出 uplink），
+  #   build pass:true，且构建后 netns 零残留。KVM/网络缺失则 skip 不误报。
+  build-egress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 nftables + iproute2（netns / NAT 需）
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2
+      - name: 安装内核构建依赖
+        run: sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target，sl-envd 静态）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态）
+        # sl-envd 须在 build-rootfs.sh 之前（脚本把它叠加为 /sbin/sl-envd）。
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs（Alpine busybox，含 nslookup）
+        run: scripts/build-rootfs.sh
+      - name: M2-Q8 allow-all 构建真出口（verify-build-egress.sh，root+KVM+network）
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 M2-Q8 构建 egress"
+            exit 0
+          fi
+          out=$(sudo scripts/verify-build-egress.sh)
+          echo "$out"
+          echo "$out" | grep -q '"skipped":true' && { echo "::warning::build-egress skipped: $out"; exit 0; }
+          echo "$out" | grep -q '"metric":"build_egress"' || { echo "::error::缺 build_egress 指标"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::build-egress 未 pass"; exit 1; }
+          echo "M2-Q8 PASS：allow-all 构建真出口生效 + netns 零残留"
+
+  # M2 W3：OCI 镜像当 rootfs 来源（M2-Q12 / ADR-18 / D5）——三步取证：
+  #   ① 远程 registry：--oci-pull docker://python:3.12-slim → 拉取 + digest 校验 + flatten + bake ext4。
+  #   ② 本地 tarball：docker save alpine → --oci-pull docker-archive:...（证 docker save 路径，
+  #      不碰 docker daemon 存储，纯解包）。
+  #   ③ boot 起 Python：from=docker://python:3.12-slim 的模板 --build，构建期在真 microVM 内
+  #      跑 `python3 --version`（fail-fast）→ pass:true 即证 OCI 基座可 boot 且 Python 可用（M2-Q12 判据）。
+  #   MVP：匿名拉公有镜像 + 单架构 x86_64；私有认证 / multi-arch 为 stretch。KVM 缺失则步骤③ skip。
+  oci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装内核构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target，sl-envd 静态供 bake）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核（boot 证明需）
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态，OCI bake 装入 /sbin/sl-envd）
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: M2-Q12 ① 远程拉取（--oci-pull docker://python:3.12-slim）
+        # 匿名拉官方库镜像 → manifest/config/layers digest 校验 → flatten（whiteout/opaque）→ bake ext4。
+        run: |
+          out=$(./target/release/sl-node --oci-pull docker://python:3.12-slim --json)
+          echo "$out"
+          echo "$out" | grep -q '"metric":"oci_pull"' || { echo "::error::缺 oci_pull 指标"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::远程 OCI 拉取未 pass"; exit 1; }
+          echo "M2-Q12 ① PASS：远程 python:3.12-slim 拉取 + digest 校验 + ext4 bake"
+      - name: M2-Q12 ② 本地 tarball（docker save → docker-archive）
+        # runner 自带 docker：docker save 产出 classic tarball（未压缩层），验 load_archive + flatten
+        # 自适应（不碰 docker daemon 存储 / socket，纯解包）。
+        run: |
+          docker pull alpine:latest
+          docker save alpine:latest -o /tmp/alpine.tar
+          out=$(./target/release/sl-node --oci-pull docker-archive:/tmp/alpine.tar --oci-out build/oci-out/alpine.ext4 --json)
+          echo "$out"
+          echo "$out" | grep -q '"metric":"oci_pull"' || { echo "::error::缺 oci_pull 指标（archive）"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::本地 tarball 解包未 pass"; exit 1; }
+          echo "M2-Q12 ② PASS：docker save tarball → docker-archive 解包 + ext4 bake"
+      - name: M2-Q12 ③ boot 起 Python（from=OCI 的模板 --build，真 microVM 内跑 python3）
+        # 构建期在真 microVM 内跑 `python3 --version`（run，fail-fast）→ pass:true 即证 OCI 基座
+        # boot 成功且 Python 可用；再验预烘焙快照产物齐全（可恢复）。KVM 缺失则 skip 不误报。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 M2-Q12 ③ boot 起 Python"
+            exit 0
+          fi
+          cat > /tmp/ocipy.sandlocker.toml <<'TOML'
+          name = "ocipy"
+          from = "docker://python:3.12-slim"
+          workdir = "/app"
+          run = ["python3 --version"]
+          build_network = "deny"
+          TOML
+          out=$(./target/release/sl-node --build /tmp/ocipy.sandlocker.toml --json)
+          echo "$out"
+          echo "$out" | grep -q '"pass":true' || { echo "::error::M2-Q12 ③ OCI 模板构建（boot 起 Python）未 pass"; exit 1; }
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          d="build/templates/ocipy/$ver"
+          for f in rootfs.ext4 vmstate mem manifest.json manifest.sig; do
+            [ -s "$d/$f" ] || { echo "::error::缺少产物 $d/$f"; exit 1; }
+          done
+          echo "M2-Q12 ③ PASS：OCI python 基座 boot 成功、真 VM 内 python3 --version 通过、预烘焙快照齐全"
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 脚本语法检查
+        run: |
+          set -e
+          for f in scripts/*.sh scripts/bench/*.sh; do bash -n "$f"; done
+      - name: Rust 工具链（含 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 构建工作区 + sl-envd 静态（musl）
+        run: |
+          cargo build --workspace --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 单测（sl-proto 契约 / sl-node fcapi+api 路由 / sl-store 窄接口 / sandlocker CLI）
+        run: cargo test -p sl-proto -p sl-node -p sl-store -p sandlocker
+      - name: Python SDK 单测（假 daemon + 契约对账，无需 KVM）
+        # W9：SDK 纯 stdlib，起进程内假 daemon 模拟 openapi 路由，验请求构造/响应解析 +
+        # ROUTES 与 openapi.yaml 对齐（契约漂移防线，替代 codegen）。托管 runner 自带 python3。
+        run: python3 -m unittest discover -s sdk/python/tests
+      - name: Node 工具链（TS SDK 单测/构建）
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: TypeScript SDK 单测 + 构建（假 daemon + 契约对账 + dual ESM/CJS，无需 KVM）
+        # 零运行时依赖；node:test 进程内假 daemon 验 SDK 面 + ROUTES 契约对账；npm run build 验双模块产物。
+        run: |
+          npm --prefix sdk/typescript ci
+          npm --prefix sdk/typescript test
+          npm --prefix sdk/typescript run build
+      - name: 缓存内核源码与产物
+        uses: actions/cache@v4
+        with:
+          path: build/kernel
+          key: kernel-${{ hashFiles('scripts/build-kernel.sh', 'scripts/kernel-fragment.config') }}
+      - name: 安装构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+
+  bench-light:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装内核构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核（缓存命中则秒过）
+        run: scripts/build-kernel.sh
+      - name: 运行轻量基准（冷启动分段 / 僵尸回收 / 销毁对账 / 克隆熵回归 / 网络时序 / 创建时延；密度不在此层）
+        # bench-*.sh 自身会 cargo build + 造 rootfs；托管 runner 通常自带 /dev/kvm，
+        # 若该 runner 无 KVM 则跳过（run-all 的 check-env 会硬失败），不误报红叉。
+        # run-all.sh 用 set -o pipefail，任一 bench 退非 0 → 该步失败（安全红线经此传导）。
+        # 其中 bench-clone-entropy.sh 是安全回归红线（Q3/Q4）：两克隆身份/熵相同即退非 0 → CI 红。
+        # bench-net-timing.sh 是 Q4 时序红线（W10）：任一轮 policy_before_resume=false 即退非 0 → CI 红。
+        # bench-restore-create.sh 是 Q2 门禁（W7）：预烘焙恢复创建 P50 > 500ms 即退非 0 → CI 红。
+        run: |
+          if [ -w /dev/kvm ]; then
+            scripts/bench/run-all.sh
+          else
+            echo "::warning::runner 无 /dev/kvm，跳过基准（KVM 是硬要求）"
+          fi
+      - name: Q6 模板构建冒烟（sl-node --build，rootless）
+        # ADR-19 build-as-sandbox 端到端：sandlocker.toml → 跑 RUN → 预烘焙快照 + 内容寻址 + 签名入库。
+        # 复用上一步 bench 造好的基座 rootfs（build/rootfs/rootfs.ext4）；deny 档真离线，无需 root/网络。
+        # 断言 --json 输出 pass:true，且产物三件套 + manifest + sig 齐全。KVM 缺失则 skip 不误报。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 Q6 构建冒烟"
+            exit 0
+          fi
+          cargo build -p sl-node --release
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          echo "$out"
+          echo "$out" | grep -q '"pass":true' || { echo "::error::Q6 构建未 pass"; exit 1; }
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          d="build/templates/hello/$ver"
+          for f in rootfs.ext4 vmstate mem manifest.json manifest.sig; do
+            [ -s "$d/$f" ] || { echo "::error::缺少产物 $d/$f"; exit 1; }
+          done
+          echo "Q6 PASS：$d 产物齐全（含签名）"
+      - name: Q9 生命周期对账（sl-node --orch-reconcile，rootless）
+        # W7：进程内 orchestrator 生命周期回收——create/keepalive/idle 到期/TTL 硬顶/手动 destroy
+        # 每步零残留（进程/目录/sockets/store 键）+ 并发双克隆隔离（machine-id 互异）+ 模板 rootfs
+        # 不可变（rootless mount-ns bind 遮蔽，FC 从不写模板）。走恢复路径，免 root。
+        # 先 --build 造预烘焙模板（复用上面 bench 造的基座 rootfs），再 --orch-reconcile。KVM 缺失则 skip。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 Q9 生命周期对账"
+            exit 0
+          fi
+          cargo build -p sl-node --release
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::Q9 未取到模板 version"; exit 1; }
+          tpl="build/templates/hello/$ver"
+          rout=$(./target/release/sl-node --orch-reconcile "$tpl" --json)
+          echo "$rout"
+          echo "$rout" | grep -q '"pass":true' || { echo "::error::Q9 生命周期对账未 pass"; exit 1; }
+          echo "Q9 PASS：生命周期回收零残留 + 并发隔离 + 模板不可变"
+      - name: W8 API 端到端（sandlocker up + CLI 全子命令，rootless）
+        # W8：REST 守护 + 用户面 CLI 端到端——build→up→run/exec/files/logs/ps/destroy + 零残留 +
+        # 退出码透传 + 契约（openapi.yaml）逐端点实测。复用上面 bench 造的基座 rootfs，走恢复路径免 root。
+        # KVM 缺失则 skip 不误报（脚本内自判，输出 skipped JSON 退 0）。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 W8 API 端到端"
+            exit 0
+          fi
+          cargo build --workspace --release
+          out=$(scripts/verify-api-e2e.sh)
+          echo "$out"
+          echo "$out" | grep -q '"pass":true' || { echo "::error::W8 API 端到端未 pass"; exit 1; }
+          echo "W8 PASS：REST + CLI 全子命令端到端 + 零残留"
+      - name: W9 SDK 端到端（US-1/US-4/US-7，Python SDK，rootless）
+        # W9：Python SDK（stdlib）跑三场景——US-1 create→run→取产物→空闲自毁 /
+        # US-4 模板秒级就绪 / US-7 with 跑测试→退出码透传→跑完即焚。复用上面 bench 造的基座
+        # rootfs，走恢复路径免 root。KVM/python3 缺失则 skip 不误报（脚本内自判，退 0）。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 W9 SDK 端到端"
+            exit 0
+          fi
+          cargo build --workspace --release
+          out=$(scripts/verify-sdk-e2e.sh)
+          echo "$out"
+          echo "$out" | grep -q '"pass":true' || { echo "::error::W9 SDK 端到端未 pass"; exit 1; }
+          echo "W9 PASS：US-1/US-4/US-7 三场景端到端 + 零残留"
+      - name: Node 工具链（TS SDK e2e）
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: TS SDK 端到端（US-1/US-4/US-7，TypeScript SDK，rootless）
+        # 对标 W9：TS SDK 跑同三场景（US-1 空闲自毁 / US-4 模板秒级就绪 / US-7 await using 跑完即焚 +
+        # 退出码透传）。复用上面 bench 造的基座 rootfs，走恢复路径免 root。KVM/node 缺失则 skip 不误报。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 TS SDK 端到端"
+            exit 0
+          fi
+          cargo build --workspace --release
+          out=$(scripts/verify-sdk-ts-e2e.sh)
+          echo "$out"
+          echo "$out" | grep -q '"skipped":true' && { echo "::warning::TS SDK e2e skipped: $out"; exit 0; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::TS SDK 端到端未 pass"; exit 1; }
+          echo "TS SDK PASS：US-1/US-4/US-7 三场景端到端 + 零残留"
+      - name: 上传基准结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-light-${{ github.sha }}
+          path: build/bench/results.jsonl
+          if-no-files-found: ignore
+
+  bench-density:
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64, bare-metal]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装内核构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 运行全部基准（含密度，BENCH_DENSITY 开启）
+        # 64C/128G 裸金属才有可比密度数据（计划 §8.1）；默认规格实例数 DENSITY_MAX 调高
+        env:
+          BENCH_DENSITY: "1"
+          DENSITY_MAX: "600"
+        run: scripts/bench/run-all.sh
+      - name: 上传基准结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-density-${{ github.sha }}
+          path: build/bench/results.jsonl
+          if-no-files-found: ignore

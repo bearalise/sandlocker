@@ -1,0 +1,11 @@
+[package]
+name = "sl-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 窄 store 接口（D3 护栏②）：Get/Put/Delete/List/Txn(CAS)/Lease/Watch。
+# M1 用 SQLite 实现；接口按 etcd 形状收敛，M3 换 etcd 时改动有界。
+[dependencies]
+# bundled：编译内置 sqlite，不依赖系统 libsqlite3，延续运行时/控制面极简依赖风格
+rusqlite = { version = "0.32", features = ["bundled"] }

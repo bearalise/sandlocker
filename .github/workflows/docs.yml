@@ -1,0 +1,57 @@
+# docs — mdBook 文档站。
+#
+# build：每次 push main（改 docs/** 或 book.toml）跑，验证 mdbook 能构建（CI 防护）。
+# deploy：**仅手动触发**（workflow_dispatch）——GitHub Pages 免费档只对公开仓库开放，
+#   本仓库私有时 deploy 会失败，故默认不随 push 跑（显示 skipped，不留红叉）。
+# 将来把仓库设为公开（或升级 Pro/Team）后：Settings → Pages → Source 选 "GitHub Actions"，
+#   再在 Actions → docs → Run workflow 手动发一次；之后可去掉 deploy 的 if 恢复自动发布。
+# 本地预览无需 Pages：mdbook serve --open。
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时刻只跑一个部署；进行中的让新提交排队而非取消（保证最终一致）
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+      - name: 构建（mdbook build → ./book）
+        run: mdbook build
+      - name: 上传 Pages 产物
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  deploy:
+    needs: build
+    # 仅手动触发时部署（私有仓库无法用 Pages；公开/升级后可去掉此行恢复自动发布）
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
