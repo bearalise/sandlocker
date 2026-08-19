@@ -1,0 +1,9 @@
+{
+  "name": "sandlocker-examples-ts",
+  "private": true,
+  "type": "module",
+  "description": "SandLocker TypeScript SDK 示例（消费已发布的 npm 包 sandlocker）",
+  "dependencies": {
+    "sandlocker": "^0.1.1"
+  }
+}

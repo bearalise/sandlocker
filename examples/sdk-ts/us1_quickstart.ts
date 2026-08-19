@@ -7,7 +7,7 @@
 // 文件读写依赖 guest base64 applet；设 SL_SKIP_FILES=1 跳过该段（e2e 探测缺失时用）。
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
-import { Sandbox } from "../../sdk/typescript/dist/esm/index.js";
+import { Sandbox } from "sandlocker";
 
 const ADDR = process.env.SANDLOCKER_ADDR ?? "127.0.0.1:7878";
 const SKIP_FILES = process.env.SL_SKIP_FILES === "1";

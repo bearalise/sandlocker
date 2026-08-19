@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify-sdk-ts-e2e.sh — TypeScript SDK 端到端自测（US-1 / US-4 / US-7，对标 verify-sdk-e2e.sh）。
 #
-# 流程：① 构建 TS SDK（dist）→ ② --build 造预烘焙模板 → ③ 后台起 `sl-node --serve`（隔离 run-root）
+# 流程：① 安装 examples 依赖（npm 包 sandlocker）→ ② --build 造预烘焙模板 → ③ 后台起 `sl-node --serve`（隔离 run-root）
 #       → 轮询就绪 → ④ 依次跑 examples/sdk-ts/us{1,4,7}_*.ts（纯 SDK 调用）→ ⑤ 断言零残留。
 #
 # 门禁：node(≥22.6，需类型剥离)/npm/KVM/环境缺失 → 输出 skip JSON、退 0（不阻塞 CI）；
@@ -19,7 +19,7 @@ SL_NODE="$REPO_ROOT/target/release/sl-node"
 KERNEL="$REPO_ROOT/build/kernel/vmlinux"
 ROOTFS="$REPO_ROOT/build/rootfs/rootfs.ext4"
 FC="$REPO_ROOT/build/firecracker/firecracker"
-TS_DIR="$REPO_ROOT/sdk/typescript"
+EX_DIR="$REPO_ROOT/examples/sdk-ts"
 
 command -v node >/dev/null 2>&1 || { echo '{"metric":"sdk_ts_e2e","skipped":true,"reason":"no-node"}'; exit 0; }
 command -v npm  >/dev/null 2>&1 || { echo '{"metric":"sdk_ts_e2e","skipped":true,"reason":"no-npm"}'; exit 0; }
@@ -38,9 +38,9 @@ SL_CLI="$REPO_ROOT/target/release/sandlocker"
 
 fail() { echo "[sdk-ts-e2e] FAIL: $*" >&2; echo '{"metric":"sdk_ts_e2e","pass":false}'; exit 1; }
 
-# 构建 TS SDK（examples 从 dist/esm 导入）。
-echo "[sdk-ts-e2e] 构建 TS SDK ..." >&2
-( cd "$TS_DIR" && (npm ci >&2 2>&1 || npm install >&2 2>&1) && npm run build >&2 ) || fail "TS SDK 构建失败"
+# 安装 examples 依赖（示例从已发布的 npm 包 sandlocker 导入）。
+echo "[sdk-ts-e2e] 安装 examples/sdk-ts 依赖 ..." >&2
+( cd "$EX_DIR" && (npm ci >&2 2>&1 || npm install >&2 2>&1) ) || fail "examples 依赖安装失败"
 
 PORT="${SDK_TS_PORT:-17980}"
 ADDR="127.0.0.1:$PORT"
@@ -86,7 +86,7 @@ else
   echo "::warning::guest 无 base64 applet，US-1 跳过 SDK 文件 API" >&2
 fi
 
-# ③ 三场景（.ts 直跑，内核类型剥离；示例从 dist/esm 导入 SDK）
+# ③ 三场景（.ts 直跑，内核类型剥离；示例从 npm 包 sandlocker 导入 SDK）
 run_us() {
   local name="$1" script="$2"
   echo "[sdk-ts-e2e] 跑 $name ..." >&2
@@ -100,10 +100,10 @@ run_us US-1 us1_quickstart.ts
 run_us US-4 us4_template.ts
 run_us US-7 us7_ci_ephemeral.ts
 
-# ③-KA keepalive 续期冒烟（纯 JS inline，导入 dist/esm，免类型剥离）
+# ③-KA keepalive 续期冒烟（纯 JS inline，导入已安装的 npm 包，免类型剥离）
 echo "[sdk-ts-e2e] 跑 keepalive 续期冒烟 ..." >&2
 node --input-type=module -e "
-import { Sandbox } from '$TS_DIR/dist/esm/index.js';
+import { Sandbox } from '$EX_DIR/node_modules/sandlocker/dist/esm/index.js';
 import assert from 'node:assert/strict';
 const sbx = await Sandbox.create('hello', { timeout: 120, idle: 5, addr: process.env.SANDLOCKER_ADDR });
 try {

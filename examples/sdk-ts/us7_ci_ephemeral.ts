@@ -4,7 +4,7 @@
 // 沙箱内命令退出码原样透传，CI 据此判红绿。M1 基座 busybox：用 shell 模拟「测试套件」。
 // 前置：sandlocker up。SANDLOCKER_ADDR（默认 127.0.0.1:7878）。
 import assert from "node:assert/strict";
-import { Sandbox } from "../../sdk/typescript/dist/esm/index.js";
+import { Sandbox } from "sandlocker";
 
 const ADDR = process.env.SANDLOCKER_ADDR ?? "127.0.0.1:7878";
 

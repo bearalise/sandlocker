@@ -4,7 +4,7 @@
 // 前置：sandlocker up + 已 build hello 模板。SANDLOCKER_ADDR（默认 127.0.0.1:7878）；
 // 就绪阈值 SL_READY_MS_MAX（默认 2000ms，恢复路径非冷启动，含 CI 抖动余量）。
 import assert from "node:assert/strict";
-import { Sandbox, Template } from "../../sdk/typescript/dist/esm/index.js";
+import { Sandbox, Template } from "sandlocker";
 
 const ADDR = process.env.SANDLOCKER_ADDR ?? "127.0.0.1:7878";
 const READY_MS_MAX = Number(process.env.SL_READY_MS_MAX ?? "2000");
