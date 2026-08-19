@@ -1,48 +1,51 @@
 # SandLocker TypeScript SDK
 
-零运行时依赖的薄 REST 客户端（仅用 `node:http`），对标 [Python SDK](../python/) 与
-[`contracts/openapi.yaml`](../../contracts/openapi.yaml)。面向 Node.js（服务端），异步 Promise API。
+A thin REST client with zero runtime dependencies (uses only `node:http`), on par with the
+[Python SDK](../python/) and [`contracts/openapi.yaml`](../../contracts/openapi.yaml).
+Targets Node.js (server-side) with an async Promise API.
 
-- **Node ≥ 20**（`await using` / `Symbol.asyncDispose` 需 ≥ 20；示例 `.ts` 直跑需 ≥ 22.6）。
-- **零运行时依赖**；devDep 仅 `typescript` + `@types/node`；测试用内置 `node:test`。
-- 双模块：ESM + CJS + `.d.ts`。
+- **Node ≥ 20** (`await using` / `Symbol.asyncDispose` require ≥ 20; running the `.ts` examples directly requires ≥ 22.6).
+- **Zero runtime dependencies**; devDeps are just `typescript` + `@types/node`; tests use the built-in `node:test`.
+- Dual module: ESM + CJS + `.d.ts`.
 
-## 快速上手
+## Quick start
 
 ```ts
 import { Sandbox } from "sandlocker";
 
-// create → run → 取产物；作用域退出自动销毁（跑完即焚）。
+// create → run → collect output; auto-destroyed when the scope exits (fire-and-forget).
 await using sbx = await Sandbox.create("hello", { timeout: 120, idle: 30 });
 const r = await sbx.run("echo hello && uname -a");
-console.log(r.exitCode, r.stdout);          // 退出码透传 + 缓冲输出
+console.log(r.exitCode, r.stdout);          // exit code passthrough + buffered output
 
 await sbx.files.write("/work/in.csv", "col\n1\n2\n");
 const data = await sbx.files.read("/work/in.csv");   // Buffer
 
-// 或手动生命周期（无 `await using` 时）：
+// Or manage the lifecycle manually (without `await using`):
 const s2 = await Sandbox.create("hello");
-try { /* ... */ } finally { await s2.kill(); }        // kill 幂等
+try { /* ... */ } finally { await s2.kill(); }        // kill is idempotent
 ```
 
-`Sandbox.create` / `list` / `get` 可传 `{ addr }`（默认 `127.0.0.1:7878`，需 `sandlocker up` 已起守护）
-或复用一个 `Client`。`Template.list()` 列已注册模板。
+`Sandbox.create` / `list` / `get` accept `{ addr }` (default `127.0.0.1:7878`, requires the
+`sandlocker up` daemon to be running), or you can share a `Client`. `Template.list()` lists
+registered templates.
 
-## API（对标 Python SDK）
+## API (on par with the Python SDK)
 
 - `Sandbox.create(template, opts)` / `Sandbox.list(opts)` / `Sandbox.get(id, opts)`
-- 实例：`run(cmd)→ExecResult`、`keepAlive()`、`logs()→string`、`info()→SandboxInfo`、`kill()`、
-  `files.write(path, string|Uint8Array)` / `files.read(path)→Buffer`、`[Symbol.asyncDispose]`
-- 低层 `Client`（一方法一路由）、模型 `ExecResult`/`SandboxInfo`/`Template`、
-  异常 `SandLockerError`/`ConnectionError`/`ApiError`/`NotFound`（仅 404→NotFound）。
+- Instance: `run(cmd)→ExecResult`, `keepAlive()`, `logs()→string`, `info()→SandboxInfo`, `kill()`,
+  `files.write(path, string|Uint8Array)` / `files.read(path)→Buffer`, `[Symbol.asyncDispose]`
+- Low-level `Client` (one method per route), models `ExecResult`/`SandboxInfo`/`Template`,
+  errors `SandLockerError`/`ConnectionError`/`ApiError`/`NotFound` (only 404→NotFound).
 
-## 开发
+## Development
 
 ```bash
 npm ci
-npm test        # 假 daemon 场景 + ROUTES 契约对账（node:test，无需 KVM）
-npm run build   # 产出 dist/esm + dist/cjs + .d.ts
+npm test        # fake-daemon scenarios + ROUTES contract reconciliation (node:test, no KVM needed)
+npm run build   # outputs dist/esm + dist/cjs + .d.ts
 ```
 
-契约漂移防线：`contracts/openapi.yaml` ↔ `src/client.ts` 的 `ROUTES` ↔ `test/sdk.test.ts` 的
-`expected` 三处必须同步（改任一即单测红）。端到端见 `scripts/verify-sdk-ts-e2e.sh`。
+Contract-drift guard: `contracts/openapi.yaml` ↔ `ROUTES` in `src/client.ts` ↔ `expected` in
+`test/sdk.test.ts` must stay in sync (change one and the unit tests go red). For end-to-end
+testing see `scripts/verify-sdk-ts-e2e.sh`.
