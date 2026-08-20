@@ -276,6 +276,8 @@ jobs:
         # 其中 bench-clone-entropy.sh 是安全回归红线（Q3/Q4）：两克隆身份/熵相同即退非 0 → CI 红。
         # bench-net-timing.sh 是 Q4 时序红线（W10）：任一轮 policy_before_resume=false 即退非 0 → CI 红。
         # bench-restore-create.sh 是 Q2 门禁（W7）：预烘焙恢复创建 P50 > 500ms 即退非 0 → CI 红。
+        # bench-pool.sh 是硬出口①分位回归（W5）：温池 warm_p50 > cold_p50 即退非 0 → CI 红；
+        #   绝对 ≤100ms 达标只在裸金属 bench-density（POOL_P50_BUDGET_MS=100）hard-gate，此处不设预算。
         run: |
           if [ -w /dev/kvm ]; then
             scripts/bench/run-all.sh
@@ -390,10 +392,15 @@ jobs:
       - name: 构建 guest 内核
         run: scripts/build-kernel.sh
       - name: 运行全部基准（含密度，BENCH_DENSITY 开启）
-        # 64C/128G 裸金属才有可比密度数据（计划 §8.1）；默认规格实例数 DENSITY_MAX 调高
+        # 64C/128G 裸金属才有可比密度数据（计划 §8.1）；默认规格实例数 DENSITY_MAX 调高。
+        # 裸金属才 hard-gate 硬出口①与 M2-Q10（托管 runner 慢/共享，bench-light 只 gate 回归）：
+        #   POOL_P50_BUDGET_MS=100 —— 池命中 P50 ≤100ms 硬达标（bench-pool.sh 经 sl-node 读 env）。
+        #   DENSITY_MIN=200        —— M2-Q10 ≥200@默认规格 密度目标 gate（bench-density.sh 尾部）。
         env:
           BENCH_DENSITY: "1"
           DENSITY_MAX: "600"
+          DENSITY_MIN: "200"
+          POOL_P50_BUDGET_MS: "100"
         run: scripts/bench/run-all.sh
       - name: 上传基准结果
         if: always()

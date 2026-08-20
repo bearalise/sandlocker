@@ -75,5 +75,15 @@ wait || true
 resid=$(count_proc firecracker)
 echo "[density] 自清理后 firecracker 残留=$resid" >&2
 
-printf '{"metric":"density","max_instances":%d,"stop_reason":"%s","mem_start_mb":%d,"used_total_mb":%d,"per_vm_mb_est":%d,"residue":%d,"curve":[%s]}\n' \
-  "$max_ok" "$stop_reason" "$mem0" "$used_total" "$per_vm" "$resid" "$points"
+# M2-Q10 目标 gate（可选，缺省关）：DENSITY_MIN>0 且峰值实例 < DENSITY_MIN → 退非 0。
+# 裸金属 dispatch（bench-density job）设 DENSITY_MIN=200（≥200@默认规格，计划 §5/§8.1）方硬达标；
+# 托管/开发机不设 BENCH_DENSITY → 本脚本整体 skip，此 gate 天然不触发（无裸金属 runner 前为待补）。
+DENSITY_MIN="${DENSITY_MIN:-0}"
+
+printf '{"metric":"density","max_instances":%d,"stop_reason":"%s","mem_start_mb":%d,"used_total_mb":%d,"per_vm_mb_est":%d,"residue":%d,"density_min":%d,"curve":[%s]}\n' \
+  "$max_ok" "$stop_reason" "$mem0" "$used_total" "$per_vm" "$resid" "$DENSITY_MIN" "$points"
+
+if [ "$DENSITY_MIN" -gt 0 ] && [ "$max_ok" -lt "$DENSITY_MIN" ]; then
+  echo "[density] M2-Q10 未达标：峰值 $max_ok < DENSITY_MIN=$DENSITY_MIN（停因=$stop_reason）" >&2
+  exit 1
+fi
