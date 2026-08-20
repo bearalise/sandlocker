@@ -5,7 +5,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## [Unreleased]
 
-Milestone M2 (in progress).
+Milestone **M2 complete** — both hard exits met (pool-hit P50: warm ≈70 ms / hot ≈48 ms ≤100 ms;
+two switchable backends: Firecracker + gVisor pass one ABI contract suite). M2-Q1–Q9 and Q12 have
+per-question conclusions; M2-Q10 (bare-metal density) is method-ready but **pending a self-hosted
+runner**; M2-Q11 (snapshot encryption) is **deferred to M3** per the plan's cut-list. See the exit
+review: `docs/design/M2出口评审.md`.
 
 ### Added
 - **Interactive PTY + SDK M2 endpoints (M2-Q7)** — a new `sl-proto` `Pty{cols,rows}` frame makes
