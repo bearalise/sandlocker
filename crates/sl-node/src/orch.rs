@@ -16,11 +16,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use sl_store::{LeaseId, SqliteStore, Store};
 
+use crate::pool::WarmPool;
 use crate::{abspath, hex, host_random, kill_group, restore_core, Config, RestoreCtx};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
@@ -55,6 +56,8 @@ pub struct CreateOutcome {
     pub resume_ms: u128,
     /// ADR-12 reinit 换发的克隆 machine-id（并发隔离断言用）。
     pub machine_id: String,
+    /// M2 W4：本次 create 是否命中温池（走池命中路径，`copy_ms=0`）。冷路径为 false。
+    pub pool_hit: bool,
 }
 
 /// 在册运行中的沙箱句柄。`id` 即 `live` 映射键，不重复存。
@@ -74,6 +77,9 @@ pub struct Orch<'a> {
     template: PathBuf,
     run_root: PathBuf,
     live: HashMap<String, Live>,
+    /// M2 W4：单模板温池（可选）。仅当请求模板 == `pool.template()` 时走池命中路径；
+    /// 其它模板/无池均走冷路径（零回归）。
+    pool: Option<WarmPool>,
 }
 
 impl<'a> Orch<'a> {
@@ -83,7 +89,35 @@ impl<'a> Orch<'a> {
         }
         std::fs::create_dir_all(run_root).map_err(|e| format!("建 run_root 失败 {}: {e}", run_root.display()))?;
         let template = abspath(template)?;
-        Ok(Self { cfg, store, template, run_root: run_root.to_path_buf(), live: HashMap::new() })
+        Ok(Self {
+            cfg,
+            store,
+            template,
+            run_root: run_root.to_path_buf(),
+            live: HashMap::new(),
+            pool: None,
+        })
+    }
+
+    /// M2 W4：为 `template` 起单模板温池（水位 `target`），后续 create 命中同模板走池命中路径。
+    /// `target == 0` 视为不启用（幂等清空既有池）。守护（`--serve`）在建 Orch 后调用。
+    pub fn enable_warm_pool(&mut self, template: &Path, target: usize) -> Result<(), String> {
+        if target == 0 {
+            self.pool = None;
+            return Ok(());
+        }
+        self.pool = Some(WarmPool::new(template, &self.run_root, target)?);
+        Ok(())
+    }
+
+    /// 温池 (hits, misses, ready_len)；未启用返回 None。供守护内省 / bench。
+    pub fn pool_stats(&self) -> Option<(u64, u64, usize)> {
+        self.pool.as_ref().map(|p| p.stats())
+    }
+
+    /// 阻塞等温池水位 ≥ `n` 或超时（bench 预填池用）。无池返回 false。
+    pub fn pool_wait_ready(&self, n: usize, timeout: Duration) -> bool {
+        self.pool.as_ref().map(|p| p.wait_ready(n, timeout)).unwrap_or(false)
     }
 
     /// 创建 = 从预烘焙快照**恢复**（keep-alive 持有 VM）。用 orchestrator 的默认模板。
@@ -100,15 +134,22 @@ impl<'a> Orch<'a> {
         }
         let template = abspath(template)?;
 
-        // 1) id + 实例目录
-        let mut idb = [0u8; 6];
-        host_random(&mut idb);
-        let id = hex(&idb);
-        let dir = self.run_root.join(&id);
-
-        // 2) 私有 rootfs 副本 + vmstate/mem 硬链（零拷贝）
-        let copy_ms = prepare_instance_dir(&template, &dir)?;
-        let dir_abs = abspath(&dir)?;
+        // 1-2) 备实例目录。**池命中路径**（M2 W4）：请求模板 == 温池模板且弹到热槽 →
+        //      槽已备妥私有 rootfs/vmstate/mem（copy 在池 refill 线程锁外完成）→ `copy_ms=0`。
+        //      否则**冷路径**：现场生成 id + `prepare_instance_dir`（copy 计入关键路径），零回归。
+        let (id, dir_abs, copy_ms, pool_hit) = match self.try_pool_hit(&template) {
+            Some(slot) => (slot.id, slot.dir, 0u128, true),
+            None => {
+                let mut idb = [0u8; 6];
+                host_random(&mut idb);
+                let id = hex(&idb);
+                let dir = self.run_root.join(&id);
+                let copy_ms = prepare_instance_dir(&template, &dir)?;
+                let dir_abs = abspath(&dir)?;
+                (id, dir_abs, copy_ms, false)
+            }
+        };
+        let dir = dir_abs.clone();
 
         // 3) lease（idle 计时器）+ sandbox/ 元数据（挂 lease → 随空闲回收/撤销一并删）
         let created_at = now_unix();
@@ -163,7 +204,17 @@ impl<'a> Orch<'a> {
             load_ms: o.load_ms,
             resume_ms: o.resume_ms,
             machine_id: o.machine_id,
+            pool_hit,
         })
+    }
+
+    /// 池命中判定：请求模板 == 温池模板（均 canonical）且弹到热槽即返回槽；否则 None（走冷路径）。
+    fn try_pool_hit(&self, template: &Path) -> Option<crate::pool::WarmSlot> {
+        let pool = self.pool.as_ref()?;
+        if pool.template() != template {
+            return None;
+        }
+        pool.try_pop()
     }
 
     /// keepalive：滑窗重置 idle（lease）。**不**动 `ttl_deadline`（TTL 是绝对硬顶）。返回新到期 unix 秒。
@@ -335,7 +386,9 @@ fn build_meta_json(id: &str, spec: &SandboxSpec, created_at: i64, ttl_deadline: 
 /// 备实例目录：私有 `rootfs.ext4` 副本（reflink 优先→回退全拷；FC reinit 会写它，须私有）+
 /// `vmstate`/`mem` 硬链（只读共享、零拷贝——File 内存后端 `MAP_PRIVATE` COW 不写回 → 硬链安全；
 /// 若某 FC 版本写回则并发 marker/machine-id 断言会红，回退每沙箱私有 mem 副本）。返回 copy 耗时 ms。
-fn prepare_instance_dir(template: &Path, dir: &Path) -> Result<u128, String> {
+///
+/// `pub(crate)`：W4 温池（[`crate::pool`]）预置槽复用同一套准备逻辑（把 copy 移出 create 关键路径）。
+pub(crate) fn prepare_instance_dir(template: &Path, dir: &Path) -> Result<u128, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("建实例目录失败 {}: {e}", dir.display()))?;
     let t0 = Instant::now();
     cp_reflink(&template.join("rootfs.ext4"), &dir.join("rootfs.ext4"))?;
@@ -539,6 +592,96 @@ pub fn bench(cfg: &Config, template: &Path) -> Result<(), String> {
     }
     if !pass {
         return Err(format!("Q2 未达标：P50={p50}ms > 500ms"));
+    }
+    Ok(())
+}
+
+// ————————————————————— M2-Q2 温池冷/热分档基准 —————————————————————
+
+/// M2 W4（M2-Q2 起步）：对比**冷档**（无池，copy 在关键路径）与**热档**（温池预填满，池命中
+/// create `copy_ms=0`）。同模板同 spec 各跑 `--cycles` 次（首个 warmup 丢弃）。
+///
+/// 判据（W4）= `warm_p50 < cold_p50`（机制生效，copy 已移出关键路径）；`warm_le_100` 仅信息性
+/// 上报——**池命中 P50 ≤100ms 的硬达标 + 分位进 CI 留 W5**（硬出口①）。免 root。
+pub fn pool_bench(cfg: &Config, template: &Path) -> Result<(), String> {
+    let cycles = if cfg.cycles > 0 { cfg.cycles } else { 20 };
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("pool-bench");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let spec = SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() };
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[pool] {m}");
+        }
+    };
+
+    // —— 冷档：无池 create→destroy ×(cycles+1)，首个作 warm-up 丢弃（copy 计入 total）——
+    let cold_store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut cold = Orch::new(cfg, &template, &run_root.join("cold"), Box::new(cold_store))?;
+    let mut cold_totals = Vec::new();
+    let mut cold_copies = Vec::new();
+    for i in 0..=cycles {
+        let o = cold.create(&spec)?;
+        if i > 0 {
+            cold_totals.push(o.total_ms);
+            cold_copies.push(o.copy_ms);
+        }
+        cold.destroy(&o.id)?;
+    }
+    drop(cold);
+    let cold_p50 = percentile(&mut cold_totals, 50);
+    let cold_p90 = percentile(&mut cold_totals, 90);
+    let copy_saved_p50 = percentile(&mut cold_copies, 50); // 热档省掉的 copy（冷档 copy P50）
+    log(&format!(
+        "冷档 n={} P50={cold_p50}ms P90={cold_p90}ms（copy_p50={copy_saved_p50}ms）",
+        cold_totals.len()
+    ));
+
+    // —— 热档：温池预填满（target=cycles+1）再测，池命中 create copy_ms=0 ——
+    let warm_store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut warm = Orch::new(cfg, &template, &run_root.join("warm"), Box::new(warm_store))?;
+    let target = cycles + 1;
+    warm.enable_warm_pool(&template, target)?;
+    let filled = warm.pool_wait_ready(target, Duration::from_secs(120));
+    if !filled {
+        log("警告：温池未在 120s 内填满，热档将含未命中（如实计入 hit_rate）");
+    }
+    let (h0, m0, _) = warm.pool_stats().unwrap_or((0, 0, 0));
+    let mut warm_totals = Vec::new();
+    for i in 0..=cycles {
+        let o = warm.create(&spec)?;
+        if i > 0 {
+            warm_totals.push(o.total_ms);
+        }
+        warm.destroy(&o.id)?;
+    }
+    let (h1, m1, _) = warm.pool_stats().unwrap_or((0, 0, 0));
+    drop(warm); // 停 refill 线程 + 清 .warm
+    let warm_p50 = percentile(&mut warm_totals, 50);
+    let warm_p90 = percentile(&mut warm_totals, 90);
+    let win_hits = h1.saturating_sub(h0);
+    let win_miss = m1.saturating_sub(m0);
+    let hit_rate = win_hits as f64 / (win_hits + win_miss).max(1) as f64;
+    let warm_le_100 = warm_p50 <= 100;
+    let pass = warm_p50 < cold_p50;
+
+    if cfg.json {
+        println!(
+            r#"{{"metric":"pool_bench","n":{},"cold_p50":{cold_p50},"cold_p90":{cold_p90},"warm_p50":{warm_p50},"warm_p90":{warm_p90},"warm_hit_rate":{hit_rate:.3},"copy_saved_p50":{copy_saved_p50},"warm_le_100":{warm_le_100},"pass":{pass}}}"#,
+            warm_totals.len()
+        );
+    } else {
+        log(&format!(
+            "热档 n={} P50={warm_p50}ms P90={warm_p90}ms（命中率={hit_rate:.1}，省 copy≈{copy_saved_p50}ms）",
+            warm_totals.len()
+        ));
+        log(&format!(
+            "M2-Q2 起步：warm_p50<cold_p50 = {}（{warm_p50}<{cold_p50}）；warm_le_100={warm_le_100}（≤100ms 硬达标留 W5）",
+            if pass { "PASS" } else { "FAIL" }
+        ));
+    }
+    if !pass {
+        return Err(format!("温池未见收益：warm_p50={warm_p50}ms 未低于 cold_p50={cold_p50}ms"));
     }
     Ok(())
 }

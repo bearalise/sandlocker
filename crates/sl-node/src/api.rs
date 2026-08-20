@@ -56,7 +56,25 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     // Orch<'a> 借 &Config；守护存活全程 → leak 得 'static（无需改 Orch 生命周期）。
     let cfg_s: &'static Config = Box::leak(Box::new(cfg.clone()));
     // 默认模板占位：守护恒走 create_in（显式模板），此占位不被 create() 使用；取模板根（存在即合法）。
-    let orch = Orch::new(cfg_s, &template_root, &run_root, Box::new(store))?;
+    let mut orch = Orch::new(cfg_s, &template_root, &run_root, Box::new(store))?;
+
+    // M2 W4 温池：--pool-size>0 且指定 --pool-template 时，解析该模板→建单模板温池。请求命中同
+    // 模板走池命中路径（copy_ms=0），其它模板/未启用均走冷路径（零回归）。模板解析失败仅告警不阻塞。
+    if cfg.pool_size > 0 {
+        if let Some(name) = cfg.pool_template.clone() {
+            match resolve_template(&orch, &template_root, &name) {
+                Ok(dir) => {
+                    orch.enable_warm_pool(&dir, cfg.pool_size)?;
+                    println!(
+                        "[sandlocker] 温池已启用：template={name} size={} dir={}",
+                        cfg.pool_size,
+                        dir.display()
+                    );
+                }
+                Err(e) => eprintln!("[sandlocker] 温池未启用（模板解析失败，走冷路径）: {e}"),
+            }
+        }
+    }
     let shared: Shared = Arc::new(Mutex::new(orch));
 
     // 后台 reaper：周期 tick(now)（TTL 硬顶 + idle sweep）。
@@ -345,8 +363,8 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
     let dir = resolve_template(&o, template_root, name)?;
     let out = o.create_in(&dir, &spec)?;
     Ok(format!(
-        r#"{{"id":"{}","state":"running","machine_id":"{}","template":"{}","total_ms":{},"copy_ms":{},"api_ready_ms":{},"load_ms":{},"resume_ms":{}}}"#,
-        out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms
+        r#"{{"id":"{}","state":"running","machine_id":"{}","template":"{}","total_ms":{},"copy_ms":{},"api_ready_ms":{},"load_ms":{},"resume_ms":{},"pool_hit":{}}}"#,
+        out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms, out.pool_hit
     )
     .into_bytes())
 }
