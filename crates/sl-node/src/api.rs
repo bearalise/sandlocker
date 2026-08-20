@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sl_store::SqliteStore;
 
+use crate::backend::Capabilities;
 use crate::orch::{Orch, SandboxSpec};
 use crate::{connect_guest, exec, Config};
 
@@ -218,6 +219,7 @@ enum Route {
     Logs(String),
     ListTemplates,
     BuildTemplate,
+    ListBackends,
     NotFound,
 }
 
@@ -230,6 +232,7 @@ fn parse_route(method: &str, path: &str) -> Route {
         ("POST", ["v1", "sandboxes"]) => Route::CreateSandbox,
         ("GET", ["v1", "sandboxes"]) => Route::ListSandboxes,
         ("GET", ["v1", "templates"]) => Route::ListTemplates,
+        ("GET", ["v1", "backends"]) => Route::ListBackends,
         ("POST", ["v1", "templates:build"]) => Route::BuildTemplate,
         ("GET", ["v1", "sandboxes", id]) => Route::GetSandbox((*id).to_string()),
         ("DELETE", ["v1", "sandboxes", id]) => Route::DeleteSandbox((*id).to_string()),
@@ -321,6 +324,7 @@ fn dispatch(
             Ok(v) => (200, json, v),
             Err(e) => (500, json, err_json(&e)),
         },
+        Route::ListBackends => (200, json, list_backends(shared)),
         Route::BuildTemplate => (
             501,
             json,
@@ -358,7 +362,23 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
             }
         }
     }
-    let spec = SandboxSpec { vcpus: cpu, mem_mib: mem, ttl_secs: ttl, idle_secs: idle, metadata };
+    // M2 W6（ADR-14）：可选 required_capabilities:[..] snake_case 名列表 → 创建期校验（后端不满足即
+    // UNSUPPORTED_BY_BACKEND）。未知能力名恒不被满足，from_names 直接返错。
+    let required_capabilities = match v.get("required_capabilities").and_then(|x| x.as_array()) {
+        Some(arr) => {
+            let names: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            Capabilities::from_names(&names)?
+        }
+        None => Capabilities::empty(),
+    };
+    let spec = SandboxSpec {
+        vcpus: cpu,
+        mem_mib: mem,
+        ttl_secs: ttl,
+        idle_secs: idle,
+        metadata,
+        required_capabilities,
+    };
 
     // 建走恢复（~130ms），全程持锁——单机 MVP 串行（如实标注）。
     let mut o = shared.lock().unwrap();
@@ -426,6 +446,20 @@ fn list_templates(shared: &Shared) -> Result<Vec<u8>, String> {
         }
     }
     Ok(format!("[{}]", items.join(",")).into_bytes())
+}
+
+/// `GET /v1/backends`（ADR-14）：后端列表与能力集。W6 单后端（fc）；W7 gVisor 落地时增。
+fn list_backends(shared: &Shared) -> Vec<u8> {
+    let o = shared.lock().unwrap();
+    let items: Vec<String> = o
+        .backends_info()
+        .into_iter()
+        .map(|b| {
+            let caps = b.capabilities.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+            format!(r#"{{"id":"{}","capabilities":[{caps}]}}"#, b.id)
+        })
+        .collect();
+    format!("[{}]", items.join(",")).into_bytes()
 }
 
 /// 单引号包裹（仓库内路径不含单引号，够用；与 main.rs `sq` 同策略）。

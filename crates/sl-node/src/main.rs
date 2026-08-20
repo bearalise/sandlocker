@@ -31,6 +31,9 @@ mod build;
 // OCI 镜像当 rootfs 来源（M2-Q12 / ADR-18 / D5，W3）——host 侧薄 registry v2 拉取/tarball 加载 →
 // 层展平 → bake ext4 交给 build.rs 当 base_rootfs。仅宿主 builder 用，guest sl-envd 零影响。
 mod oci;
+// M2 W6：Sandbox ABI 契约（trait + 能力模型，ADR-14）+ Firecracker 后端实现。
+mod backend;
+mod fcbackend;
 // W7：进程内 orchestrator（生命周期 create/keepalive/destroy/tick + Q2/Q9）。
 mod orch;
 // M2 W4：预热池·温池（把 rootfs 拷贝/page-cache 预热移出 create 关键路径，M2-Q2）。
