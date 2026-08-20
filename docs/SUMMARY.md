@@ -11,6 +11,7 @@
 - [Guest kernel strategy](design/内核跟进策略.md)
 - [Deployment guide](design/部署指南.md)
 - [Release guide](design/RELEASING.md)
+- [M2 exit review](design/M2出口评审.md)
 - [M1 exit review](design/M1出口评审.md)
 - [M0 exit review](design/M0出口评审.md)
 - [M0 technical validation plan](design/M0技术验证计划.md)
