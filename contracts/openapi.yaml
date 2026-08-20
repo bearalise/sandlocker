@@ -96,6 +96,68 @@ paths:
         '404':
           $ref: '#/components/responses/Error'
 
+  /v1/sandboxes/{id}/pause:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 暂停（FR-1.4）——落快照 + 停 VM（需后端 pause_resume）
+      description: >
+        M2 W9（M2-Q5）：暂停沙箱，落 Full 快照并停止 VM。paused 期间不可 exec/文件。后端不具
+        pause_resume 能力时返 409 UNSUPPORTED_BY_BACKEND（如 gVisor）。
+      operationId: pauseSandbox
+      responses:
+        '200':
+          description: 已暂停（state=paused）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Sandbox' } } }
+        '409':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 恢复（FR-1.4）——从快照拉起（需后端 pause_resume）
+      description: >
+        M2 W9：从 paused 快照恢复运行。ADR-12 reinit 换发新 machine-id/RNG/会话密钥（克隆熵不泄漏）。
+      operationId: resumeSandbox
+      responses:
+        '200':
+          description: 已恢复（state=running，返回新 machine_id）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Sandbox' } } }
+        '409':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/fork:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: fork（M2-Q5）——从（已 pause 的）父快照派生新实例（需后端 snapshot_fork）
+      description: >
+        M2 W9：从父沙箱的 paused 快照派生新实例，经 reinit 得**独立身份**（machine-id/RNG/会话密钥
+        必异，克隆熵不泄漏），复用父 rootfs/快照——**不刷新安全边界**。父须先 pause。
+      operationId: forkSandbox
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl: { type: integer, default: 300 }
+                idle: { type: integer }
+      responses:
+        '201':
+          description: 新实例（含 forked_from）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Sandbox' } } }
+        '409':
+          $ref: '#/components/responses/Error'
+        '400':
+          $ref: '#/components/responses/Error'
+
   /v1/sandboxes/{id}/exec:
     parameters:
       - $ref: '#/components/parameters/SandboxId'
@@ -282,11 +344,19 @@ components:
           type: string
         state:
           type: string
+          enum: [running, paused]
           example: running
         machine_id:
           type: string
         template:
           type: string
+        forked_from:
+          type: string
+          description: M2 W9：fork 得来时为父沙箱 id（直接 create 则无）
+        pool_hit:
+          type: boolean
+        hot_hit:
+          type: boolean
         total_ms:
           type: integer
         copy_ms:

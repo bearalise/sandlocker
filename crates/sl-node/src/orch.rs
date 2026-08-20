@@ -71,10 +71,15 @@ pub struct CreateOutcome {
     pub resume_ms: u128,
     /// ADR-12 reinit 换发的克隆 machine-id（并发隔离断言用）。
     pub machine_id: String,
+    /// M2 W9（M2-Q5）：reinit 换发的 RNG 种子 hex / 会话密钥 hex——克隆熵三元组（fork/resume 复验互异）。
+    pub rng_hex: String,
+    pub session_key_hex: String,
     /// M2 W4：本次 create 是否命中池（温池或热池，`copy_ms=0`）。冷路径为 false。
     pub pool_hit: bool,
     /// M2 W5：是否命中**热池**（暂停态 VM，仅 activate；`total_ms`=activate wall-clock）。温/冷为 false。
     pub hot_hit: bool,
+    /// M2 W9：fork 得来时为父沙箱 id；直接 create 为 None。
+    pub forked_from: Option<String>,
 }
 
 /// 在册沙箱的**编排态**（M2 W6：机制态——进程/目录——归后端 [`SandboxBackend`]）。
@@ -188,8 +193,20 @@ impl<'a> Orch<'a> {
         // ② 后端造 running 实例（FC：三段 hot→warm→cold / gVisor：runsc run；机制态归后端）。
         let bc = self.backends[idx].create(&template, spec)?;
 
-        // ③ 编排：grant lease + 写 meta/state（挂 lease → 随空闲回收/撤销一并删）→ 存编排态。
-        //    任一步失败即回滚（撤 lease + 令后端销毁实例）。
+        // ③ 编排登记（lease/meta/state/台账）——与 fork 共用。
+        self.register(bc, idx, spec, &template, None)
+    }
+
+    /// 编排登记（create/fork 共用）：grant lease + 写 meta/state（挂 lease → 随空闲回收/撤销一并删）→
+    /// 存编排态 → 组装 CreateOutcome。任一步失败即回滚（撤 lease + 令后端销毁实例）。
+    fn register(
+        &mut self,
+        bc: crate::backend::BackendCreate,
+        idx: usize,
+        spec: &SandboxSpec,
+        template: &Path,
+        forked_from: Option<String>,
+    ) -> Result<CreateOutcome, String> {
         let created_at = now_unix();
         let ttl_deadline = compute_ttl_deadline(created_at, spec.ttl_secs);
         let lease = match self.store.lease_grant(spec.idle_secs) {
@@ -199,7 +216,7 @@ impl<'a> Orch<'a> {
                 return Err(e.to_string());
             }
         };
-        let meta = build_meta_json(&bc.id, spec, created_at, ttl_deadline, &template);
+        let meta = build_meta_json(&bc.id, spec, created_at, ttl_deadline, template);
         if let Err(e) = self.store.put(&meta_key(&bc.id), meta.as_bytes(), Some(lease)) {
             let _ = self.store.lease_revoke(lease);
             self.backends[idx].destroy(&bc.id);
@@ -219,9 +236,59 @@ impl<'a> Orch<'a> {
             load_ms: bc.load_ms,
             resume_ms: bc.resume_ms,
             machine_id: bc.machine_id,
+            rng_hex: bc.rng_hex,
+            session_key_hex: bc.session_key_hex,
             pool_hit: bc.pool_hit,
             hot_hit: bc.hot_hit,
+            forked_from,
         })
+    }
+
+    /// pause（FR-1.4）：能力校验（`pause_resume`）→ 后端落快照停 VM → store `state`=paused。
+    pub fn pause(&mut self, id: &str) -> Result<(), String> {
+        let idx = self.backend_of(id)?;
+        self.require_cap(idx, Capability::PauseResume)?;
+        self.backends[idx].pause(id)?;
+        let _ = self.store.put(&state_key(id), b"paused", self.lease_of(id));
+        Ok(())
+    }
+
+    /// resume（FR-1.4）：能力校验 → 后端从快照拉起（reinit 新身份）→ store `state`=running。返回新 machine-id。
+    pub fn resume(&mut self, id: &str) -> Result<String, String> {
+        let idx = self.backend_of(id)?;
+        self.require_cap(idx, Capability::PauseResume)?;
+        let mid = self.backends[idx].resume(id)?;
+        let _ = self.store.put(&state_key(id), b"running", self.lease_of(id));
+        Ok(mid)
+    }
+
+    /// fork（M2-Q5）：能力校验（`snapshot_fork`）→ 后端从父快照派生新实例（reinit 独立身份）→ 编排登记。
+    pub fn fork(&mut self, id: &str, spec: &SandboxSpec) -> Result<CreateOutcome, String> {
+        let idx = self.backend_of(id)?;
+        self.require_cap(idx, Capability::SnapshotFork)?;
+        let bc = self.backends[idx].fork(id)?;
+        // fork 的恢复模板由后端内部持有（FcInst.template）；meta 用默认模板占位，forked_from 标父。
+        let tpl = self.template.clone();
+        self.register(bc, idx, spec, &tpl, Some(id.to_string()))
+    }
+
+    // —— 编排辅助 ——
+    fn backend_of(&self, id: &str) -> Result<usize, String> {
+        self.live.get(id).map(|m| m.backend).ok_or_else(|| format!("未知沙箱 {id}"))
+    }
+    fn lease_of(&self, id: &str) -> Option<LeaseId> {
+        self.live.get(id).map(|m| m.lease)
+    }
+    fn require_cap(&self, idx: usize, cap: Capability) -> Result<(), String> {
+        if self.backends[idx].capabilities().contains(cap) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{UNSUPPORTED_BY_BACKEND}: 后端 {} 不支持 {}",
+                self.backends[idx].id(),
+                cap.as_str()
+            ))
+        }
     }
 
     /// keepalive：滑窗重置 idle（lease）。**不**动 `ttl_deadline`（TTL 是绝对硬顶）。返回新到期 unix 秒。
@@ -859,6 +926,118 @@ pub fn abi_contract(cfg: &Config, template: &Path) -> Result<(), String> {
         return Err(format!(
             "硬出口② 未达标：switchable={switchable} both_backends={both_backends}（需两后端合资格且全过、能力矩阵无 GATE-FAIL）"
         ));
+    }
+    Ok(())
+}
+
+// ————————————————————— M2-Q5 pause/resume + fork 克隆熵复验 —————————————————————
+
+/// M2-Q5：pause/resume 用户 API（FR-1.4）+ fork 克隆熵复验。create A→pause A（落快照停 VM）→
+/// fork A ×2 得 B/C→resume A。断言 A0/A1(resumed)/B/C 的 machine-id 两两互异 + 两 fork(B/C) 的
+/// rng/session-key 互异（ADR-12 reinit 在 fork/resume 后仍换发独立身份，克隆熵不泄漏）+ 零残留 +
+/// gVisor pause→UNSUPPORTED（能力门控）。免 root（走恢复路径）；runsc 缺失则跳过 gVisor 分支。
+pub fn q5_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("q5-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let mut cfg2 = cfg.clone();
+    cfg2.gvisor = true; // 试注册 gVisor（用于 pause→UNSUPPORTED 能力门控验证；runsc 缺失则不注册）
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(&cfg2, &template, &run_root, Box::new(store))?;
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[q5] {m}");
+        }
+    };
+    let spec = SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() };
+
+    // ① create A（默认 fc）
+    let a = orch.create(&spec)?;
+    ensure(orch.is_live(&a.id), "① A 不在册")?;
+    log(&format!("① create A={} machine_id={}", a.id, a.machine_id));
+
+    // ② pause A → 落快照停 VM，state=paused，paused 不可 exec
+    orch.pause(&a.id)?;
+    let paused_state = orch
+        .store
+        .get(&state_key(&a.id))
+        .map_err(|e| e.to_string())?
+        .map(|kv| kv.value == b"paused")
+        .unwrap_or(false);
+    ensure(paused_state, "② state 未置 paused")?;
+    ensure(orch.exec_target(&a.id).is_none(), "② paused 沙箱仍可 exec（应拒）")?;
+    log("② pause A：state=paused + 不可 exec ✓");
+
+    // ③ fork A ×2 → B/C（从 A 的 paused 快照派生）
+    let b = orch.fork(&a.id, &spec)?;
+    let c = orch.fork(&a.id, &spec)?;
+    ensure(b.forked_from.as_deref() == Some(a.id.as_str()), "③ B.forked_from 未标父")?;
+    ensure(orch.is_live(&b.id) && orch.is_live(&c.id), "③ fork 实例不在册")?;
+    log(&format!("③ fork A → B={} C={}", b.id, c.id));
+
+    // ④ resume A → 新 machine-id（reinit）
+    let a1 = orch.resume(&a.id)?;
+    let running_state = orch
+        .store
+        .get(&state_key(&a.id))
+        .map_err(|e| e.to_string())?
+        .map(|kv| kv.value == b"running")
+        .unwrap_or(false);
+    ensure(running_state, "④ resume 后 state 未置 running")?;
+    ensure(orch.exec_target(&a.id).is_some(), "④ resume 后仍不可 exec")?;
+    log(&format!("④ resume A：state=running + machine_id={a1}"));
+
+    // ⑤ 克隆熵：machine-id A0/A1/B/C 两两互异；两 fork(B/C) 的 rng/session-key 互异（reinit 生效）
+    let mids = [a.machine_id.clone(), a1.clone(), b.machine_id.clone(), c.machine_id.clone()];
+    ensure(mids.iter().all(|m| !m.is_empty()), "⑤ machine-id 有空")?;
+    for i in 0..mids.len() {
+        for j in (i + 1)..mids.len() {
+            ensure(mids[i] != mids[j], "⑤ machine-id 存在相同（克隆身份泄漏）")?;
+        }
+    }
+    ensure(!b.rng_hex.is_empty() && b.rng_hex != c.rng_hex, "⑤ 两 fork rng 相同（熵未分叉）")?;
+    ensure(
+        !b.session_key_hex.is_empty() && b.session_key_hex != c.session_key_hex,
+        "⑤ 两 fork session-key 相同（熵未分叉）",
+    )?;
+    log("⑤ 克隆熵：A0/A1/B/C machine-id 两两互异 + 两 fork rng/session-key 互异 ✓");
+
+    // ⑥ destroy 全部 → 零残留
+    let dir_b = orch.dir_of(&b.id);
+    orch.destroy(&a.id)?;
+    orch.destroy(&b.id)?;
+    orch.destroy(&c.id)?;
+    ensure(!orch.is_live(&a.id) && !orch.is_live(&b.id) && !orch.is_live(&c.id), "⑥ destroy 后仍在册")?;
+    ensure(dir_b.map(|d| !d.exists()).unwrap_or(true), "⑥ fork 实例目录未删")?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "⑥ 收尾 store sandbox/ 非空")?;
+    log("⑥ destroy A/B/C：进程/目录/元数据零残留 ✓");
+
+    // ⑦ 能力门控：gVisor pause → UNSUPPORTED_BY_BACKEND（runsc 注册时）
+    let has_gvisor = orch.backends_info().iter().any(|x| x.id == "gvisor");
+    if has_gvisor {
+        let g = orch.create(&SandboxSpec { backend: Some("gvisor".into()), ..spec.clone() })?;
+        match orch.pause(&g.id) {
+            Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => log("⑦ gVisor pause → UNSUPPORTED_BY_BACKEND ✓"),
+            Err(e) => {
+                orch.destroy(&g.id)?;
+                return Err(format!("⑦ 期望 UNSUPPORTED_BY_BACKEND，实得: {e}"));
+            }
+            Ok(_) => {
+                orch.destroy(&g.id)?;
+                return Err("⑦ gVisor 无 pause_resume 却 pause 成功（静默降级）".into());
+            }
+        }
+        orch.destroy(&g.id)?;
+    } else {
+        log("⑦ gVisor 未注册（无 runsc），跳过 pause 能力门控验证");
+    }
+
+    if cfg.json {
+        println!(
+            r#"{{"metric":"q5_reconcile","cases":7,"gvisor_gate":{has_gvisor},"clone_entropy":true,"pass":true}}"#
+        );
+    } else {
+        println!("[q5] M2-Q5 对账 PASS：pause/resume 用户 API + fork 克隆熵（reinit 后身份必异）+ 零残留 + 能力门控");
     }
     Ok(())
 }

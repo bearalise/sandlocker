@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sl_store::SqliteStore;
 
-use crate::backend::Capabilities;
+use crate::backend::{Capabilities, UNSUPPORTED_BY_BACKEND};
 use crate::orch::{Orch, SandboxSpec};
 use crate::Config;
 
@@ -213,6 +213,9 @@ enum Route {
     GetSandbox(String),
     DeleteSandbox(String),
     Keepalive(String),
+    Pause(String),
+    Resume(String),
+    Fork(String),
     Exec(String),
     PutFile(String, String),
     GetFile(String, String),
@@ -237,6 +240,9 @@ fn parse_route(method: &str, path: &str) -> Route {
         ("GET", ["v1", "sandboxes", id]) => Route::GetSandbox((*id).to_string()),
         ("DELETE", ["v1", "sandboxes", id]) => Route::DeleteSandbox((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "keepalive"]) => Route::Keepalive((*id).to_string()),
+        ("POST", ["v1", "sandboxes", id, "pause"]) => Route::Pause((*id).to_string()),
+        ("POST", ["v1", "sandboxes", id, "resume"]) => Route::Resume((*id).to_string()),
+        ("POST", ["v1", "sandboxes", id, "fork"]) => Route::Fork((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "exec"]) => Route::Exec((*id).to_string()),
         ("GET", ["v1", "sandboxes", id, "logs"]) => Route::Logs((*id).to_string()),
         (m, [.., ]) if segs.len() >= 5 && segs[0] == "v1" && segs[1] == "sandboxes" && segs[3] == "files" => {
@@ -304,6 +310,29 @@ fn dispatch(
                 Err(_) => (404, json, err_json("未知沙箱")),
             }
         }
+        Route::Pause(id) => {
+            let r = shared.lock().unwrap().pause(&id);
+            match r {
+                Ok(()) => (200, json, format!(r#"{{"id":"{id}","state":"paused"}}"#).into_bytes()),
+                Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => (409, json, err_json(&e)),
+                Err(e) => (404, json, err_json(&e)),
+            }
+        }
+        Route::Resume(id) => {
+            let r = shared.lock().unwrap().resume(&id);
+            match r {
+                Ok(mid) => {
+                    (200, json, format!(r#"{{"id":"{id}","state":"running","machine_id":"{mid}"}}"#).into_bytes())
+                }
+                Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => (409, json, err_json(&e)),
+                Err(e) => (404, json, err_json(&e)),
+            }
+        }
+        Route::Fork(id) => match fork_sandbox(&id, body, shared) {
+            Ok(v) => (201, json, v),
+            Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => (409, json, err_json(&e)),
+            Err(e) => (400, json, err_json(&e)),
+        },
         Route::Exec(id) => match exec_in(&id, body, shared) {
             Ok(v) => (200, json, v),
             Err(e) => (500, json, err_json(&e)),
@@ -390,6 +419,24 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
     Ok(format!(
         r#"{{"id":"{}","state":"running","machine_id":"{}","template":"{}","total_ms":{},"copy_ms":{},"api_ready_ms":{},"load_ms":{},"resume_ms":{},"pool_hit":{},"hot_hit":{}}}"#,
         out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms, out.pool_hit, out.hot_hit
+    )
+    .into_bytes())
+}
+
+/// fork（M2-Q5）：从（已 pause 的）父沙箱派生新实例，reinit 得独立身份。ttl/idle 可选（缺省 300）；
+/// 后端继承父（经 orch 内部路由），无需 template。返回新 sandbox JSON（含 forked_from）。
+fn fork_sandbox(id: &str, body: &[u8], shared: &Shared) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(if body.is_empty() { b"{}" } else { body })
+        .map_err(|e| format!("请求体非 JSON: {e}"))?;
+    let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
+    let idle = v.get("idle").and_then(|x| x.as_i64()).unwrap_or(ttl);
+    let spec = SandboxSpec { ttl_secs: ttl, idle_secs: idle, ..Default::default() };
+    let mut o = shared.lock().unwrap();
+    let out = o.fork(id, &spec)?;
+    let forked = out.forked_from.as_deref().unwrap_or("");
+    Ok(format!(
+        r#"{{"id":"{}","state":"running","machine_id":"{}","forked_from":"{forked}","total_ms":{},"copy_ms":{}}}"#,
+        out.id, out.machine_id, out.total_ms, out.copy_ms
     )
     .into_bytes())
 }

@@ -193,6 +193,9 @@ impl SandboxBackend for GvisorBackend {
         Ok(BackendCreate {
             id,
             machine_id,
+            // gVisor 无 ADR-12 reinit（无 pause_resume/snapshot_fork 能力，不参与克隆熵三元组比对）。
+            rng_hex: String::new(),
+            session_key_hex: String::new(),
             total_ms: copy_ms.saturating_add(resume_ms),
             copy_ms,
             api_ready_ms: 0,
