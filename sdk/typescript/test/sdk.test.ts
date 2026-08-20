@@ -132,7 +132,12 @@ test("contract alignment: ROUTES == openapi M1 集合", () => {
     "PUT /v1/sandboxes/{id}/files/{path}",
     "GET /v1/sandboxes/{id}/files/{path}",
     "GET /v1/sandboxes/{id}/logs",
+    "POST /v1/sandboxes/{id}/pause",
+    "POST /v1/sandboxes/{id}/resume",
+    "POST /v1/sandboxes/{id}/fork",
+    "POST /v1/sandboxes/{id}/ticket",
     "GET /v1/templates",
+    "GET /v1/backends",
     // 注：POST /v1/templates:build M1 恒 501，SDK 不封装，故不入集。
   ]);
   assert.deepEqual(new Set(ROUTES), expected);

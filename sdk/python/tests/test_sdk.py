@@ -289,7 +289,12 @@ class SdkTest(unittest.TestCase):
                 ("PUT", "/v1/sandboxes/{id}/files/{path}"),   # putFile
                 ("GET", "/v1/sandboxes/{id}/files/{path}"),   # getFile
                 ("GET", "/v1/sandboxes/{id}/logs"),           # getLogs
+                ("POST", "/v1/sandboxes/{id}/pause"),         # pauseSandbox (M2 W9)
+                ("POST", "/v1/sandboxes/{id}/resume"),        # resumeSandbox (M2 W9)
+                ("POST", "/v1/sandboxes/{id}/fork"),          # forkSandbox (M2 W9)
+                ("POST", "/v1/sandboxes/{id}/ticket"),        # mintTicket (M2 W10)
                 ("GET", "/v1/templates"),                     # listTemplates
+                ("GET", "/v1/backends"),                      # listBackends (M2 W6)
                 # 注：POST /v1/templates:build 在 M1 恒返 501，SDK 不封装，故不在此集合。
             }
         )

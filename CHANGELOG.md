@@ -8,6 +8,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **Interactive PTY + SDK M2 endpoints (M2-Q7)** — a new `sl-proto` `Pty{cols,rows}` frame makes
+  `sl-envd` `forkpty` an interactive `/bin/sh` (guest now mounts `devpts`); after the `Ok` ack the
+  vsock connection carries **framed input** (`pty_stdin_frame` / `pty_resize_frame` — stdin vs
+  `TIOCSWINSZ` resize) and **raw PTY output**, so a client gets a bidirectional terminal with live
+  window resize. `sl-node --pty-reconcile` validates M2-Q7 (echo round-trip + `stty size` reflects a
+  resize + clean teardown + zero residue; CI `pty` job). The **TypeScript and Python SDKs** gain the
+  M2 endpoints — `pause` / `resume` / `fork` / `ticket` / `listBackends` — with `ROUTES` and
+  contract-drift tests kept in sync with `contracts/openapi.yaml`.
 - **Data-plane gateway + one-time HMAC signed URLs + port exposure (ADR-22, FR-3.3, M2-Q6)** — a
   separate in-process gateway listener (`--gw-addr`, default `127.0.0.1:7879`) serves the data plane
   behind **one-time HMAC-SHA256 signed URLs** (hand-rolled HMAC over `sha2`, no new dep). The control

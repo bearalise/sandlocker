@@ -33,6 +33,49 @@ pub enum Request {
     /// W10（FR-3.3 端口暴露）：guest 内 dial `127.0.0.1:port`。成功回 [`Response::Ok`] 后，**此连接转为
     /// 裸字节双向管道**（不再走帧）——host 网关据此把外部流量中继进 VM 内服务。
     Connect { port: u32 },
+    /// W11（M2-Q7 交互式 PTY）：guest `forkpty` 起 shell（初始窗口 cols×rows）。回 [`Response::Ok`] 后：
+    /// **host→guest** 走 PTY 输入帧（[`pty_stdin_frame`]/[`pty_resize_frame`]）；**guest→host** 为裸 PTY 输出。
+    Pty { cols: u16, rows: u16 },
+}
+
+/// PTY 输入帧种类（host→guest，装进 [`write_frame`] 的 payload 首字节）。
+pub const PTY_KIND_STDIN: u8 = 0;
+pub const PTY_KIND_RESIZE: u8 = 1;
+
+/// host 编码：一段 stdin 键入字节 → PTY 输入帧（payload = [0] ++ data）。
+pub fn pty_stdin_frame(data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(1 + data.len());
+    p.push(PTY_KIND_STDIN);
+    p.extend_from_slice(data);
+    p
+}
+
+/// host 编码：窗口 resize → PTY 输入帧（payload = [1, cols_be(2), rows_be(2)]）。
+pub fn pty_resize_frame(cols: u16, rows: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5);
+    p.push(PTY_KIND_RESIZE);
+    p.extend_from_slice(&cols.to_be_bytes());
+    p.extend_from_slice(&rows.to_be_bytes());
+    p
+}
+
+/// guest 解析：一个 PTY 输入帧 payload → 语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtyInput {
+    Stdin(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+/// guest 解析 PTY 输入帧 payload（`read_frame` 得到的字节）；格式非法返回 None。
+pub fn parse_pty_input(payload: &[u8]) -> Option<PtyInput> {
+    match payload.first().copied()? {
+        PTY_KIND_STDIN => Some(PtyInput::Stdin(payload[1..].to_vec())),
+        PTY_KIND_RESIZE if payload.len() == 5 => Some(PtyInput::Resize {
+            cols: u16::from_be_bytes([payload[1], payload[2]]),
+            rows: u16::from_be_bytes([payload[3], payload[4]]),
+        }),
+        _ => None,
+    }
 }
 
 /// guest→host 响应。
@@ -220,6 +263,33 @@ mod tests {
                 assert_eq!(exit_code, 7);
                 assert_eq!(stdout, "out");
                 assert_eq!(stderr, "err");
+            }
+            other => panic!("解析错误: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pty_input_frames_roundtrip() {
+        // stdin 帧：payload[0]=0，其余为数据
+        let f = pty_stdin_frame(b"echo hi\n");
+        assert_eq!(f[0], PTY_KIND_STDIN);
+        assert_eq!(parse_pty_input(&f), Some(PtyInput::Stdin(b"echo hi\n".to_vec())));
+        // resize 帧：cols/rows 大端
+        let r = pty_resize_frame(120, 40);
+        assert_eq!(parse_pty_input(&r), Some(PtyInput::Resize { cols: 120, rows: 40 }));
+        // 非法
+        assert_eq!(parse_pty_input(&[]), None);
+        assert_eq!(parse_pty_input(&[PTY_KIND_RESIZE, 1, 2]), None);
+    }
+
+    #[test]
+    fn pty_request_roundtrip() {
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &Request::Pty { cols: 80, rows: 24 }).unwrap();
+        let mut cur = Cursor::new(buf);
+        match read_msg::<_, Request>(&mut cur).unwrap() {
+            Request::Pty { cols, rows } => {
+                assert_eq!((cols, rows), (80, 24));
             }
             other => panic!("解析错误: {other:?}"),
         }
