@@ -8,6 +8,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **Sandbox ABI + capability model (ADR-14)** — the Firecracker mechanism (restore, warm/hot pools,
+  vsock endpoint, instance lifecycle) is refactored behind a `SandboxBackend` trait; `Orch` now holds
+  a `Box<dyn SandboxBackend>` and keeps only orchestration (store / lease / TTL / tick). Backends
+  register a capability bitset (`pause_resume` / `snapshot_fork` / `prebake_snapshot` /
+  `gpu_passthrough` / `persistent_volume`); the FC backend registers the first three. A create can
+  declare `required_capabilities` — unmet capabilities are rejected at **create time** with
+  `UNSUPPORTED_BY_BACKEND` (no runtime silent degradation). Pools are capability-gated (a backend
+  without `prebake_snapshot` / `pause_resume` gets cold create only). New `GET /v1/backends` lists
+  backends and their capabilities. This is the abstraction step for the second backend (gVisor, W7).
 - **Hot pool (热池)** — `restore_core` is split into `restore_park` (spawn Firecracker + load snapshot
   to a **paused** VM) and `restore_activate` (policy → resume → reinit → validate); a background
   thread pre-parks paused VMs so a pool-hit `create` only activates (resume + reinit), moving FC spawn

@@ -15,14 +15,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use sl_store::{LeaseId, SqliteStore, Store};
 
-use crate::pool::{HotPool, HotSlot, WarmPool};
-use crate::{abspath, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome, RestoreCtx};
+use crate::backend::{BackendInfo, Capabilities, SandboxBackend, UNSUPPORTED_BY_BACKEND};
+use crate::fcbackend::FcBackend;
+use crate::{abspath, hex, Config};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
 /// 决定，vcpus/mem 为记录性字段（真正按 spec 造型待冷路径/多模板，如实标注）。
@@ -36,11 +37,21 @@ pub struct SandboxSpec {
     pub idle_secs: i64,
     /// 用户标签，平铺进 `sandbox/<id>/meta` 的 `labels`。
     pub metadata: BTreeMap<String, String>,
+    /// M2 W6（ADR-14）：本次 create 要求的后端能力集。后端不满足即**创建期**返回
+    /// `UNSUPPORTED_BY_BACKEND`（禁止运行期静默降级）。默认空集（不约束）。
+    pub required_capabilities: Capabilities,
 }
 
 impl Default for SandboxSpec {
     fn default() -> Self {
-        Self { vcpus: 2, mem_mib: 512, ttl_secs: 300, idle_secs: 300, metadata: BTreeMap::new() }
+        Self {
+            vcpus: 2,
+            mem_mib: 512,
+            ttl_secs: 300,
+            idle_secs: 300,
+            metadata: BTreeMap::new(),
+            required_capabilities: Capabilities::empty(),
+        }
     }
 }
 
@@ -62,28 +73,20 @@ pub struct CreateOutcome {
     pub hot_hit: bool,
 }
 
-/// 在册运行中的沙箱句柄。`id` 即 `live` 映射键，不重复存。
-struct Live {
-    child: Child,
-    /// 实例目录（绝对）：私有 rootfs 副本 + vmstate/mem 硬链 + sockets/日志。
-    dir: PathBuf,
+/// 在册沙箱的**编排态**（M2 W6：机制态——FC 进程/目录——归后端 [`SandboxBackend`]）。
+struct LiveMeta {
     lease: LeaseId,
     /// TTL 绝对硬顶（unix 秒），独立于 lease。
     ttl_deadline: i64,
 }
 
-/// 进程内 orchestrator。`store` 按窄接口编程（M3 可换 etcd）；`template` 为预烘焙快照目录（绝对）。
+/// 进程内 orchestrator（M2 W6 起只管编排）。`store` 按窄接口编程（M3 可换 etcd）；
+/// `backend` 为 Sandbox ABI 后端（默认 FC，ADR-14），经 trait 触达机制；`template` 默认模板目录。
 pub struct Orch<'a> {
-    cfg: &'a Config,
     store: Box<dyn Store>,
+    backend: Box<dyn SandboxBackend + Send + 'a>,
     template: PathBuf,
-    run_root: PathBuf,
-    live: HashMap<String, Live>,
-    /// M2 W4：单模板温池（可选）。仅当请求模板 == `pool.template()` 时走池命中路径；
-    /// 其它模板/无池均走冷路径（零回归）。
-    pool: Option<WarmPool>,
-    /// M2 W5：单模板热池（可选，默认无）。命中优先于温池（最快，仅 activate）。
-    hot: Option<HotPool>,
+    live: HashMap<String, LiveMeta>,
 }
 
 impl<'a> Orch<'a> {
@@ -93,52 +96,40 @@ impl<'a> Orch<'a> {
         }
         std::fs::create_dir_all(run_root).map_err(|e| format!("建 run_root 失败 {}: {e}", run_root.display()))?;
         let template = abspath(template)?;
-        Ok(Self {
-            cfg,
-            store,
-            template,
-            run_root: run_root.to_path_buf(),
-            live: HashMap::new(),
-            pool: None,
-            hot: None,
-        })
+        let backend: Box<dyn SandboxBackend + Send + 'a> = Box::new(FcBackend::new(cfg, run_root.to_path_buf()));
+        Ok(Self { store, backend, template, live: HashMap::new() })
     }
 
-    /// M2 W4：为 `template` 起单模板温池（水位 `target`），后续 create 命中同模板走池命中路径。
+    /// 后端列表与能力集（`GET /v1/backends`，ADR-14）。W6 单后端；W7 gVisor 落地时扩注册表。
+    pub fn backends_info(&self) -> Vec<BackendInfo> {
+        vec![self.backend.info()]
+    }
+
+    /// M2 W4：为 `template` 起单模板温池（需后端具 `prebake_snapshot`）。委托后端（能力门控）。
     /// `target == 0` 视为不启用（幂等清空既有池）。守护（`--serve`）在建 Orch 后调用。
     pub fn enable_warm_pool(&mut self, template: &Path, target: usize) -> Result<(), String> {
-        if target == 0 {
-            self.pool = None;
-            return Ok(());
-        }
-        self.pool = Some(WarmPool::new(template, &self.run_root, target)?);
-        Ok(())
+        self.backend.enable_warm_pool(template, target)
     }
 
-    /// 温池 (hits, misses, ready_len)；未启用返回 None。供守护内省 / bench。
+    /// 温池 (hits, misses, ready_len)；未启用/后端不支持返回 None。供守护内省 / bench。
     pub fn pool_stats(&self) -> Option<(u64, u64, usize)> {
-        self.pool.as_ref().map(|p| p.stats())
+        self.backend.pool_stats()
     }
 
-    /// 阻塞等温池水位 ≥ `n` 或超时（bench 预填池用）。无池返回 false。
+    /// 阻塞等温池水位 ≥ `n` 或超时（bench 预填池用）。无池/不支持返回 false。
     pub fn pool_wait_ready(&self, n: usize, timeout: Duration) -> bool {
-        self.pool.as_ref().map(|p| p.wait_ready(n, timeout)).unwrap_or(false)
+        self.backend.pool_wait_ready(n, timeout)
     }
 
-    /// M2 W5：为 `template` 起单模板热池（水位 `target`，预置暂停态 VM）。命中优先于温池。
-    /// `target == 0` 视为不启用（幂等清空既有池 → Drop 杀 parked）。守护/bench 建 Orch 后调用。
+    /// M2 W5：为 `template` 起单模板热池（需后端具 `pause_resume`+`prebake_snapshot`）。委托后端。
+    /// `target == 0` 视为不启用（幂等清空既有池）。守护/bench 建 Orch 后调用。
     pub fn enable_hot_pool(&mut self, template: &Path, target: usize) -> Result<(), String> {
-        if target == 0 {
-            self.hot = None;
-            return Ok(());
-        }
-        self.hot = Some(HotPool::new(self.cfg, template, &self.run_root, target)?);
-        Ok(())
+        self.backend.enable_hot_pool(template, target)
     }
 
-    /// 阻塞等热池水位 ≥ `n` 或超时（bench 预填池用）。无池返回 false。
+    /// 阻塞等热池水位 ≥ `n` 或超时（bench 预填池用）。无池/不支持返回 false。
     pub fn hot_wait_ready(&self, n: usize, timeout: Duration) -> bool {
-        self.hot.as_ref().map(|h| h.wait_ready(n, timeout)).unwrap_or(false)
+        self.backend.hot_wait_ready(n, timeout)
     }
 
     /// 创建 = 从预烘焙快照**恢复**（keep-alive 持有 VM）。用 orchestrator 的默认模板。
@@ -155,143 +146,55 @@ impl<'a> Orch<'a> {
         }
         let template = abspath(template)?;
 
-        // 三段式（M2 W5）：hot → warm → cold。命中**热池**最快——暂停态 VM 只 activate（resume+reinit），
-        // FC spawn + snapshot load 已在关键路径外；其次**温池**（省 copy）；再次**冷路径**（现逻辑）。
-        if let Some(slot) = self.try_hot_hit(&template) {
-            return self.create_from_hot(&template, slot, spec);
+        // ① 能力校验（创建期，ADR-14）：required_capabilities 不被后端满足即拒——禁止运行期静默降级。
+        if !spec.required_capabilities.is_empty() {
+            let missing = spec.required_capabilities.missing_from(&self.backend.capabilities());
+            if !missing.is_empty() {
+                return Err(format!(
+                    "{UNSUPPORTED_BY_BACKEND}: 后端 {} 不满足 required_capabilities {:?}",
+                    self.backend.id(),
+                    missing
+                ));
+            }
         }
 
-        // 温池命中（copy_ms=0，refill 线程锁外备好私有 rootfs/vmstate/mem）或冷路径（现场 copy，零回归）。
-        let (id, dir_abs, copy_ms, pool_hit) = match self.try_pool_hit(&template) {
-            Some(slot) => (slot.id, slot.dir, 0u128, true),
-            None => {
-                let mut idb = [0u8; 6];
-                host_random(&mut idb);
-                let id = hex(&idb);
-                let dir = self.run_root.join(&id);
-                let copy_ms = prepare_instance_dir(&template, &dir)?;
-                let dir_abs = abspath(&dir)?;
-                (id, dir_abs, copy_ms, false)
-            }
-        };
+        // ② 后端造 running 实例（FC：三段 hot→warm→cold；机制态归后端）。
+        let bc = self.backend.create(&template, spec)?;
 
-        // 恢复（keep-alive）：目录级 bind（实例目录 → 模板目录）令 FC 烘焙的 rootfs/vsock 绝对路径落进
-        // 实例私有副本——并发不撞、不脏模板。vmstate/mem 从实例目录（未被 bind 遮蔽）直取。
-        let ctx = RestoreCtx {
-            template_dir: &template,
-            instance_dir: &dir_abs,
-            bind: Some((dir_abs.clone(), template.clone())),
-            keep_alive: true,
-            // Option A：快照无网卡 → 恢复态 guest 无 eth0（出口天然为零，仍 fail-safe）。真流量 live gate
-            // 证明走 `--net-live-reconcile` 冷启动；restore-path live 网卡落地待后续。
-            netns: None,
-        };
-        let (o, child) = match restore_core(self.cfg, &ctx) {
-            Ok((o, Some(c), _gate)) => (o, c),
-            Ok((_, None, _gate)) => {
-                let _ = std::fs::remove_dir_all(&dir_abs);
-                return Err("恢复未返回 VM 句柄（keep_alive 语义异常）".into());
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir_abs);
-                return Err(format!("创建走恢复失败: {e}"));
-            }
-        };
-        // 总时延 = 私有 rootfs 副本（restore 前）+ 恢复（spawn→ready）；分段另报以定位大头。
-        let total_ms = copy_ms.saturating_add(o.total_ms);
-        self.register_live(id, dir_abs, child, o, spec, &template, copy_ms, total_ms, pool_hit, false)
-    }
-
-    /// 热池命中创建：暂停态槽 `restore_activate` 拉起（netns=None、keep_alive）→ 登记 Live。
-    /// `total_ms` = activate wall-clock（park 的 spawn+load 已在关键路径外）；`copy_ms=0`。
-    /// 活化失败即杀 parked child + 删 dir（尚无 lease 可撤）。
-    fn create_from_hot(&mut self, template: &Path, slot: HotSlot, spec: &SandboxSpec) -> Result<CreateOutcome, String> {
-        let HotSlot { id, dir, parked } = slot;
-        let t = Instant::now();
-        let (o, child) = match restore_activate(self.cfg, None, true, parked) {
-            Ok((o, Some(c), _gate)) => (o, c),
-            Ok((_, None, _gate)) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err("热池活化未返回 VM 句柄（keep_alive 语义异常）".into());
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(format!("热池活化失败: {e}"));
-            }
-        };
-        let activate_ms = t.elapsed().as_millis();
-        self.register_live(id, dir, child, o, spec, template, 0, activate_ms, true, true)
-    }
-
-    /// 登记在册（三段共用）：grant lease + 写 meta/state（挂 lease → 随回收/撤销一并删）→ 存 Live。
-    /// 任一步失败即回滚（撤 lease + 杀 child + 删 dir），返回 `CreateOutcome`。
-    #[allow(clippy::too_many_arguments)]
-    fn register_live(
-        &mut self,
-        id: String,
-        dir: PathBuf,
-        mut child: Child,
-        o: LoadOutcome,
-        spec: &SandboxSpec,
-        template: &Path,
-        copy_ms: u128,
-        total_ms: u128,
-        pool_hit: bool,
-        hot_hit: bool,
-    ) -> Result<CreateOutcome, String> {
+        // ③ 编排：grant lease + 写 meta/state（挂 lease → 随空闲回收/撤销一并删）→ 存编排态。
+        //    任一步失败即回滚（撤 lease + 令后端销毁实例）。
         let created_at = now_unix();
         let ttl_deadline = compute_ttl_deadline(created_at, spec.ttl_secs);
         let lease = match self.store.lease_grant(spec.idle_secs) {
             Ok(l) => l,
             Err(e) => {
-                kill_group(&mut child);
-                let _ = std::fs::remove_dir_all(&dir);
+                self.backend.destroy(&bc.id);
                 return Err(e.to_string());
             }
         };
-        let meta = build_meta_json(&id, spec, created_at, ttl_deadline, template);
-        if let Err(e) = self.store.put(&meta_key(&id), meta.as_bytes(), Some(lease)) {
+        let meta = build_meta_json(&bc.id, spec, created_at, ttl_deadline, &template);
+        if let Err(e) = self.store.put(&meta_key(&bc.id), meta.as_bytes(), Some(lease)) {
             let _ = self.store.lease_revoke(lease);
-            kill_group(&mut child);
-            let _ = std::fs::remove_dir_all(&dir);
+            self.backend.destroy(&bc.id);
             return Err(format!("写 sandbox meta 失败: {e}"));
         }
-        if let Err(e) = self.store.put(&state_key(&id), b"running", Some(lease)) {
+        if let Err(e) = self.store.put(&state_key(&bc.id), b"running", Some(lease)) {
             let _ = self.store.lease_revoke(lease);
-            kill_group(&mut child);
-            let _ = std::fs::remove_dir_all(&dir);
+            self.backend.destroy(&bc.id);
             return Err(format!("写 sandbox state 失败: {e}"));
         }
-        self.live.insert(id.clone(), Live { child, dir, lease, ttl_deadline });
+        self.live.insert(bc.id.clone(), LiveMeta { lease, ttl_deadline });
         Ok(CreateOutcome {
-            id,
-            total_ms,
-            copy_ms,
-            api_ready_ms: o.api_ready_ms,
-            load_ms: o.load_ms,
-            resume_ms: o.resume_ms,
-            machine_id: o.machine_id,
-            pool_hit,
-            hot_hit,
+            id: bc.id,
+            total_ms: bc.total_ms,
+            copy_ms: bc.copy_ms,
+            api_ready_ms: bc.api_ready_ms,
+            load_ms: bc.load_ms,
+            resume_ms: bc.resume_ms,
+            machine_id: bc.machine_id,
+            pool_hit: bc.pool_hit,
+            hot_hit: bc.hot_hit,
         })
-    }
-
-    /// 温池命中判定：请求模板 == 温池模板（均 canonical）且弹到热槽即返回槽；否则 None（走冷路径）。
-    fn try_pool_hit(&self, template: &Path) -> Option<crate::pool::WarmSlot> {
-        let pool = self.pool.as_ref()?;
-        if pool.template() != template {
-            return None;
-        }
-        pool.try_pop()
-    }
-
-    /// 热池命中判定：请求模板 == 热池模板（均 canonical）且弹到暂停态槽即返回；否则 None。
-    fn try_hot_hit(&self, template: &Path) -> Option<HotSlot> {
-        let hot = self.hot.as_ref()?;
-        if hot.template() != template {
-            return None;
-        }
-        hot.try_pop()
     }
 
     /// keepalive：滑窗重置 idle（lease）。**不**动 `ttl_deadline`（TTL 是绝对硬顶）。返回新到期 unix 秒。
@@ -305,13 +208,11 @@ impl<'a> Orch<'a> {
         self.live.get(id).map(|l| l.ttl_deadline)
     }
 
-    /// 手动 destroy：杀 VM 进程组 → 撤销 lease（删 lease+挂键）→ 删实例目录 → 出台账。返回被删 store 键。
+    /// 手动 destroy：后端销毁实例（杀进程 + 删目录）→ 撤销 lease（删 lease+挂键）→ 出台账。返回被删 store 键。
     pub fn destroy(&mut self, id: &str) -> Result<Vec<String>, String> {
-        let mut live = self.live.remove(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
-        kill_group(&mut live.child);
-        let deleted = self.store.lease_revoke(live.lease).map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_dir_all(&live.dir);
-        Ok(deleted)
+        let meta = self.live.remove(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
+        self.backend.destroy(id);
+        self.store.lease_revoke(meta.lease).map_err(|e| e.to_string())
     }
 
     /// reaper（手动驱动，收显式 `now` → 确定性测试无需真实 sleep）。
@@ -339,9 +240,8 @@ impl<'a> Orch<'a> {
         ids.sort();
         ids.dedup();
         for id in ids {
-            if let Some(mut live) = self.live.remove(&id) {
-                kill_group(&mut live.child);
-                let _ = std::fs::remove_dir_all(&live.dir);
+            if self.live.remove(&id).is_some() {
+                self.backend.destroy(&id);
                 reaped.push(id);
             }
         }
@@ -352,20 +252,21 @@ impl<'a> Orch<'a> {
     fn is_live(&self, id: &str) -> bool {
         self.live.contains_key(id)
     }
+    /// 实例目录（对账查残留用）：由后端数据面端点反推（control_path 的父目录）。
     fn dir_of(&self, id: &str) -> Option<PathBuf> {
-        self.live.get(id).map(|l| l.dir.clone())
+        self.backend.control_path(id).and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     // —— 守护（api.rs 复用）——
 
-    /// 在册沙箱的 vsock uds 路径（连 guest 执行 exec/文件桥接用）；不在册返回 None。
+    /// 在册沙箱的 vsock uds 路径（连 guest 执行 exec/文件桥接用）；不在册返回 None。委托后端数据面端点。
     pub fn vsock_path(&self, id: &str) -> Option<PathBuf> {
-        self.live.get(id).map(|l| l.dir.join("vsock.sock"))
+        self.backend.control_path(id)
     }
 
-    /// 在册沙箱的 console 日志路径（GET /logs 用）；不在册返回 None。
+    /// 在册沙箱的 console 日志路径（GET /logs 用）；不在册返回 None。委托后端。
     pub fn log_path(&self, id: &str) -> Option<PathBuf> {
-        self.live.get(id).map(|l| l.dir.join("console.load.log"))
+        self.backend.log_path(id)
     }
 
     /// 列出所有沙箱 meta JSON（每项已是 store 里落的 JSON 对象串）。供 `GET /v1/sandboxes`。
@@ -825,6 +726,7 @@ pub fn pool_bench(cfg: &Config, template: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_random; // 仅单测用（id 生成断言）
 
     #[test]
     fn key_helpers_roundtrip() {
@@ -855,7 +757,14 @@ mod tests {
     fn meta_json_shape() {
         let mut md = BTreeMap::new();
         md.insert("team".to_string(), "core".to_string());
-        let spec = SandboxSpec { vcpus: 4, mem_mib: 1024, ttl_secs: 300, idle_secs: 60, metadata: md };
+        let spec = SandboxSpec {
+            vcpus: 4,
+            mem_mib: 1024,
+            ttl_secs: 300,
+            idle_secs: 60,
+            metadata: md,
+            required_capabilities: Capabilities::empty(),
+        };
         let j = build_meta_json("s1", &spec, 1000, 1300, Path::new("/t/hello"));
         assert!(j.contains(r#""id":"s1""#));
         assert!(j.contains(r#""vcpus":4"#));
