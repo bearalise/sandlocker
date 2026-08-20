@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use sl_store::{LeaseId, SqliteStore, Store};
 
-use crate::pool::WarmPool;
-use crate::{abspath, hex, host_random, kill_group, restore_core, Config, RestoreCtx};
+use crate::pool::{HotPool, HotSlot, WarmPool};
+use crate::{abspath, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome, RestoreCtx};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
 /// 决定，vcpus/mem 为记录性字段（真正按 spec 造型待冷路径/多模板，如实标注）。
@@ -56,8 +56,10 @@ pub struct CreateOutcome {
     pub resume_ms: u128,
     /// ADR-12 reinit 换发的克隆 machine-id（并发隔离断言用）。
     pub machine_id: String,
-    /// M2 W4：本次 create 是否命中温池（走池命中路径，`copy_ms=0`）。冷路径为 false。
+    /// M2 W4：本次 create 是否命中池（温池或热池，`copy_ms=0`）。冷路径为 false。
     pub pool_hit: bool,
+    /// M2 W5：是否命中**热池**（暂停态 VM，仅 activate；`total_ms`=activate wall-clock）。温/冷为 false。
+    pub hot_hit: bool,
 }
 
 /// 在册运行中的沙箱句柄。`id` 即 `live` 映射键，不重复存。
@@ -80,6 +82,8 @@ pub struct Orch<'a> {
     /// M2 W4：单模板温池（可选）。仅当请求模板 == `pool.template()` 时走池命中路径；
     /// 其它模板/无池均走冷路径（零回归）。
     pool: Option<WarmPool>,
+    /// M2 W5：单模板热池（可选，默认无）。命中优先于温池（最快，仅 activate）。
+    hot: Option<HotPool>,
 }
 
 impl<'a> Orch<'a> {
@@ -96,6 +100,7 @@ impl<'a> Orch<'a> {
             run_root: run_root.to_path_buf(),
             live: HashMap::new(),
             pool: None,
+            hot: None,
         })
     }
 
@@ -120,6 +125,22 @@ impl<'a> Orch<'a> {
         self.pool.as_ref().map(|p| p.wait_ready(n, timeout)).unwrap_or(false)
     }
 
+    /// M2 W5：为 `template` 起单模板热池（水位 `target`，预置暂停态 VM）。命中优先于温池。
+    /// `target == 0` 视为不启用（幂等清空既有池 → Drop 杀 parked）。守护/bench 建 Orch 后调用。
+    pub fn enable_hot_pool(&mut self, template: &Path, target: usize) -> Result<(), String> {
+        if target == 0 {
+            self.hot = None;
+            return Ok(());
+        }
+        self.hot = Some(HotPool::new(self.cfg, template, &self.run_root, target)?);
+        Ok(())
+    }
+
+    /// 阻塞等热池水位 ≥ `n` 或超时（bench 预填池用）。无池返回 false。
+    pub fn hot_wait_ready(&self, n: usize, timeout: Duration) -> bool {
+        self.hot.as_ref().map(|h| h.wait_ready(n, timeout)).unwrap_or(false)
+    }
+
     /// 创建 = 从预烘焙快照**恢复**（keep-alive 持有 VM）。用 orchestrator 的默认模板。
     pub fn create(&mut self, spec: &SandboxSpec) -> Result<CreateOutcome, String> {
         let tpl = self.template.clone();
@@ -134,9 +155,13 @@ impl<'a> Orch<'a> {
         }
         let template = abspath(template)?;
 
-        // 1-2) 备实例目录。**池命中路径**（M2 W4）：请求模板 == 温池模板且弹到热槽 →
-        //      槽已备妥私有 rootfs/vmstate/mem（copy 在池 refill 线程锁外完成）→ `copy_ms=0`。
-        //      否则**冷路径**：现场生成 id + `prepare_instance_dir`（copy 计入关键路径），零回归。
+        // 三段式（M2 W5）：hot → warm → cold。命中**热池**最快——暂停态 VM 只 activate（resume+reinit），
+        // FC spawn + snapshot load 已在关键路径外；其次**温池**（省 copy）；再次**冷路径**（现逻辑）。
+        if let Some(slot) = self.try_hot_hit(&template) {
+            return self.create_from_hot(&template, slot, spec);
+        }
+
+        // 温池命中（copy_ms=0，refill 线程锁外备好私有 rootfs/vmstate/mem）或冷路径（现场 copy，零回归）。
         let (id, dir_abs, copy_ms, pool_hit) = match self.try_pool_hit(&template) {
             Some(slot) => (slot.id, slot.dir, 0u128, true),
             None => {
@@ -149,72 +174,124 @@ impl<'a> Orch<'a> {
                 (id, dir_abs, copy_ms, false)
             }
         };
-        let dir = dir_abs.clone();
 
-        // 3) lease（idle 计时器）+ sandbox/ 元数据（挂 lease → 随空闲回收/撤销一并删）
-        let created_at = now_unix();
-        let ttl_deadline = compute_ttl_deadline(created_at, spec.ttl_secs);
-        let lease = self.store.lease_grant(spec.idle_secs).map_err(|e| e.to_string())?;
-        let meta = build_meta_json(&id, spec, created_at, ttl_deadline, &template);
-        if let Err(e) = self.store.put(&meta_key(&id), meta.as_bytes(), Some(lease)) {
-            let _ = self.store.lease_revoke(lease);
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(format!("写 sandbox meta 失败: {e}"));
-        }
-        if let Err(e) = self.store.put(&state_key(&id), b"running", Some(lease)) {
-            let _ = self.store.lease_revoke(lease);
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(format!("写 sandbox state 失败: {e}"));
-        }
-
-        // 4) 恢复（keep-alive）：目录级 bind（实例目录 → 模板目录）令 FC 烘焙的 rootfs/vsock 绝对
-        //    路径落进实例私有副本——并发不撞、不脏模板。vmstate/mem 从实例目录（未被 bind 遮蔽）直取。
+        // 恢复（keep-alive）：目录级 bind（实例目录 → 模板目录）令 FC 烘焙的 rootfs/vsock 绝对路径落进
+        // 实例私有副本——并发不撞、不脏模板。vmstate/mem 从实例目录（未被 bind 遮蔽）直取。
         let ctx = RestoreCtx {
             template_dir: &template,
-            instance_dir: &dir,
+            instance_dir: &dir_abs,
             bind: Some((dir_abs.clone(), template.clone())),
             keep_alive: true,
-            // Option A（M2 W2）：快照无网卡 → 恢复态 guest 无 eth0，orchestrator 实例本周保持无网卡
-            // （出口天然为零，仍 fail-safe）。真流量 live gate 证明走 `--net-live-reconcile` 冷启动；
-            // restore-path live 网卡落地待后续（届时此处传 `Some(&ns)` 并线程化门禁句柄）。
+            // Option A：快照无网卡 → 恢复态 guest 无 eth0（出口天然为零，仍 fail-safe）。真流量 live gate
+            // 证明走 `--net-live-reconcile` 冷启动；restore-path live 网卡落地待后续。
             netns: None,
         };
         let (o, child) = match restore_core(self.cfg, &ctx) {
             Ok((o, Some(c), _gate)) => (o, c),
             Ok((_, None, _gate)) => {
-                let _ = self.store.lease_revoke(lease);
-                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&dir_abs);
                 return Err("恢复未返回 VM 句柄（keep_alive 语义异常）".into());
             }
             Err(e) => {
-                let _ = self.store.lease_revoke(lease);
-                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&dir_abs);
                 return Err(format!("创建走恢复失败: {e}"));
             }
         };
+        // 总时延 = 私有 rootfs 副本（restore 前）+ 恢复（spawn→ready）；分段另报以定位大头。
+        let total_ms = copy_ms.saturating_add(o.total_ms);
+        self.register_live(id, dir_abs, child, o, spec, &template, copy_ms, total_ms, pool_hit, false)
+    }
 
-        // 5) 登记 Live（持有 Child，不 kill）
-        self.live.insert(id.clone(), Live { child, dir: dir_abs, lease, ttl_deadline });
-        // 创建总时延 = 私有 rootfs 副本（restore 前）+ 恢复（spawn→ready）；分段另报以定位大头。
+    /// 热池命中创建：暂停态槽 `restore_activate` 拉起（netns=None、keep_alive）→ 登记 Live。
+    /// `total_ms` = activate wall-clock（park 的 spawn+load 已在关键路径外）；`copy_ms=0`。
+    /// 活化失败即杀 parked child + 删 dir（尚无 lease 可撤）。
+    fn create_from_hot(&mut self, template: &Path, slot: HotSlot, spec: &SandboxSpec) -> Result<CreateOutcome, String> {
+        let HotSlot { id, dir, parked } = slot;
+        let t = Instant::now();
+        let (o, child) = match restore_activate(self.cfg, None, true, parked) {
+            Ok((o, Some(c), _gate)) => (o, c),
+            Ok((_, None, _gate)) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err("热池活化未返回 VM 句柄（keep_alive 语义异常）".into());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(format!("热池活化失败: {e}"));
+            }
+        };
+        let activate_ms = t.elapsed().as_millis();
+        self.register_live(id, dir, child, o, spec, template, 0, activate_ms, true, true)
+    }
+
+    /// 登记在册（三段共用）：grant lease + 写 meta/state（挂 lease → 随回收/撤销一并删）→ 存 Live。
+    /// 任一步失败即回滚（撤 lease + 杀 child + 删 dir），返回 `CreateOutcome`。
+    #[allow(clippy::too_many_arguments)]
+    fn register_live(
+        &mut self,
+        id: String,
+        dir: PathBuf,
+        mut child: Child,
+        o: LoadOutcome,
+        spec: &SandboxSpec,
+        template: &Path,
+        copy_ms: u128,
+        total_ms: u128,
+        pool_hit: bool,
+        hot_hit: bool,
+    ) -> Result<CreateOutcome, String> {
+        let created_at = now_unix();
+        let ttl_deadline = compute_ttl_deadline(created_at, spec.ttl_secs);
+        let lease = match self.store.lease_grant(spec.idle_secs) {
+            Ok(l) => l,
+            Err(e) => {
+                kill_group(&mut child);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e.to_string());
+            }
+        };
+        let meta = build_meta_json(&id, spec, created_at, ttl_deadline, template);
+        if let Err(e) = self.store.put(&meta_key(&id), meta.as_bytes(), Some(lease)) {
+            let _ = self.store.lease_revoke(lease);
+            kill_group(&mut child);
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("写 sandbox meta 失败: {e}"));
+        }
+        if let Err(e) = self.store.put(&state_key(&id), b"running", Some(lease)) {
+            let _ = self.store.lease_revoke(lease);
+            kill_group(&mut child);
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("写 sandbox state 失败: {e}"));
+        }
+        self.live.insert(id.clone(), Live { child, dir, lease, ttl_deadline });
         Ok(CreateOutcome {
             id,
-            total_ms: copy_ms.saturating_add(o.total_ms),
+            total_ms,
             copy_ms,
             api_ready_ms: o.api_ready_ms,
             load_ms: o.load_ms,
             resume_ms: o.resume_ms,
             machine_id: o.machine_id,
             pool_hit,
+            hot_hit,
         })
     }
 
-    /// 池命中判定：请求模板 == 温池模板（均 canonical）且弹到热槽即返回槽；否则 None（走冷路径）。
+    /// 温池命中判定：请求模板 == 温池模板（均 canonical）且弹到热槽即返回槽；否则 None（走冷路径）。
     fn try_pool_hit(&self, template: &Path) -> Option<crate::pool::WarmSlot> {
         let pool = self.pool.as_ref()?;
         if pool.template() != template {
             return None;
         }
         pool.try_pop()
+    }
+
+    /// 热池命中判定：请求模板 == 热池模板（均 canonical）且弹到暂停态槽即返回；否则 None。
+    fn try_hot_hit(&self, template: &Path) -> Option<HotSlot> {
+        let hot = self.hot.as_ref()?;
+        if hot.template() != template {
+            return None;
+        }
+        hot.try_pop()
     }
 
     /// keepalive：滑窗重置 idle（lease）。**不**动 `ttl_deadline`（TTL 是绝对硬顶）。返回新到期 unix 秒。
@@ -524,6 +601,22 @@ pub fn reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
     orch.destroy(&e.id)?;
     log("⑥ 并发双克隆：machine-id 互异 ✓");
 
+    // ⑦ 热池（M2 W5）：预置暂停态 VM ×2 → 两次热命中（走 activate）→ machine-id 互异（reinit 在
+    //    activate 分叉，克隆熵隔离正确）+ 各命中 hot_hit=true + destroy 零残留 + 模板仍不变。
+    orch.enable_hot_pool(template, 2)?;
+    ensure(orch.hot_wait_ready(2, Duration::from_secs(60)), "⑦ 热池未在超时内预置到水位 2")?;
+    let h1 = orch.create(&SandboxSpec::default())?;
+    let h2 = orch.create(&SandboxSpec::default())?;
+    ensure(h1.hot_hit && h2.hot_hit, "⑦ 未走热池命中路径（hot_hit=false）")?;
+    ensure(h1.copy_ms == 0 && h2.copy_ms == 0, "⑦ 热池命中 copy_ms 应为 0")?;
+    ensure(!h1.machine_id.is_empty() && h1.machine_id != h2.machine_id, "⑦ 两热池克隆 machine-id 相同（熵未分叉）")?;
+    let dir_h1 = orch.dir_of(&h1.id).unwrap();
+    orch.destroy(&h1.id)?;
+    orch.destroy(&h2.id)?;
+    ensure(!orch.is_live(&h1.id) && !dir_h1.exists(), "⑦ 热池实例 destroy 后有残留")?;
+    orch.enable_hot_pool(template, 0)?; // 关热池 → Drop 杀掉后台补的 parked VM + 清 dir
+    log("⑦ 热池双命中：hot_hit + machine-id 互异 + 零残留 ✓");
+
     // 收尾：store sandbox/ 空 + 模板 rootfs sha256 不变（bind 遮蔽证明 FC 从未写模板）
     ensure(
         orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(),
@@ -533,10 +626,10 @@ pub fn reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
     ensure(tpl_sha_before == tpl_sha_after, "收尾 模板 rootfs 被写脏（bind 遮蔽失效）")?;
 
     if cfg.json {
-        println!(r#"{{"metric":"orch_reconcile","cases":6,"template_immutable":true,"pass":true}}"#);
+        println!(r#"{{"metric":"orch_reconcile","cases":7,"template_immutable":true,"hot_pool":true,"pass":true}}"#);
     } else {
         println!(
-            "[orch] Q9 对账 PASS：create/keepalive/idle 回收/TTL 硬顶/手动 destroy 每步零残留 + 并发双克隆隔离 + 模板 rootfs 不变"
+            "[orch] Q9 对账 PASS：create/keepalive/idle 回收/TTL 硬顶/手动 destroy/热池双命中 每步零残留 + 并发双克隆隔离 + 模板 rootfs 不变"
         );
     }
     Ok(())
@@ -664,6 +757,33 @@ pub fn pool_bench(cfg: &Config, template: &Path) -> Result<(), String> {
     let hit_rate = win_hits as f64 / (win_hits + win_miss).max(1) as f64;
     let warm_le_100 = warm_p50 <= 100;
 
+    // —— 超热档（M2 W5）：热池预置暂停态 VM，命中仅 activate（spawn+load 已在关键路径外）。
+    //    bounded 数量（≤4）避免过多常驻 parked VM 打爆内存；hot_p50 信息性上报（<50ms 达标裸金属）。
+    let hot_n = cycles.min(4);
+    let mut hot_p50 = 0u128;
+    if hot_n > 0 {
+        let hot_store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+        let mut hotorch = Orch::new(cfg, &template, &run_root.join("hot"), Box::new(hot_store))?;
+        hotorch.enable_hot_pool(&template, hot_n)?;
+        if hotorch.hot_wait_ready(hot_n, Duration::from_secs(120)) {
+            let mut hot_totals = Vec::new();
+            for _ in 0..hot_n {
+                let o = hotorch.create(&spec)?;
+                if o.hot_hit {
+                    hot_totals.push(o.total_ms);
+                }
+                hotorch.destroy(&o.id)?;
+            }
+            hot_p50 = percentile(&mut hot_totals, 50);
+            log(&format!("超热档 n={} hot_p50={hot_p50}ms（仅 activate，<50ms 达标裸金属信息性）", hot_totals.len()));
+        } else {
+            log("警告：热池未在 120s 内预置，跳过超热档（hot_p50=0）");
+        }
+        hotorch.enable_hot_pool(&template, 0)?; // 关热池 → Drop 杀 parked + 清 dir
+        drop(hotorch);
+    }
+    let hot_le_50 = hot_p50 > 0 && hot_p50 <= 50;
+
     // 回归判据：温池不劣于冷档（`<=` 容忍 reflink fs 上 copy≈0 的等值噪声；ext4 上仍严格小于）。
     let regression_ok = warm_p50 <= cold_p50;
     // 绝对预算 gate（硬出口①）：env `POOL_P50_BUDGET_MS`>0 时追加 warm_p50 ≤ budget。缺省 0=关——
@@ -674,7 +794,7 @@ pub fn pool_bench(cfg: &Config, template: &Path) -> Result<(), String> {
 
     if cfg.json {
         println!(
-            r#"{{"metric":"pool_bench","n":{},"cold_p50":{cold_p50},"cold_p90":{cold_p90},"warm_p50":{warm_p50},"warm_p90":{warm_p90},"warm_hit_rate":{hit_rate:.3},"copy_saved_p50":{copy_saved_p50},"warm_le_100":{warm_le_100},"budget_ms":{budget_ms},"pass":{pass}}}"#,
+            r#"{{"metric":"pool_bench","n":{},"cold_p50":{cold_p50},"cold_p90":{cold_p90},"warm_p50":{warm_p50},"warm_p90":{warm_p90},"warm_hit_rate":{hit_rate:.3},"copy_saved_p50":{copy_saved_p50},"warm_le_100":{warm_le_100},"hot_p50":{hot_p50},"hot_le_50":{hot_le_50},"budget_ms":{budget_ms},"pass":{pass}}}"#,
             warm_totals.len()
         );
     } else {

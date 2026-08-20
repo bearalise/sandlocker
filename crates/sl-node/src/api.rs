@@ -60,19 +60,21 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
 
     // M2 W4 温池：--pool-size>0 且指定 --pool-template 时，解析该模板→建单模板温池。请求命中同
     // 模板走池命中路径（copy_ms=0），其它模板/未启用均走冷路径（零回归）。模板解析失败仅告警不阻塞。
-    if cfg.pool_size > 0 {
-        if let Some(name) = cfg.pool_template.clone() {
-            match resolve_template(&orch, &template_root, &name) {
-                Ok(dir) => {
+    // M2 W5 热池：--pool-template 解析成功且 --hot-size>0 时，为该模板预置暂停态 VM（命中优先于温池）。
+    if (cfg.pool_size > 0 || cfg.hot_size > 0) && cfg.pool_template.is_some() {
+        let name = cfg.pool_template.clone().unwrap();
+        match resolve_template(&orch, &template_root, &name) {
+            Ok(dir) => {
+                if cfg.pool_size > 0 {
                     orch.enable_warm_pool(&dir, cfg.pool_size)?;
-                    println!(
-                        "[sandlocker] 温池已启用：template={name} size={} dir={}",
-                        cfg.pool_size,
-                        dir.display()
-                    );
+                    println!("[sandlocker] 温池已启用：template={name} size={} dir={}", cfg.pool_size, dir.display());
                 }
-                Err(e) => eprintln!("[sandlocker] 温池未启用（模板解析失败，走冷路径）: {e}"),
+                if cfg.hot_size > 0 {
+                    orch.enable_hot_pool(&dir, cfg.hot_size)?;
+                    println!("[sandlocker] 热池已启用：template={name} size={}（暂停态 VM 常驻内存）", cfg.hot_size);
+                }
             }
+            Err(e) => eprintln!("[sandlocker] 池未启用（模板解析失败，走冷路径）: {e}"),
         }
     }
     let shared: Shared = Arc::new(Mutex::new(orch));
@@ -363,8 +365,8 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
     let dir = resolve_template(&o, template_root, name)?;
     let out = o.create_in(&dir, &spec)?;
     Ok(format!(
-        r#"{{"id":"{}","state":"running","machine_id":"{}","template":"{}","total_ms":{},"copy_ms":{},"api_ready_ms":{},"load_ms":{},"resume_ms":{},"pool_hit":{}}}"#,
-        out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms, out.pool_hit
+        r#"{{"id":"{}","state":"running","machine_id":"{}","template":"{}","total_ms":{},"copy_ms":{},"api_ready_ms":{},"load_ms":{},"resume_ms":{},"pool_hit":{},"hot_hit":{}}}"#,
+        out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms, out.pool_hit, out.hot_hit
     )
     .into_bytes())
 }

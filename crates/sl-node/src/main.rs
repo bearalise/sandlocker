@@ -166,6 +166,9 @@ struct Config {
     /// --pool-template <name>：M2 W4 --serve 温池绑定的模板名（经 template_root 解析）。
     /// 缺省不建池（--serve 全走冷路径，零回归）。请求命中同模板走池命中路径。
     pool_template: Option<String>,
+    /// --hot-size N：M2 W5 --serve 热池目标水位（默认 0=关；>0 预置暂停态 VM，命中优先于温池）。
+    /// 模板复用 --pool-template。parked VM 常驻内存，故默认关、显式开启。
+    hot_size: usize,
 }
 
 fn main() {
@@ -720,16 +723,23 @@ fn validate_outcome(o: &LoadOutcome) -> Option<String> {
     None
 }
 
-/// W2 恢复核心 + W4 ADR-13 时序 + ADR-12 reinit（W7 抽出，参数化实例目录/bind/keep-alive）。**不打印**。
-///
-/// 时序（Q4）：fresh FC → `snapshot/load{resume_vm:false}`（load 后**暂停**，vCPU 不跑）
-///   → `apply_network_policy` 策略钩子 → `PATCH /vm Resumed` → 连 vsock → Ping →
-///   **下发 Reinit**（换发 machine-id/hostname/会话密钥、混种子、校时钟）→ 一致性校验。
-/// 暂停态构造上不可能发包，且策略钩子在 resume 之前，故"策略生效前无发包窗口"不存在。
-fn restore_core(
-    cfg: &Config,
-    ctx: &RestoreCtx,
-) -> Result<(LoadOutcome, Option<Child>, Option<nftfw::Sandbox>), String> {
+/// **park 段**（M2 W5 热池）：fresh FC → `snapshot/load{resume_vm:false}` **停在暂停态**（vCPU 不跑，
+/// 构造上不可能发包）。此后可长期停放（热池），或立即 [`restore_activate`]。失败即杀 child + 清 socket。
+/// **不打印**。全字段 `Send` → 可跨 refill 线程停放。
+pub(crate) struct ParkedVm {
+    pub child: Child,
+    pub api_host: PathBuf,
+    pub vsock: PathBuf,
+    /// spawn 起点：组合路径（restore_core）用它算 `total_ms`；热池命中另在 activate 外测 wall-clock。
+    pub spawn_at: Instant,
+    pub api_ready_ms: u128,
+    pub load_ms: u128,
+    pub want_token: String,
+    pub want_uptime: f64,
+}
+
+/// park 段实现：见 [`ParkedVm`]。参数化实例目录/bind/netns（与旧 restore_core 前半逐字节等价）。
+pub(crate) fn restore_park(cfg: &Config, ctx: &RestoreCtx) -> Result<ParkedVm, String> {
     let tdir = abspath(ctx.template_dir)?;
     let idir = abspath(ctx.instance_dir)?;
     let vmstate = idir.join("vmstate");
@@ -795,9 +805,8 @@ fn restore_core(
     let spawn_at = Instant::now();
     let mut child = spawn_with_log(cmd, &console_log)?;
 
-    // live 门禁句柄（Some 仅当 ctx.netns 且 root）：闭包内 ensure 成功后写入，供失败清理 / 成功返回。
-    let mut gate: Option<nftfw::Sandbox> = None;
-    let result = (|| -> Result<LoadOutcome, String> {
+    // load 段（失败即杀 child + 清 socket，不泄漏暂停态 VM）。
+    let load = (|| -> Result<(u128, u128), String> {
         let api = FcApi::new(&api_host);
         wait_api_ready(&api, &mut child)?;
         let api_ready_ms = spawn_at.elapsed().as_millis();
@@ -814,10 +823,42 @@ fn restore_core(
             ),
         )?;
         let load_ms = load_at.elapsed().as_millis();
+        Ok((api_ready_ms, load_ms))
+    })();
+    let (api_ready_ms, load_ms) = match load {
+        Ok(v) => v,
+        Err(e) => {
+            kill_group(&mut child);
+            let _ = std::fs::remove_file(&api_host);
+            let _ = std::fs::remove_file(&vsock);
+            return Err(e);
+        }
+    };
 
-        // ADR-13：策略钩子在 resume **之前**生效。live 档（ctx.netns Some + root）fail-closed
+    Ok(ParkedVm { child, api_host, vsock, spawn_at, api_ready_ms, load_ms, want_token, want_uptime })
+}
+
+/// **activate 段**（M2 W5 热池）：`apply_network_policy`（resume **之前**，ADR-13）→ `PATCH /vm Resumed`
+/// → 连 vsock → Ping → **下发 Reinit**（ADR-12：换发 machine-id/hostname/会话密钥、混种子、校时钟）→
+/// 一致性校验。暂停态 park 后策略仍恒在 resume 前，故"策略生效前无发包窗口"不存在。**不打印**。
+///
+/// `keep_alive` 且校验通过：返回 `Child` 交调用方持有；否则杀 VM + 清 socket。门禁句柄交调用方 teardown。
+pub(crate) fn restore_activate(
+    cfg: &Config,
+    netns: Option<&str>,
+    keep_alive: bool,
+    parked: ParkedVm,
+) -> Result<(LoadOutcome, Option<Child>, Option<nftfw::Sandbox>), String> {
+    let ParkedVm { mut child, api_host, vsock, spawn_at, api_ready_ms, load_ms, want_token, want_uptime } = parked;
+
+    // live 门禁句柄（Some 仅当 netns 且 root）：闭包内 ensure 成功后写入，供失败清理 / 成功返回。
+    let mut gate: Option<nftfw::Sandbox> = None;
+    let result = (|| -> Result<LoadOutcome, String> {
+        let api = FcApi::new(&api_host);
+
+        // ADR-13：策略钩子在 resume **之前**生效。live 档（netns Some + root）fail-closed
         // ensure forward-hook 门禁——失败即 `?` 抛出，下方 resume 不执行（无发包窗口）。
-        let (policy_at, sb) = apply_network_policy(cfg, ctx.netns)?;
+        let (policy_at, sb) = apply_network_policy(cfg, netns)?;
         gate = sb;
 
         // resume：此后 vCPU 才运行、guest 才可能发包——而策略已就位。
@@ -885,7 +926,7 @@ fn restore_core(
 
     // 断言失败 或 非 keep-alive：杀 VM + 清 socket。keep-alive 且断言通过：保留交调用方持有。
     let assert_err = validate_outcome(&outcome);
-    if assert_err.is_some() || !ctx.keep_alive {
+    if assert_err.is_some() || !keep_alive {
         kill_group(&mut child);
         let _ = std::fs::remove_file(&api_host);
         let _ = std::fs::remove_file(&vsock);
@@ -897,9 +938,25 @@ fn restore_core(
         }
         return Err(msg);
     }
-    let child_opt = if ctx.keep_alive { Some(child) } else { None };
+    let child_opt = if keep_alive { Some(child) } else { None };
     // 门禁句柄交调用方 teardown：keep-alive（orchestrator）随实例销毁拆；探针/单发档由调用方即刻拆。
     Ok((outcome, child_opt, gate))
+}
+
+/// W2 恢复核心 + W4 ADR-13 时序 + ADR-12 reinit（W7 抽出，参数化实例目录/bind/keep-alive）。**不打印**。
+///
+/// M2 W5 起为 [`restore_park`] + [`restore_activate`] 的**薄组合**（单发/warm/cold/net-timing-live 路径
+/// 逐字节等价，签名与返回不变）；热池另路复用 park/activate 两段（park 后停放、命中即 activate）。
+///
+/// 时序（Q4）：fresh FC → `snapshot/load{resume_vm:false}`（load 后**暂停**，vCPU 不跑）
+///   → `apply_network_policy` 策略钩子 → `PATCH /vm Resumed` → 连 vsock → Ping →
+///   **下发 Reinit** → 一致性校验。暂停态构造上不可能发包，且策略钩子在 resume 之前。
+fn restore_core(
+    cfg: &Config,
+    ctx: &RestoreCtx,
+) -> Result<(LoadOutcome, Option<Child>, Option<nftfw::Sandbox>), String> {
+    let parked = restore_park(cfg, ctx)?;
+    restore_activate(cfg, ctx.netns, ctx.keep_alive, parked)
 }
 
 /// W2/W4 单发恢复：`restore_core` 之薄封装（实例目录==模板目录、无 bind、无 keep-alive）——
@@ -1847,6 +1904,7 @@ fn clone_paths(cfg: &Config) -> Config {
         pool_bench: None,
         pool_size: 2,
         pool_template: None,
+        hot_size: 0,
     }
 }
 
@@ -1960,6 +2018,7 @@ fn parse_args() -> Config {
         pool_bench: None,
         pool_size: 2,
         pool_template: None,
+        hot_size: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2002,6 +2061,9 @@ fn parse_args() -> Config {
                 cfg.pool_size = take().parse().unwrap_or_else(|_| { eprintln!("--pool-size 需整数"); std::process::exit(2); })
             }
             "--pool-template" => cfg.pool_template = Some(take()),
+            "--hot-size" => {
+                cfg.hot_size = take().parse().unwrap_or_else(|_| { eprintln!("--hot-size 需整数"); std::process::exit(2); })
+            }
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
@@ -2020,7 +2082,7 @@ fn parse_args() -> Config {
             "run" => {}
             other => {
                 eprintln!("未知参数: {other}");
-                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--serve] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
+                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--serve] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
                 std::process::exit(2);
             }
         }

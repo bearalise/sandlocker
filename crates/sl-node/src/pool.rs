@@ -9,9 +9,13 @@
 //! `posix_fadvise(WILLNEED)`；预置槽的 reflink 也触及模板共享块，`mem`/`vmstate` 走共享 inode 硬链
 //! 保持热——故池命中恢复读的是热 page cache。
 //!
-//! **热池**（已恢复 paused VM、命中即 resume）默认 0，留 W5；本模块只做温池（默认水位 2）。
+//! **热池**（[`HotPool`]，M2 W5，默认 0）更进一步：后台预置一批 **park 到暂停态**的 VM（spawn FC +
+//! `snapshot/load{resume_vm:false}`，见 [`crate::restore_park`]），命中时只 `restore_activate`
+//! （resume + vsock + reinit + validate）——把 FC spawn + snapshot load 也移出关键路径。parked VM
+//! 常驻内存（暂停不燃 CPU），故默认 0、`--hot-size` 显式开启。reinit 在 activate 下发 → 每次命中
+//! 新身份/新时钟（克隆熵隔离正确）。
 //!
-//! 线程模型对齐 `api.rs` 的 reaper：自带 `Arc<PoolInner>` + `Mutex` + `Condvar` + 一条 refill 线程，
+//! 线程模型对齐 `api.rs` 的 reaper：自带 `Arc<...Inner>` + `Mutex` + `Condvar` + 一条 refill 线程，
 //! 全同步无 tokio。
 
 use std::collections::VecDeque;
@@ -22,7 +26,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::orch::prepare_instance_dir;
-use crate::{abspath, hex, host_random};
+use crate::{abspath, hex, host_random, kill_group, restore_park, Config, ParkedVm, RestoreCtx};
 
 /// 一个预置好的实例槽：`dir` 已备妥私有 `rootfs.ext4`（reflink）+ `vmstate`/`mem`（硬链）。
 /// refill 阶段落在 `<run_root>/.warm/<id>`；`try_pop` 命中后 `rename` 到 `<run_root>/<id>`。
@@ -238,6 +242,177 @@ fn fadvise_willneed(p: &Path) {
     // SAFETY: fd 由上面打开的 File 持有、在本次调用期间有效；posix_fadvise 只读提示，不改内容。
     unsafe {
         libc::posix_fadvise(f.as_raw_fd(), 0, len as libc::off_t, libc::POSIX_FADV_WILLNEED);
+    }
+}
+
+// ————————————————————— 热池（M2 W5，默认 0）—————————————————————
+
+/// 一个 **park 到暂停态**的实例槽：`dir`（=最终 `<run_root>/<id>`，FC 已 bind-mount 不可 rename）+
+/// 停放的 `parked`（暂停态 VM 句柄）。命中即 `restore_activate` 拉起。
+pub(crate) struct HotSlot {
+    pub id: String,
+    pub dir: PathBuf,
+    pub parked: ParkedVm,
+}
+
+struct HotInner {
+    /// `Arc<Config>`（serve 侧 `cfg.clone()`）：解耦 Orch<'a> 借用，refill 线程可 `restore_park(&cfg, …)`。
+    cfg: Arc<Config>,
+    template: PathBuf,
+    run_root: PathBuf,
+    target: usize,
+    ready: Mutex<VecDeque<HotSlot>>,
+    cv: Condvar,
+    shutdown: AtomicBool,
+}
+
+/// 单模板热池。`try_pop` 命中即拿走一个暂停态 VM（调用方 `restore_activate` 拉起）；后台线程持续
+/// 补水到 `target`（每槽 = `prepare_instance_dir` + `restore_park`，重活在 Orch 锁外）。
+pub(crate) struct HotPool {
+    inner: Arc<HotInner>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl HotPool {
+    /// 建热池：canonical 模板 → spawn refill 线程。`target>=1`（0 由调用方判为不启用）。
+    /// `cfg` 深拷进 `Arc`（refill 线程 `restore_park` 用）。
+    pub(crate) fn new(cfg: &Config, template: &Path, run_root: &Path, target: usize) -> Result<Self, String> {
+        if !template.is_dir() {
+            return Err(format!("热池模板目录不存在: {}", template.display()));
+        }
+        let template = abspath(template)?;
+        std::fs::create_dir_all(run_root).map_err(|e| format!("建 run_root 失败 {}: {e}", run_root.display()))?;
+        let run_root = abspath(run_root)?;
+
+        let inner = Arc::new(HotInner {
+            cfg: Arc::new(cfg.clone()),
+            template,
+            run_root,
+            target,
+            ready: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+
+        let worker_inner = Arc::clone(&inner);
+        let worker = std::thread::Builder::new()
+            .name("hotpool-refill".into())
+            .spawn(move || hot_refill_loop(worker_inner))
+            .map_err(|e| format!("起热池 refill 线程失败: {e}"))?;
+
+        Ok(Self { inner, worker: Some(worker) })
+    }
+
+    /// 池命中：弹一个暂停态槽 → 通知补水 → 返回槽（调用方 `restore_activate` 拉起）。空池返 None。
+    pub(crate) fn try_pop(&self) -> Option<HotSlot> {
+        let slot = {
+            let mut q = self.inner.ready.lock().unwrap();
+            q.pop_front()
+        };
+        self.inner.cv.notify_one();
+        slot
+    }
+
+    /// 池模板目录（canonical）。create 路径据此判断请求模板是否命中本池。
+    pub(crate) fn template(&self) -> &Path {
+        &self.inner.template
+    }
+
+    /// 阻塞等到 ready 水位 ≥ `n` 或超时（bench 预填池 / 测试用）。到达返 true。
+    pub(crate) fn wait_ready(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let q = self.inner.ready.lock().unwrap();
+            if q.len() >= n {
+                return true;
+            }
+            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            if remain.is_zero() {
+                return q.len() >= n;
+            }
+            let (_g, to) = self.inner.cv.wait_timeout(q, remain.min(Duration::from_millis(100))).unwrap();
+            if to.timed_out() && std::time::Instant::now() >= deadline {
+                return self.inner.ready.lock().unwrap().len() >= n;
+            }
+        }
+    }
+
+    /// 幂等停机：置 flag → 唤醒 → join → **杀所有未取走的暂停态 VM** + 清其 dir（parked 是真 FC 进程）。
+    fn shutdown(&mut self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        self.inner.cv.notify_all();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+        let mut q = self.inner.ready.lock().unwrap();
+        while let Some(mut slot) = q.pop_front() {
+            kill_group(&mut slot.parked.child);
+            let _ = std::fs::remove_dir_all(&slot.dir);
+        }
+    }
+}
+
+impl Drop for HotPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// 热池 refill 线程主体：ready < target 时**在锁外** park 一台 VM（spawn FC + load 暂停态）再入队；
+/// 满则挂 cv（1s 心跳，停机即醒）。park 失败退避避免忙转（模板损坏/无 KVM）。
+fn hot_refill_loop(inner: Arc<HotInner>) {
+    while !inner.shutdown.load(Ordering::SeqCst) {
+        let cur = inner.ready.lock().unwrap().len();
+        if cur < inner.target {
+            match prep_hot(&inner) {
+                Ok(slot) => {
+                    inner.ready.lock().unwrap().push_back(slot);
+                    inner.cv.notify_all();
+                }
+                Err(e) => {
+                    if !inner.shutdown.load(Ordering::SeqCst) {
+                        eprintln!("[hotpool] park 失败（退避重试）: {e}");
+                    }
+                    let g = inner.ready.lock().unwrap();
+                    let _ = inner.cv.wait_timeout(g, Duration::from_millis(500));
+                }
+            }
+        } else {
+            let g = inner.ready.lock().unwrap();
+            let _ = inner.cv.wait_timeout(g, Duration::from_secs(1));
+        }
+    }
+}
+
+/// park 一台 VM：随机 id → `<run_root>/<id>`（最终位，FC bind-mount 不可 rename）→
+/// `prepare_instance_dir`（reflink + 硬链）→ `restore_park`（spawn FC + load 暂停态，netns=None）。
+/// park 失败清 dir（restore_park 自身已杀 child + 清 socket）。
+fn prep_hot(inner: &HotInner) -> Result<HotSlot, String> {
+    let mut idb = [0u8; 6];
+    host_random(&mut idb);
+    let id = hex(&idb);
+    let dir = inner.run_root.join(&id);
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(e) = prepare_instance_dir(&inner.template, &dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+    let dir = abspath(&dir)?;
+    let ctx = RestoreCtx {
+        template_dir: &inner.template,
+        instance_dir: &dir,
+        // 目录级 bind：FC 烘焙的 rootfs/vsock 绝对路径落进实例私有副本（与 orch create 一致）。
+        bind: Some((dir.clone(), inner.template.clone())),
+        keep_alive: true,
+        // 热池 netns 恒 None（Option A：快照无网卡，出口天然为零；gate 恒 None → ParkedVm 天然 Send）。
+        netns: None,
+    };
+    match restore_park(&inner.cfg, &ctx) {
+        Ok(parked) => Ok(HotSlot { id, dir, parked }),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        }
     }
 }
 
