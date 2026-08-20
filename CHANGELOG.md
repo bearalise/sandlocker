@@ -8,6 +8,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **Hot pool (热池)** — `restore_core` is split into `restore_park` (spawn Firecracker + load snapshot
+  to a **paused** VM) and `restore_activate` (policy → resume → reinit → validate); a background
+  thread pre-parks paused VMs so a pool-hit `create` only activates (resume + reinit), moving FC spawn
+  + snapshot load off the critical path too. `--serve --pool-template <name> --hot-size <N>`
+  (default 0 — parked VMs stay memory-resident; hot-hit takes priority over the warm pool). Reinit
+  runs at activate, so two hot-hit sandboxes still get distinct machine-id / RNG / session key
+  (clone-entropy preserved — asserted by the `--orch-reconcile` hot case). `--pool-bench` now also
+  reports `hot_p50` (hot-hit only-activate latency; <50 ms target informational on bare metal).
 - **Warm pool (温池)** — a background refill thread pre-stages instance dirs (rootfs reflink copy +
   vmstate/mem hardlink) off the create critical path and warms the snapshot page cache
   (`posix_fadvise`); pool-hit `create` skips the copy (`copy_ms=0`) and restores from warm cache.
