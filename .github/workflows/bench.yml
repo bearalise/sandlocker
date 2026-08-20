@@ -248,6 +248,54 @@ jobs:
           echo "$out" | grep -q '"pass":true' || { echo "::error::M2-Q4 gVisor 对账未 pass"; exit 1; }
           echo "M2-Q4 PASS：gVisor create/exec/fs/destroy 走 ABI + 能力显式无 prebake/pause + 与 fc 可切换 + 零残留"
 
+  # 硬出口②（M2 W8）：ABI 契约测试套件——同一组场景对 **fc(需KVM) + gvisor(runsc)** 逐后端跑，
+  #   能力差异显式建模（不齐即 UNSUPPORTED_BY_BACKEND，非失败），产出兼容矩阵。两后端齐全全过 +
+  #   能力矩阵无 GATE-FAIL → both_backends:true + switchable:true + pass:true。KVM 缺失则 skip 不误报。
+  abi-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 runsc（gVisor apt 仓库）+ e2fsprogs + 内核构建依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg e2fsprogs build-essential flex bison libelf-dev libssl-dev bc
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update && sudo apt-get install -y runsc
+          runsc --version
+      - name: Rust 工具链（含 musl target，sl-envd 静态）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态）
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs（Alpine busybox）
+        run: scripts/build-rootfs.sh
+      - name: 硬出口② ABI 契约套件（fc + gvisor 逐后端，两后端可切换验收）
+        # 先 --build 预烘焙 hello 模板（fc 恢复需 vmstate/mem；gVisor 只用其 rootfs.ext4）。
+        # KVM 缺失 → fc 不合资格 → both_backends:false → 本步 skip 不误报（真硬出口②需两后端齐全）。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过硬出口② ABI 契约（fc 需 KVM）"
+            exit 0
+          fi
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::未取到模板 version"; exit 1; }
+          tpl="build/templates/hello/$ver"
+          m=$(./target/release/sl-node --abi-contract "$tpl" --json)
+          echo "$m"
+          echo "$m" | grep -q '"metric":"abi_contract"' || { echo "::error::缺 abi_contract 指标"; exit 1; }
+          echo "$m" | grep -q '"both_backends":true' || { echo "::error::两后端未齐全（fc+gvisor）"; exit 1; }
+          echo "$m" | grep -q '"switchable":true' || { echo "::error::两后端不可切换"; exit 1; }
+          echo "$m" | grep -q '"pass":true' || { echo "::error::硬出口② ABI 契约未 pass"; exit 1; }
+          echo "硬出口② PASS：fc + gvisor 同套 ABI 契约皆过 + 能力对等建模（无 GATE-FAIL）"
+
   validate:
     runs-on: ubuntu-latest
     steps:

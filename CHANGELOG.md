@@ -8,6 +8,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **ABI contract suite & two-backend switchable acceptance (ADR-14, M2 hard exit ②)** —
+  `sl-node --abi-contract <template>` runs one common scenario set (lifecycle / exec / fs /
+  clone-isolation / destroy-clean) against **both** backends through the ABI, plus a capability
+  matrix over every `Capability`: a backend that has a capability must accept a
+  `required_capabilities` create for it (`has`); one that lacks it must reject at create time
+  (`unsupported-ok`) — anything else is a `GATE-FAIL` (silent runtime degradation). Emits the
+  official compatibility matrix (`docs/design/后端兼容矩阵.md`); passes only when both backends
+  clear the common scenarios and the capability matrix has no GATE-FAIL (`both_backends` +
+  `switchable`). CI `abi-contract` job runs it with fc (KVM) + gVisor (runsc).
 - **gVisor (runsc) second backend (ADR-14 / M2-Q4)** — a `GvisorBackend` implements the same
   `SandboxBackend` ABI: rootless `runsc run --detach` + `runsc exec` + `kill`/`delete`
   (`--rootless --platform=systrap --network=none`, no root/KVM); the OCI bundle rootfs is extracted
