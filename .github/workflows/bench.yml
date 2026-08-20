@@ -213,6 +213,41 @@ jobs:
           done
           echo "M2-Q12 ③ PASS：OCI python 基座 boot 成功、真 VM 内 python3 --version 通过、预烘焙快照齐全"
 
+  # M2-Q4：gVisor(runsc) 第二后端接入——create/exec/fs/destroy 走 ABI、能力显式无 prebake/pause、
+  #   与 FC 可切换、零残留。**rootless**（--rootless --platform=systrap --network=none）→ 无需 root/KVM；
+  #   只需 runsc + e2fsprogs（debugfs 抽 rootfs）+ 一份 rootfs.ext4（build-rootfs.sh，gVisor 只用 rootfs）。
+  gvisor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 runsc（gVisor apt 仓库）+ e2fsprogs（debugfs）
+        run: |
+          sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg e2fsprogs
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update && sudo apt-get install -y runsc
+          runsc --version
+      - name: Rust 工具链（含 musl target，sl-envd 供 build-rootfs）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 构建 sl-node + sl-envd（静态）
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs（Alpine busybox；gVisor bundle rootfs 来源）
+        run: scripts/build-rootfs.sh
+      - name: M2-Q4 gVisor 后端对账（--gvisor-reconcile，rootless 无需 root/KVM）
+        # gVisor 只用模板的 rootfs.ext4（debugfs 抽取）→ 指向 build/rootfs（含 rootfs.ext4）。
+        # runsc 缺失/不可用则 skip（输出 skipped JSON 退 0，不误报）。
+        run: |
+          out=$(./target/release/sl-node --gvisor-reconcile build/rootfs --json)
+          echo "$out"
+          echo "$out" | grep -q '"skipped":true' && { echo "::warning::gvisor-reconcile skipped: $out"; exit 0; }
+          echo "$out" | grep -q '"metric":"gvisor_reconcile"' || { echo "::error::缺 gvisor_reconcile 指标"; exit 1; }
+          echo "$out" | grep -q '"pass":true' || { echo "::error::M2-Q4 gVisor 对账未 pass"; exit 1; }
+          echo "M2-Q4 PASS：gVisor create/exec/fs/destroy 走 ABI + 能力显式无 prebake/pause + 与 fc 可切换 + 零残留"
+
   validate:
     runs-on: ubuntu-latest
     steps:

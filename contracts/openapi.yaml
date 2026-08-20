@@ -270,6 +270,11 @@ components:
           description: >
             要求后端具备的能力集（ADR-14）。后端不满足即创建期返回 UNSUPPORTED_BY_BACKEND；
             未知能力名恒不被满足。缺省空（不约束）。
+        backend:
+          type: string
+          enum: [fc, gvisor]
+          description: >
+            显式选后端（ADR-14，M2 W7）。缺省 fc。无此后端（如 gVisor 未注册）即 UNSUPPORTED_BY_BACKEND。
     Sandbox:
       type: object
       properties:

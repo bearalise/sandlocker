@@ -34,6 +34,8 @@ mod oci;
 // M2 W6：Sandbox ABI 契约（trait + 能力模型，ADR-14）+ Firecracker 后端实现。
 mod backend;
 mod fcbackend;
+// M2 W7：gVisor(runsc) 第二后端（M2-Q4，短任务路径，能力空集）。
+mod gvisorbackend;
 // W7：进程内 orchestrator（生命周期 create/keepalive/destroy/tick + Q2/Q9）。
 mod orch;
 // M2 W4：预热池·温池（把 rootfs 拷贝/page-cache 预热移出 create 关键路径，M2-Q2）。
@@ -172,6 +174,13 @@ struct Config {
     /// --hot-size N：M2 W5 --serve 热池目标水位（默认 0=关；>0 预置暂停态 VM，命中优先于温池）。
     /// 模板复用 --pool-template。parked VM 常驻内存，故默认关、显式开启。
     hot_size: usize,
+    /// --gvisor：M2 W7 注册 gVisor(runsc) 第二后端（且 runsc 探活成功时）。默认关。
+    gvisor: bool,
+    /// --gvisor-bin <path>：runsc 可执行路径（默认 "runsc"，取 PATH）。
+    gvisor_bin: PathBuf,
+    /// --gvisor-reconcile <模板目录>：M2-Q4 gVisor 后端对账（create/exec/fs/destroy + 能力 + 可切换 +
+    /// 零残留），随后退出。rootless 无需 root/KVM；runsc 缺失则 skip。
+    gvisor_reconcile: Option<PathBuf>,
 }
 
 fn main() {
@@ -253,6 +262,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[pool] M2-Q2 pool-bench FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --gvisor-reconcile：M2 W7 gVisor 第二后端对账（M2-Q4，rootless）。
+    if let Some(tpl) = cfg.gvisor_reconcile.clone() {
+        match orch::gvisor_reconcile(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[gvisor] M2-Q4 gvisor-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -1908,6 +1929,9 @@ fn clone_paths(cfg: &Config) -> Config {
         pool_size: 2,
         pool_template: None,
         hot_size: 0,
+        gvisor: false,
+        gvisor_bin: PathBuf::from("runsc"),
+        gvisor_reconcile: None,
     }
 }
 
@@ -2022,6 +2046,9 @@ fn parse_args() -> Config {
         pool_size: 2,
         pool_template: None,
         hot_size: 0,
+        gvisor: false,
+        gvisor_bin: PathBuf::from("runsc"),
+        gvisor_reconcile: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2067,6 +2094,9 @@ fn parse_args() -> Config {
             "--hot-size" => {
                 cfg.hot_size = take().parse().unwrap_or_else(|_| { eprintln!("--hot-size 需整数"); std::process::exit(2); })
             }
+            "--gvisor" => cfg.gvisor = true,
+            "--gvisor-bin" => cfg.gvisor_bin = PathBuf::from(take()),
+            "--gvisor-reconcile" => cfg.gvisor_reconcile = Some(PathBuf::from(take())),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
@@ -2085,7 +2115,7 @@ fn parse_args() -> Config {
             "run" => {}
             other => {
                 eprintln!("未知参数: {other}");
-                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--serve] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
+                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--serve] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
                 std::process::exit(2);
             }
         }
