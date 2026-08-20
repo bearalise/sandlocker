@@ -8,6 +8,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **pause / resume / fork user API (FR-1.4, M2-Q5)** — `POST /v1/sandboxes/{id}/pause` snapshots the
+  running VM to disk and stops it (`state: paused`, no exec while paused); `/resume` restores it; and
+  `/fork` derives a new sandbox from a paused parent's snapshot. Added to the `SandboxBackend` ABI
+  (capability-gated: `pause_resume` / `snapshot_fork` — gVisor lacks both → create-time
+  `UNSUPPORTED_BY_BACKEND`). Every resume and fork re-runs ADR-12 reinit, so a paused sandbox and all
+  its forks get **distinct** machine-id / RNG seed / session key — clone-entropy is preserved across
+  fork/resume, not just fresh restore (fork reuses the parent rootfs/snapshot, so it does **not**
+  refresh the security boundary). `sl-node --q5-reconcile` validates M2-Q5 end-to-end (CI
+  `pause-resume` job).
 - **ABI contract suite & two-backend switchable acceptance (ADR-14, M2 hard exit ②)** —
   `sl-node --abi-contract <template>` runs one common scenario set (lifecycle / exec / fs /
   clone-isolation / destroy-clean) against **both** backends through the ABI, plus a capability

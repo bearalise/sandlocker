@@ -11,16 +11,24 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 use crate::backend::{BackendCreate, Capabilities, Capability, ExecTarget, SandboxBackend};
+use crate::fcapi::FcApi;
 use crate::orch::{prepare_instance_dir, SandboxSpec};
 use crate::pool::{HotPool, HotSlot, WarmPool};
-use crate::{abspath, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome, RestoreCtx};
+use crate::{
+    abspath, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome, RestoreCtx,
+};
 
-/// 后端独占的在册实例：FC 进程 + 实例目录 + ADR-12 克隆身份。
+/// 后端独占的在册实例：FC 进程 + 实例目录 + 原始模板 + ADR-12 克隆身份 + 暂停态标记。
 struct FcInst {
+    /// 运行中持有 FC 进程；pause 后 VM 已停（child 已亡，仅占位）。
     child: Child,
     dir: PathBuf,
+    /// 原始模板目录（canonical）：resume/fork 以此做 bind（快照烘焙的是模板绝对路径，非实例路径）。
+    template: PathBuf,
     #[allow(dead_code)]
     machine_id: String,
+    /// M2 W9：已暂停（快照落盘 + VM 停）。paused 时不可 exec；resume 从快照拉起。
+    paused: bool,
 }
 
 /// Firecracker 后端。持 cfg（借用，serve 侧 `'static`）+ run_root + 自有在册表 + 温/热池。
@@ -57,7 +65,7 @@ impl<'a> FcBackend<'a> {
 
     /// 热池命中：暂停态槽 `restore_activate` 拉起（netns=None、keep_alive）。`total_ms`=activate wall-clock
     /// （park 的 spawn+load 已在关键路径外）；`copy_ms=0`。活化失败即杀 parked child + 删 dir。
-    fn create_from_hot(&mut self, slot: HotSlot) -> Result<BackendCreate, String> {
+    fn create_from_hot(&mut self, template: &Path, slot: HotSlot) -> Result<BackendCreate, String> {
         let HotSlot { id, dir, parked } = slot;
         let t = Instant::now();
         let (o, child) = match restore_activate(self.cfg, None, true, parked) {
@@ -72,15 +80,17 @@ impl<'a> FcBackend<'a> {
             }
         };
         let activate_ms = t.elapsed().as_millis();
-        Ok(self.register_inst(id, dir, child, o, 0, activate_ms, true, true))
+        Ok(self.register_inst(id, dir, template.to_path_buf(), child, o, 0, activate_ms, true, true))
     }
 
     /// 存 `FcInst` 到自有在册表，组装 `BackendCreate`（编排 lease/meta 由 Orch 依此包装）。
+    /// `template` 记入 FcInst——resume/fork 须以**原始模板**做 bind（快照烘焙的是模板绝对路径）。
     #[allow(clippy::too_many_arguments)]
     fn register_inst(
         &mut self,
         id: String,
         dir: PathBuf,
+        template: PathBuf,
         child: Child,
         o: LoadOutcome,
         copy_ms: u128,
@@ -89,10 +99,12 @@ impl<'a> FcBackend<'a> {
         hot_hit: bool,
     ) -> BackendCreate {
         let machine_id = o.machine_id.clone();
-        self.live.insert(id.clone(), FcInst { child, dir, machine_id: machine_id.clone() });
+        self.live.insert(id.clone(), FcInst { child, dir, template, machine_id: machine_id.clone(), paused: false });
         BackendCreate {
             id,
             machine_id,
+            rng_hex: o.rng_hex,
+            session_key_hex: o.session_key_hex,
             total_ms,
             copy_ms,
             api_ready_ms: o.api_ready_ms,
@@ -122,7 +134,7 @@ impl SandboxBackend for FcBackend<'_> {
         // 三段式（M2 W5）：hot → warm → cold。命中**热池**最快——暂停态 VM 只 activate（resume+reinit），
         // FC spawn + snapshot load 已在关键路径外；其次**温池**（省 copy）；再次**冷路径**（现场 copy）。
         if let Some(slot) = self.try_hot_hit(&template) {
-            return self.create_from_hot(slot);
+            return self.create_from_hot(&template, slot);
         }
 
         // 温池命中（copy_ms=0，refill 线程锁外备好私有 rootfs/vmstate/mem）或冷路径（现场 copy，零回归）。
@@ -163,7 +175,7 @@ impl SandboxBackend for FcBackend<'_> {
         };
         // 总时延 = 私有 rootfs 副本（restore 前）+ 恢复（spawn→ready）；分段另报以定位大头。
         let total_ms = copy_ms.saturating_add(o.total_ms);
-        Ok(self.register_inst(id, dir_abs, child, o, copy_ms, total_ms, pool_hit, false))
+        Ok(self.register_inst(id, dir_abs, template.clone(), child, o, copy_ms, total_ms, pool_hit, false))
     }
 
     fn destroy(&mut self, id: &str) {
@@ -174,7 +186,11 @@ impl SandboxBackend for FcBackend<'_> {
     }
 
     fn exec_target(&self, id: &str) -> Option<ExecTarget> {
-        self.live.get(id).map(|i| ExecTarget::Vsock(i.dir.join("vsock.sock")))
+        let i = self.live.get(id)?;
+        if i.paused {
+            return None; // 暂停态 VM 已停，不可 exec（resume 后复通）
+        }
+        Some(ExecTarget::Vsock(i.dir.join("vsock.sock")))
     }
 
     fn instance_dir(&self, id: &str) -> Option<PathBuf> {
@@ -213,5 +229,106 @@ impl SandboxBackend for FcBackend<'_> {
 
     fn pool_stats(&self) -> Option<(u64, u64, usize)> {
         self.pool.as_ref().map(|p| p.stats())
+    }
+
+    /// pause（FR-1.4）：断实例 vmstate/mem 硬链（防写穿模板）→ `PATCH Paused` → `PUT /snapshot/create Full`
+    /// 落 `dir/`（自包含内存快照）→ 停 VM。guest 现存 `/tmp/sl-snap-marker`（建模板时播种）随快照捕获，
+    /// resume/fork 仍据**模板 expect** 校验一致性。幂等（已 paused 直接返 Ok）。
+    fn pause(&mut self, id: &str) -> Result<(), String> {
+        let (dir, already) = {
+            let i = self.live.get(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
+            (i.dir.clone(), i.paused)
+        };
+        if already {
+            return Ok(());
+        }
+        // 断硬链：dir/vmstate、dir/mem 是 create 时从模板硬链来的；snapshot/create 会覆写，先 unlink
+        // 令 FC 建独立文件——否则写穿共享 inode 会脏模板。
+        let _ = std::fs::remove_file(dir.join("vmstate"));
+        let _ = std::fs::remove_file(dir.join("mem"));
+        let api = FcApi::new(dir.join("api.sock"));
+        api.patch("/vm", r#"{"state":"Paused"}"#)?;
+        api.put_long(
+            "/snapshot/create",
+            &format!(
+                r#"{{"snapshot_type":"Full","snapshot_path":"{}","mem_file_path":"{}"}}"#,
+                dir.join("vmstate").display(),
+                dir.join("mem").display()
+            ),
+        )?;
+        let i = self.live.get_mut(id).unwrap();
+        kill_group(&mut i.child);
+        i.paused = true;
+        Ok(())
+    }
+
+    /// resume（FR-1.4）：从 paused 快照**就地**恢复（instance=dir 读快照 vmstate/mem；bind dir→模板，
+    /// 因 FC 烘焙的是**模板**绝对路径）。经 restore_core → reinit 换发**新** machine-id（克隆熵不泄漏）。
+    fn resume(&mut self, id: &str) -> Result<String, String> {
+        let (dir, template, paused) = {
+            let i = self.live.get(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
+            (i.dir.clone(), i.template.clone(), i.paused)
+        };
+        if !paused {
+            return Err(format!("resume: 沙箱 {id} 未暂停"));
+        }
+        let ctx = RestoreCtx {
+            template_dir: &template,
+            instance_dir: &dir,
+            bind: Some((dir.clone(), template.clone())),
+            keep_alive: true,
+            netns: None,
+        };
+        let (o, child) = match restore_core(self.cfg, &ctx) {
+            Ok((o, Some(c), _gate)) => (o, c),
+            Ok((_, None, _gate)) => return Err("resume 未返回 VM 句柄（keep_alive 语义异常）".into()),
+            Err(e) => return Err(format!("resume 失败: {e}")),
+        };
+        let mid = o.machine_id.clone();
+        let i = self.live.get_mut(id).unwrap();
+        i.child = child;
+        i.machine_id = mid.clone();
+        i.paused = false;
+        Ok(mid)
+    }
+
+    /// fork（M2-Q5）：从**已 paused** 父的快照派生新实例——拷父 paused vmstate/mem + rootfs（reflink）到
+    /// 新 dir，restore（bind 新 dir→模板）→ reinit 换发**独立**身份（克隆熵不泄漏）。父 rootfs/快照复用，
+    /// **不刷新安全边界**（同代码/数据）。父须先 pause（快照来源）。
+    fn fork(&mut self, id: &str) -> Result<BackendCreate, String> {
+        let (parent_dir, template, paused) = {
+            let i = self.live.get(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
+            (i.dir.clone(), i.template.clone(), i.paused)
+        };
+        if !paused {
+            return Err(format!("fork: 需先 pause 父沙箱 {id}（fork 快照来源）"));
+        }
+        let mut idb = [0u8; 6];
+        host_random(&mut idb);
+        let new_id = hex(&idb);
+        let new_dir = self.run_root.join(&new_id);
+        // 拷父 paused 快照（vmstate/mem 硬链 + rootfs reflink）到新实例目录。
+        let copy_ms = prepare_instance_dir(&parent_dir, &new_dir)?;
+        let new_dir = abspath(&new_dir)?;
+        let ctx = RestoreCtx {
+            template_dir: &template,
+            instance_dir: &new_dir,
+            bind: Some((new_dir.clone(), template.clone())),
+            keep_alive: true,
+            netns: None,
+        };
+        let (o, child) = match restore_core(self.cfg, &ctx) {
+            Ok((o, Some(c), _gate)) => (o, c),
+            Ok((_, None, _gate)) => {
+                let _ = std::fs::remove_dir_all(&new_dir);
+                return Err("fork 未返回 VM 句柄（keep_alive 语义异常）".into());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&new_dir);
+                return Err(format!("fork 失败: {e}"));
+            }
+        };
+        let total_ms = copy_ms.saturating_add(o.total_ms);
+        Ok(self.register_inst(new_id, new_dir, template, child, o, copy_ms, total_ms, false, false))
     }
 }

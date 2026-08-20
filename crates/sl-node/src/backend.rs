@@ -136,6 +136,10 @@ pub struct BackendInfo {
 pub struct BackendCreate {
     pub id: String,
     pub machine_id: String,
+    /// M2 W9（M2-Q5）：ADR-12 reinit 换发的 RNG 种子 hex——克隆熵三元组之一（fork/resume 复验须互异）。
+    pub rng_hex: String,
+    /// M2 W9（M2-Q5）：ADR-12 reinit 换发的会话密钥 hex——克隆熵三元组之一。
+    pub session_key_hex: String,
     pub total_ms: u128,
     pub copy_ms: u128,
     pub api_ready_ms: u128,
@@ -237,6 +241,24 @@ pub trait SandboxBackend {
     /// 温池 (hits, misses, ready_len)；无池默认 None。
     fn pool_stats(&self) -> Option<(u64, u64, usize)> {
         None
+    }
+
+    // —— pause/resume/fork（M2 W9 / FR-1.4 / M2-Q5；能力门控，默认不支持）——
+
+    /// 暂停：落快照 + 停 VM（需 `pause_resume`）。默认后端不支持。
+    fn pause(&mut self, _id: &str) -> Result<(), String> {
+        Err(format!("{UNSUPPORTED_BY_BACKEND}: 后端 {} 无 pause_resume，不支持 pause", self.id()))
+    }
+
+    /// 恢复：从快照拉起（需 `pause_resume`）。返回 reinit 换发的新 machine-id。默认后端不支持。
+    fn resume(&mut self, _id: &str) -> Result<String, String> {
+        Err(format!("{UNSUPPORTED_BY_BACKEND}: 后端 {} 无 pause_resume，不支持 resume", self.id()))
+    }
+
+    /// fork：从父快照派生新实例（需 `snapshot_fork`）。新实例经 reinit 得**独立身份**（克隆熵不泄漏），
+    /// 但复用父 rootfs/快照——**不刷新安全边界**。默认后端不支持。
+    fn fork(&mut self, _id: &str) -> Result<BackendCreate, String> {
+        Err(format!("{UNSUPPORTED_BY_BACKEND}: 后端 {} 无 snapshot_fork，不支持 fork", self.id()))
     }
 }
 

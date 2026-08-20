@@ -296,6 +296,49 @@ jobs:
           echo "$m" | grep -q '"pass":true' || { echo "::error::硬出口② ABI 契约未 pass"; exit 1; }
           echo "硬出口② PASS：fc + gvisor 同套 ABI 契约皆过 + 能力对等建模（无 GATE-FAIL）"
 
+  # M2-Q5（M2 W9）：pause/resume 用户 API（FR-1.4）+ fork 克隆熵复验——create→pause→fork×2→resume，
+  #   A0/A1/B/C machine-id 两两互异 + 两 fork rng/session-key 互异（reinit 后身份必异）+ 零残留 +
+  #   gVisor pause→UNSUPPORTED。fc 走恢复需 /dev/kvm；装 runsc 以验能力门控⑦。KVM 缺失则 skip。
+  pause-resume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 runsc（gVisor apt 仓库）+ e2fsprogs + 内核构建依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg e2fsprogs build-essential flex bison libelf-dev libssl-dev bc
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update && sudo apt-get install -y runsc || echo "::warning::runsc 装失败，⑦ 能力门控将跳过"
+      - name: Rust 工具链（含 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态）
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs
+        run: scripts/build-rootfs.sh
+      - name: M2-Q5 pause/resume + fork 克隆熵复验（--q5-reconcile）
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 M2-Q5 pause/resume（fc 恢复需 KVM）"
+            exit 0
+          fi
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::未取到模板 version"; exit 1; }
+          q=$(./target/release/sl-node --q5-reconcile "build/templates/hello/$ver" --json)
+          echo "$q"
+          echo "$q" | grep -q '"metric":"q5_reconcile"' || { echo "::error::缺 q5_reconcile 指标"; exit 1; }
+          echo "$q" | grep -q '"clone_entropy":true' || { echo "::error::克隆熵复验未过"; exit 1; }
+          echo "$q" | grep -q '"pass":true' || { echo "::error::M2-Q5 未 pass"; exit 1; }
+          echo "M2-Q5 PASS：pause/resume 用户 API + fork 克隆熵（reinit 后身份必异）+ 零残留 + 能力门控"
+
   validate:
     runs-on: ubuntu-latest
     steps:
