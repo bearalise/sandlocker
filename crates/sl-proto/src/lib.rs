@@ -30,6 +30,9 @@ pub enum Request {
     ///   hostname：该实例唯一主机名。
     ///   wall_time_ns：host 当前 UNIX 纪元纳秒，校正快照冻结的 CLOCK_REALTIME。
     Reinit { seed_hex: String, hostname: String, wall_time_ns: u64 },
+    /// W10（FR-3.3 端口暴露）：guest 内 dial `127.0.0.1:port`。成功回 [`Response::Ok`] 后，**此连接转为
+    /// 裸字节双向管道**（不再走帧）——host 网关据此把外部流量中继进 VM 内服务。
+    Connect { port: u32 },
 }
 
 /// guest→host 响应。
@@ -51,6 +54,8 @@ pub enum Response {
     Reinit { machine_id: String, rng_hex: String, session_key_hex: String },
     /// 请求无法执行（如 spawn 失败）。
     Error { message: String },
+    /// W10：通用成功 ack（[`Request::Connect`] dial 成功后回此，随后连接转裸字节管道）。
+    Ok,
 }
 
 /// 写一条消息 = JSON 序列化后装帧。

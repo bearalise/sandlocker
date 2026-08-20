@@ -22,12 +22,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sl_store::SqliteStore;
 
-use crate::backend::{Capabilities, UNSUPPORTED_BY_BACKEND};
+use crate::backend::{Capabilities, ExecTarget, UNSUPPORTED_BY_BACKEND};
+use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::orch::{Orch, SandboxSpec};
 use crate::Config;
 
 /// 守护共享态：orchestrator（互斥）+ 模板仓库根（模板名→目录解析）。
 type Shared = Arc<Mutex<Orch<'static>>>;
+/// 数据面网关（ADR-22）：控制面签发 + 网关验签共用（单机进程内）。
+type SharedGw = Arc<Gateway>;
 
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -91,6 +94,31 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         }
     });
 
+    // M2 W10 数据面网关（ADR-22）：独立监听（默认 127.0.0.1:7879），与控制面同进程共享 orch + secret。
+    let gw_addr = cfg.gw_addr.clone().unwrap_or_else(|| "127.0.0.1:7879".to_string());
+    let gw: SharedGw = Arc::new(Gateway::new_random(format!("http://{gw_addr}")));
+    {
+        let gw_l = Arc::clone(&gw);
+        let sh_l = Arc::clone(&shared);
+        let bind = gw_addr.clone();
+        match TcpListener::bind(&bind) {
+            Ok(gwl) => {
+                println!("[sandlocker] 数据面网关就绪 http://{bind}（一次性 HMAC 签名 URL；/gw/*）");
+                thread::spawn(move || {
+                    for conn in gwl.incoming().flatten() {
+                        let (g, s) = (Arc::clone(&gw_l), Arc::clone(&sh_l));
+                        thread::spawn(move || {
+                            if let Err(e) = handle_gw_conn(conn, &s, &g) {
+                                eprintln!("[sandlocker] 网关连接错误: {e}");
+                            }
+                        });
+                    }
+                });
+            }
+            Err(e) => eprintln!("[sandlocker] 网关 bind {bind} 失败（数据面不可用）: {e}"),
+        }
+    }
+
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {addr} 失败: {e}"))?;
     println!(
         "[sandlocker] API 守护就绪 http://{addr}（store={} templates={} run={} tick={tick_secs}s）",
@@ -104,8 +132,9 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         match conn {
             Ok(stream) => {
                 let sh = Arc::clone(&shared);
+                let g = Arc::clone(&gw);
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(stream, &sh, troot) {
+                    if let Err(e) = handle_conn(stream, &sh, troot, &g) {
                         eprintln!("[sandlocker] 连接处理错误: {e}");
                     }
                 });
@@ -216,6 +245,7 @@ enum Route {
     Pause(String),
     Resume(String),
     Fork(String),
+    Ticket(String),
     Exec(String),
     PutFile(String, String),
     GetFile(String, String),
@@ -243,6 +273,7 @@ fn parse_route(method: &str, path: &str) -> Route {
         ("POST", ["v1", "sandboxes", id, "pause"]) => Route::Pause((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "resume"]) => Route::Resume((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "fork"]) => Route::Fork((*id).to_string()),
+        ("POST", ["v1", "sandboxes", id, "ticket"]) => Route::Ticket((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "exec"]) => Route::Exec((*id).to_string()),
         ("GET", ["v1", "sandboxes", id, "logs"]) => Route::Logs((*id).to_string()),
         (m, [.., ]) if segs.len() >= 5 && segs[0] == "v1" && segs[1] == "sandboxes" && segs[3] == "files" => {
@@ -260,9 +291,9 @@ fn parse_route(method: &str, path: &str) -> Route {
 
 // ————————————————————— 分派 / handler —————————————————————
 
-fn handle_conn(mut stream: TcpStream, shared: &Shared, template_root: &Path) -> Result<(), String> {
+fn handle_conn(mut stream: TcpStream, shared: &Shared, template_root: &Path, gw: &SharedGw) -> Result<(), String> {
     let (method, path, body) = read_request(&mut stream)?;
-    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root);
+    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw);
     write_response(&mut stream, code, ctype, &resp)
 }
 
@@ -272,10 +303,15 @@ fn dispatch(
     body: &[u8],
     shared: &Shared,
     template_root: &Path,
+    gw: &SharedGw,
 ) -> (u16, &'static str, Vec<u8>) {
     let route = parse_route(method, path);
     let json = "application/json";
     match route {
+        Route::Ticket(id) => match mint_ticket(&id, body, gw) {
+            Ok(v) => (200, json, v),
+            Err(e) => (400, json, err_json(&e)),
+        },
         Route::CreateSandbox => match create_sandbox(body, shared, template_root) {
             Ok(v) => (201, json, v),
             Err(e) => (400, json, err_json(&e)),
@@ -421,6 +457,76 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
         out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms, out.pool_hit, out.hot_hit
     )
     .into_bytes())
+}
+
+/// 控制面签发一次性 HMAC 签名 URL（M2-Q6）：body{action, port?, ttl?}→gateway::mint→{url}。
+fn mint_ticket(id: &str, body: &[u8], gw: &SharedGw) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(if body.is_empty() { b"{}" } else { body }).map_err(|e| format!("请求体非 JSON: {e}"))?;
+    let action = v
+        .get("action")
+        .and_then(|x| x.as_str())
+        .and_then(Action::from_str)
+        .ok_or("缺/非法 action（exec|file|logs|port）")?;
+    let port = v.get("port").and_then(|x| x.as_i64()).unwrap_or(0) as u32;
+    let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
+    let url = gw.mint(id, action, port, ttl, now_unix());
+    Ok(format!(r#"{{"url":"{url}"}}"#).into_bytes())
+}
+
+/// 数据面网关连接（M2-Q6）：验签一次性 ticket → 路由到 exec/file/logs/端口反代。端口反代把 guest
+/// HTTP 响应**原样**写回外部客户端；其余走 write_response。验签失败 403。
+fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Result<(), String> {
+    let (method, path, body) = read_request(&mut stream)?;
+    let json = "application/json";
+    let q = parse_query(&path);
+    let ticket = match gw.verify(&q, now_unix()) {
+        Ok(t) => t,
+        Err(e) => return write_response(&mut stream, 403, json, &err_json(&format!("ticket 无效: {e}"))),
+    };
+    let base = path.split('?').next().unwrap_or("");
+    match (base, ticket.action) {
+        ("/gw/exec", Action::Exec) => match exec_in(&ticket.sid, &body, shared) {
+            Ok(v) => write_response(&mut stream, 200, json, &v),
+            Err(e) => write_response(&mut stream, 500, json, &err_json(&e)),
+        },
+        ("/gw/file", Action::File) => {
+            let p = q.get("p").cloned().unwrap_or_default();
+            if method == "PUT" {
+                match put_file(&ticket.sid, &p, &body, shared) {
+                    Ok(()) => write_response(&mut stream, 204, json, &[]),
+                    Err(e) => write_response(&mut stream, 500, json, &err_json(&e)),
+                }
+            } else {
+                match get_file(&ticket.sid, &p, shared) {
+                    Ok(b) => write_response(&mut stream, 200, "application/octet-stream", &b),
+                    Err(e) => write_response(&mut stream, 500, json, &err_json(&e)),
+                }
+            }
+        }
+        ("/gw/logs", Action::Logs) => match read_logs(&ticket.sid, shared) {
+            Ok(b) => write_response(&mut stream, 200, "text/plain; charset=utf-8", &b),
+            Err(e) => write_response(&mut stream, 404, json, &err_json(&e)),
+        },
+        ("/gw/p", Action::Port) => {
+            let gpath = q.get("p").cloned().unwrap_or_default();
+            // 端口反代仅 FC 后端（vsock）；取裸 vsock 路径（锁内），锁外做代理。
+            let tgt = shared.lock().unwrap().exec_target(&ticket.sid);
+            match tgt {
+                Some(ExecTarget::Vsock(vsock)) => match proxy_port_http(&vsock, ticket.port, &gpath) {
+                    Ok(raw) => {
+                        stream.write_all(&raw).map_err(|e| format!("写客户端失败: {e}"))?;
+                        stream.flush().ok();
+                        Ok(())
+                    }
+                    Err(e) => write_response(&mut stream, 502, json, &err_json(&e)),
+                },
+                Some(_) => write_response(&mut stream, 400, json, &err_json("端口暴露仅 FC 后端（vsock）支持")),
+                None => write_response(&mut stream, 404, json, &err_json("未知沙箱或已回收")),
+            }
+        }
+        _ => write_response(&mut stream, 403, json, &err_json("ticket 动作与路径不符")),
+    }
 }
 
 /// fork（M2-Q5）：从（已 pause 的）父沙箱派生新实例，reinit 得独立身份。ttl/idle 可选（缺省 300）；

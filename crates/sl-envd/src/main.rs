@@ -36,6 +36,7 @@ fn main() {
     }
 
     spawn_reaper();
+    bring_lo_up(); // W10 端口暴露：Connect dial 127.0.0.1:port 需 loopback up
 
     // 永不返回；若 serve 因致命错误退出，进入长眠而非 exit（PID 1 退出 = 内核 panic）
     if let Err(e) = serve_vsock() {
@@ -206,6 +207,11 @@ fn handle_conn(conn_fd: RawFd) {
                 break;
             }
         };
+        // W10 端口暴露：Connect 脱离 req/resp——dial + Ok ack 后本连接转裸字节双向管道，占用至 EOF。
+        if let Request::Connect { port } = req {
+            handle_connect(conn_fd, &mut stream, port);
+            break;
+        }
         let resp = dispatch(req);
         if let Err(e) = write_msg(&mut stream, &resp) {
             log(&format!("写响应失败: {e}"));
@@ -220,6 +226,94 @@ fn dispatch(req: Request) -> Response {
         Request::Exec { cmd } => run_exec(&cmd),
         Request::Reinit { seed_hex, hostname, wall_time_ns } => {
             run_reinit(&seed_hex, &hostname, wall_time_ns)
+        }
+        // Connect 由 handle_conn 特判（脱离 dispatch 的 req/resp 模型）；到此属逻辑错误。
+        Request::Connect { .. } => Response::Error { message: "Connect 应由 handle_conn 处理".into() },
+    }
+}
+
+/// 带起 loopback（Connect dial 127.0.0.1 需 lo up）。busybox `ip`/`ifconfig` 皆可；失败仅记录。
+fn bring_lo_up() {
+    let ok = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    log(if ok { "loopback up" } else { "loopback up 失败（端口暴露可能不可用）" });
+}
+
+/// W10：dial guest 内 `127.0.0.1:port`，成功回 `Ok` 后把 vsock 连接与 TCP 连接**双向 splice**。
+fn handle_connect(vsock_fd: RawFd, stream: &mut FdStream, port: u32) {
+    let tcp_fd = match dial_loopback(port) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = write_msg(stream, &Response::Error { message: format!("connect 127.0.0.1:{port} 失败: {e}") });
+            return;
+        }
+    };
+    if write_msg(stream, &Response::Ok).is_err() {
+        unsafe { libc::close(tcp_fd) };
+        return;
+    }
+    splice_bidi(vsock_fd, tcp_fd);
+    unsafe { libc::close(tcp_fd) };
+}
+
+/// dial 127.0.0.1:port（短重试，容 guest 服务刚起未 bind）。返回已连 TCP fd。
+fn dial_loopback(port: u32) -> std::io::Result<RawFd> {
+    let mut last = std::io::Error::new(ErrorKind::Other, "no attempt");
+    for _ in 0..20 {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = (port as u16).to_be();
+        addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+        let r = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if r == 0 {
+            return Ok(fd);
+        }
+        last = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(last)
+}
+
+/// 双向裸字节 splice：一方 EOF 即 shutdown 两端解阻另一线程，join 收敛。
+fn splice_bidi(a: RawFd, b: RawFd) {
+    let h = thread::spawn(move || pipe_one(a, b));
+    pipe_one(b, a);
+    unsafe {
+        libc::shutdown(a, libc::SHUT_RDWR);
+        libc::shutdown(b, libc::SHUT_RDWR);
+    }
+    let _ = h.join();
+}
+
+fn pipe_one(from: RawFd, to: RawFd) {
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = unsafe { libc::read(from, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off < n as usize {
+            let w = unsafe { libc::write(to, buf[off..].as_ptr() as *const libc::c_void, n as usize - off) };
+            if w <= 0 {
+                return;
+            }
+            off += w as usize;
         }
     }
 }

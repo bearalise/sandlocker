@@ -23,6 +23,7 @@ use sl_store::{LeaseId, SqliteStore, Store};
 
 use crate::backend::{BackendInfo, Capabilities, Capability, ExecTarget, SandboxBackend, UNSUPPORTED_BY_BACKEND};
 use crate::fcbackend::FcBackend;
+use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::gvisorbackend::GvisorBackend;
 use crate::{abspath, hex, Config};
 
@@ -1038,6 +1039,87 @@ pub fn q5_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
         );
     } else {
         println!("[q5] M2-Q5 对账 PASS：pause/resume 用户 API + fork 克隆熵（reinit 后身份必异）+ 零残留 + 能力门控");
+    }
+    Ok(())
+}
+
+// ————————————————————— M2-Q6 数据面网关对账 —————————————————————
+
+/// M2-Q6：数据面网关（ADR-22）——一次性 HMAC 签名 URL + 无状态验签 + exec/端口经 ticket 换直连。
+/// create A→① exec ticket 验签通过→经 exec_target 跑命令；② 同 ticket 再用→一次性拒；③ 篡改 sig 拒；
+/// ④ 过期拒；⑤ 端口暴露：guest 起 httpd→port ticket→proxy_port_http 取到 VM 内服务内容（外部访问 VM
+/// 内部 ✓）；⑥ destroy 零残留。免额外 root（走恢复路径）。**须用含新 sl-envd 的模板**（Connect 帧）。
+pub fn gw_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("gw-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(cfg, &template, &run_root, Box::new(store))?;
+    let gw = Gateway::new_random("http://gw".to_string());
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[gw] {m}");
+        }
+    };
+    let now = now_unix();
+
+    let a = orch.create(&SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() })?;
+    log(&format!("create A={}", a.id));
+
+    // ① exec ticket：mint→verify 通过→经 exec_target 跑命令
+    let url = gw.mint(&a.id, Action::Exec, 0, 60, now);
+    let q = parse_query(&url);
+    let t = gw.verify(&q, now).map_err(|e| format!("① exec ticket 验签失败: {e}"))?;
+    ensure(t.sid == a.id && t.action == Action::Exec, "① ticket 内容不符")?;
+    let tgt = orch.exec_target(&a.id).ok_or("① 无 exec 目标")?;
+    let (code, out, _) = tgt.exec("echo gw-exec-ok")?;
+    ensure(code == 0 && out.contains("gw-exec-ok"), "① 网关 exec 输出不符")?;
+    log("① exec ticket：验签通过 + 换直连跑命令 ✓");
+
+    // ② 一次性：同 ticket 再验 → 拒
+    ensure(gw.verify(&q, now).is_err(), "② 一次性失效（ticket 可重用）")?;
+    log("② 一次性：ticket 重用被拒 ✓");
+
+    // ③ 篡改 sig → 拒；④ 过期 → 拒
+    let url2 = gw.mint(&a.id, Action::Exec, 0, 60, now);
+    let mut q2 = parse_query(&url2);
+    q2.insert("sig".to_string(), "deadbeef".to_string());
+    ensure(gw.verify(&q2, now).is_err(), "③ 篡改 sig 未被拒")?;
+    let url3 = gw.mint(&a.id, Action::Exec, 0, 60, now);
+    let q3 = parse_query(&url3);
+    ensure(gw.verify(&q3, now + 3600).is_err(), "④ 过期 ticket 未被拒")?;
+    log("③④ 篡改/过期：均被拒 ✓");
+
+    // ⑤ 端口暴露（FR-3.3）：guest 起 httpd → port ticket → proxy_port_http 取 VM 内服务内容
+    let vsock = match orch.exec_target(&a.id) {
+        Some(ExecTarget::Vsock(p)) => p,
+        _ => return Err("⑤ 无 vsock（端口暴露仅 FC）".into()),
+    };
+    // busybox 无 httpd applet，用 nc 起一个循环 HTTP 响应器（每连接回定值），后台常驻（reparent 到 PID1）。
+    let setup = orch.exec_target(&a.id).ok_or("⑤ 无 exec 目标")?.exec(
+        "(while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 10\\r\\nConnection: close\\r\\n\\r\\nGW-PORT-OK' | nc -l -p 8080; done) >/dev/null 2>&1 & sleep 1",
+    )?;
+    ensure(setup.0 == 0, "⑤ guest nc 响应器启动失败")?;
+    let port_url = gw.mint(&a.id, Action::Port, 8080, 60, now);
+    let pq = parse_query(&port_url);
+    let pt = gw.verify(&pq, now).map_err(|e| format!("⑤ port ticket 验签失败: {e}"))?;
+    ensure(pt.action == Action::Port && pt.port == 8080, "⑤ port ticket 不符")?;
+    let resp = proxy_port_http(&vsock, 8080, "index.html")?;
+    let resp_s = String::from_utf8_lossy(&resp);
+    ensure(resp_s.contains("GW-PORT-OK"), "⑤ 端口暴露未取到 VM 内服务内容")?;
+    log("⑤ 端口暴露：签名 URL 经网关取到 VM 内 httpd 内容（外部访问 VM 内部）✓");
+
+    // ⑥ destroy 零残留
+    let dir_a = orch.dir_of(&a.id);
+    orch.destroy(&a.id)?;
+    ensure(!orch.is_live(&a.id) && dir_a.map(|d| !d.exists()).unwrap_or(true), "⑥ destroy 后有残留")?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "⑥ 收尾 store 非空")?;
+    log("⑥ destroy：零残留 ✓");
+
+    if cfg.json {
+        println!(r#"{{"metric":"gw_reconcile","cases":6,"port_exposure":true,"one_time":true,"pass":true}}"#);
+    } else {
+        println!("[gw] M2-Q6 对账 PASS：一次性 HMAC 签名 URL + 无状态验签 + exec/端口经 ticket 换直连 + 端口暴露 + 零残留");
     }
     Ok(())
 }

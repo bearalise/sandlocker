@@ -8,6 +8,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **Data-plane gateway + one-time HMAC signed URLs + port exposure (ADR-22, FR-3.3, M2-Q6)** — a
+  separate in-process gateway listener (`--gw-addr`, default `127.0.0.1:7879`) serves the data plane
+  behind **one-time HMAC-SHA256 signed URLs** (hand-rolled HMAC over `sha2`, no new dep). The control
+  plane mints tickets via `POST /v1/sandboxes/{id}/ticket {action, port?, ttl?}`; the gateway verifies
+  the signature **statelessly** + checks expiry + consumes the nonce once (`/gw/exec`, `/gw/file`,
+  `/gw/logs`, `/gw/p`). **Port exposure** (`/gw/p`): a new `sl-proto` `Connect{port}` frame makes
+  `sl-envd` dial `127.0.0.1:port` in the guest and bidirectionally splice over vsock (guest brings
+  `lo` up), and the gateway HTTP-reverse-proxies to it — so an external client reaches a service
+  **inside** the VM through a signed URL, even though sandboxes are vsock-only (no eth0). `sl-node
+  --gw-reconcile` validates M2-Q6 end-to-end (CI `gateway` job). Tampered / expired / reused tickets
+  are rejected (403).
 - **pause / resume / fork user API (FR-1.4, M2-Q5)** — `POST /v1/sandboxes/{id}/pause` snapshots the
   running VM to disk and stops it (`state: paused`, no exec while paused); `/resume` restores it; and
   `/fork` derives a new sandbox from a paused parent's snapshot. Added to the `SandboxBackend` ABI
