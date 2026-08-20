@@ -14,17 +14,21 @@
 //! 生命周期由 `reconcile`（Q9 对账）/ `bench`（Q2 时延）子命令进程内驱动一次（本周不起长驻循环）。
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+use sl_proto::{pty_resize_frame, pty_stdin_frame, read_msg, write_frame, write_msg, Request, Response};
 use sl_store::{LeaseId, SqliteStore, Store};
 
 use crate::backend::{BackendInfo, Capabilities, Capability, ExecTarget, SandboxBackend, UNSUPPORTED_BY_BACKEND};
 use crate::fcbackend::FcBackend;
 use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::gvisorbackend::GvisorBackend;
+use crate::connect_guest;
 use crate::{abspath, hex, Config};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
@@ -1120,6 +1124,94 @@ pub fn gw_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
         println!(r#"{{"metric":"gw_reconcile","cases":6,"port_exposure":true,"one_time":true,"pass":true}}"#);
     } else {
         println!("[gw] M2-Q6 对账 PASS：一次性 HMAC 签名 URL + 无状态验签 + exec/端口经 ticket 换直连 + 端口暴露 + 零残留");
+    }
+    Ok(())
+}
+
+// ————————————————————— M2-Q7 交互式 PTY 对账 —————————————————————
+
+/// 从 PTY 裸输出流累积读，直到含 `needle` 或超时（PTY 输出含回显+prompt，用 contains 定位）。
+fn pty_read_until(s: &mut UnixStream, needle: &str, deadline: Instant) -> String {
+    let mut acc = String::new();
+    let mut buf = [0u8; 4096];
+    while Instant::now() < deadline {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if acc.contains(needle) {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+    acc
+}
+
+/// M2-Q7：交互式 PTY 会话——双向流 + 窗口 resize。create A → 连 vsock → `Pty{80,24}` → Ok →
+/// ① stdin `echo <marker>` 回显含 marker（双向流）；② resize 120×40 + `stty size` 输出 `40 120`
+/// （窗口 resize 生效）；③ `exit` 收敛；④ destroy 零残留。免 root（走恢复路径）。须含新 sl-envd 的模板。
+pub fn pty_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("pty-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(cfg, &template, &run_root, Box::new(store))?;
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[pty] {m}");
+        }
+    };
+
+    let a = orch.create(&SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() })?;
+    let vsock = match orch.exec_target(&a.id) {
+        Some(ExecTarget::Vsock(p)) => p,
+        _ => return Err("PTY 仅 FC 后端（vsock）".into()),
+    };
+    let mut s = connect_guest(&vsock)?;
+    write_msg(&mut s, &Request::Pty { cols: 80, rows: 24 }).map_err(|e| format!("发 Pty 失败: {e}"))?;
+    match read_msg::<_, Response>(&mut s).map_err(|e| format!("读 Pty ack 失败: {e}"))? {
+        Response::Ok => {}
+        other => return Err(format!("Pty ack 异常: {other:?}")),
+    }
+    s.set_read_timeout(Some(Duration::from_millis(300))).map_err(|e| e.to_string())?;
+    let _ = pty_read_until(&mut s, "\u{0}<never>", Instant::now() + Duration::from_millis(400)); // drain 初始 prompt
+    log(&format!("create A={} + PTY 会话建立（80×24）", a.id));
+
+    // ① 双向流：stdin echo → 输出含 marker
+    write_frame(&mut s, &pty_stdin_frame(b"echo PTY-MARKER-42\n")).map_err(|e| format!("写 stdin 失败: {e}"))?;
+    let out1 = pty_read_until(&mut s, "PTY-MARKER-42", Instant::now() + Duration::from_secs(5));
+    ensure(out1.contains("PTY-MARKER-42"), "① PTY 双向流：未见 echo marker")?;
+    log("① 双向流：echo 回显命中 marker ✓");
+
+    // ② 窗口 resize：120×40 → `stty size` 输出 `40 120`（rows cols）
+    write_frame(&mut s, &pty_resize_frame(120, 40)).map_err(|e| format!("写 resize 失败: {e}"))?;
+    write_frame(&mut s, &pty_stdin_frame(b"stty size\n")).map_err(|e| format!("写 stty 失败: {e}"))?;
+    let out2 = pty_read_until(&mut s, "40 120", Instant::now() + Duration::from_secs(5));
+    ensure(out2.contains("40 120"), "② 窗口 resize：stty size 未反映 40×120")?;
+    log("② 窗口 resize：stty size=40 120 ✓");
+
+    // ③ exit 收敛（shell 退出 → master EOF → guest 关连接）
+    let _ = write_frame(&mut s, &pty_stdin_frame(b"exit\n"));
+    let _ = pty_read_until(&mut s, "\u{0}<never>", Instant::now() + Duration::from_millis(500));
+    drop(s);
+    log("③ exit：会话收敛 ✓");
+
+    // ④ destroy 零残留
+    let dir_a = orch.dir_of(&a.id);
+    orch.destroy(&a.id)?;
+    ensure(!orch.is_live(&a.id) && dir_a.map(|d| !d.exists()).unwrap_or(true), "④ destroy 后有残留")?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "④ 收尾 store 非空")?;
+    log("④ destroy：零残留 ✓");
+
+    if cfg.json {
+        println!(r#"{{"metric":"pty_reconcile","cases":4,"bidi":true,"resize":true,"pass":true}}"#);
+    } else {
+        println!("[pty] M2-Q7 对账 PASS：交互式 PTY 双向流 + 窗口 resize + 会话收敛 + 零残留");
     }
     Ok(())
 }

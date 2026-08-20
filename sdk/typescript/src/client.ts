@@ -16,7 +16,12 @@ export const ROUTES: ReadonlySet<string> = new Set<string>([
   "PUT /v1/sandboxes/{id}/files/{path}",
   "GET /v1/sandboxes/{id}/files/{path}",
   "GET /v1/sandboxes/{id}/logs",
+  "POST /v1/sandboxes/{id}/pause",
+  "POST /v1/sandboxes/{id}/resume",
+  "POST /v1/sandboxes/{id}/fork",
+  "POST /v1/sandboxes/{id}/ticket",
   "GET /v1/templates",
+  "GET /v1/backends",
 ]);
 
 /** 非预期状态 → 异常（仅 404 特化为 NotFound；错误体形如 {"error":"..."}）。 */
@@ -73,6 +78,26 @@ export class Client {
   }
   async keepAlive(id: string): Promise<any> {
     return this.json("POST", `/v1/sandboxes/${id}/keepalive`, undefined, [200]);
+  }
+  /** M2 W9：暂停沙箱（落快照停 VM，需后端 pause_resume）。 */
+  async pause(id: string): Promise<any> {
+    return this.json("POST", `/v1/sandboxes/${id}/pause`, undefined, [200]);
+  }
+  /** M2 W9：恢复沙箱（从快照拉起，reinit 换发新 machine-id）。 */
+  async resume(id: string): Promise<any> {
+    return this.json("POST", `/v1/sandboxes/${id}/resume`, undefined, [200]);
+  }
+  /** M2 W9：从（已 pause 的）父派生新沙箱（独立身份，需后端 snapshot_fork）。 */
+  async fork(id: string, body: Record<string, unknown> = {}): Promise<any> {
+    return this.json("POST", `/v1/sandboxes/${id}/fork`, body, [201]);
+  }
+  /** M2 W10：签发数据面网关一次性 HMAC 签名 URL（action: exec|file|logs|port）。 */
+  async ticket(id: string, action: string, opts: { port?: number; ttl?: number } = {}): Promise<any> {
+    return this.json("POST", `/v1/sandboxes/${id}/ticket`, { action, ...opts }, [200]);
+  }
+  /** M2 W6：后端列表与能力集（ADR-14）。 */
+  async listBackends(): Promise<any[]> {
+    return (await this.json("GET", "/v1/backends")) ?? [];
   }
   async exec(id: string, cmd: string): Promise<any> {
     return this.json("POST", `/v1/sandboxes/${id}/exec`, { cmd });

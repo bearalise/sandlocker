@@ -28,7 +28,12 @@ ROUTES = frozenset(
         ("PUT", "/v1/sandboxes/{id}/files/{path}"),
         ("GET", "/v1/sandboxes/{id}/files/{path}"),
         ("GET", "/v1/sandboxes/{id}/logs"),
+        ("POST", "/v1/sandboxes/{id}/pause"),
+        ("POST", "/v1/sandboxes/{id}/resume"),
+        ("POST", "/v1/sandboxes/{id}/fork"),
+        ("POST", "/v1/sandboxes/{id}/ticket"),
         ("GET", "/v1/templates"),
+        ("GET", "/v1/backends"),
     }
 )
 
@@ -101,6 +106,43 @@ class Client:
         # type: (str) -> Dict[str, Any]
         # 续期只滑 idle lease 窗；TTL 绝对硬顶 keepalive 救不了（M2-Q9）。返回 lease/ttl 到期秒。
         return self._json("POST", "/v1/sandboxes/{}/keepalive".format(sid), expect=(200,))
+
+    # --- pause/resume/fork（M2 W9，FR-1.4 / M2-Q5） ---
+    def pause(self, sid):
+        # type: (str) -> Dict[str, Any]
+        # 暂停：落快照停 VM（需后端 pause_resume；如 gVisor 无 → 409 UNSUPPORTED_BY_BACKEND）。
+        return self._json("POST", "/v1/sandboxes/{}/pause".format(sid), expect=(200,))
+
+    def resume(self, sid):
+        # type: (str) -> Dict[str, Any]
+        # 恢复：从快照拉起（reinit 换发新 machine-id/rng/session-key）。
+        return self._json("POST", "/v1/sandboxes/{}/resume".format(sid), expect=(200,))
+
+    def fork(self, sid, ttl=None, idle=None):
+        # type: (str, int, int) -> Dict[str, Any]
+        # 从（已 pause 的）父派生新沙箱（独立身份，需后端 snapshot_fork）。返回新 sandbox（含 forked_from）。
+        body = {}
+        if ttl is not None:
+            body["ttl"] = ttl
+        if idle is not None:
+            body["idle"] = idle
+        return self._json("POST", "/v1/sandboxes/{}/fork".format(sid), body_obj=body, expect=(201,))
+
+    # --- 数据面网关一次性签名 URL（M2 W10，ADR-22 / M2-Q6） ---
+    def ticket(self, sid, action, port=None, ttl=None):
+        # type: (str, str, int, int) -> Dict[str, Any]
+        # 签发一次性 HMAC 签名 URL（action: exec|file|logs|port）。返回 {"url": ...}。
+        body = {"action": action}
+        if port is not None:
+            body["port"] = port
+        if ttl is not None:
+            body["ttl"] = ttl
+        return self._json("POST", "/v1/sandboxes/{}/ticket".format(sid), body_obj=body, expect=(200,))
+
+    # --- 后端列表与能力集（M2 W6，ADR-14） ---
+    def list_backends(self):
+        # type: () -> List[Dict[str, Any]]
+        return self._json("GET", "/v1/backends") or []
 
     # --- exec（POST /v1/sandboxes/{id}/exec） ---
     def exec(self, sid, cmd):

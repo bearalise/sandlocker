@@ -18,7 +18,9 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use sl_proto::{read_msg, write_msg, FdStream, Request, Response, ENVD_VSOCK_PORT};
+use sl_proto::{
+    parse_pty_input, read_frame, read_msg, write_msg, FdStream, PtyInput, Request, Response, ENVD_VSOCK_PORT,
+};
 
 fn log(msg: &str) {
     // 直接写 stderr → 串口 ttyS0（FC console），host 侧 console.log 可见
@@ -54,6 +56,9 @@ fn mount_all() {
     mount("sysfs", "/sys", "sysfs");
     mount("devtmpfs", "/dev", "devtmpfs");
     mount("tmpfs", "/tmp", "tmpfs");
+    // W11 PTY：forkpty/openpty 需 devpts（分配 pty slave）。/dev/pts 目录先建再挂。
+    let _ = std::fs::create_dir_all("/dev/pts");
+    mount("devpts", "/dev/pts", "devpts");
 }
 
 fn mount(source: &str, target: &str, fstype: &str) {
@@ -212,6 +217,11 @@ fn handle_conn(conn_fd: RawFd) {
             handle_connect(conn_fd, &mut stream, port);
             break;
         }
+        // W11 交互式 PTY：forkpty 起 shell + Ok ack 后本连接进 PTY 模式（帧化输入 / 裸输出），占用至退出。
+        if let Request::Pty { cols, rows } = req {
+            handle_pty(conn_fd, &mut stream, cols, rows);
+            break;
+        }
         let resp = dispatch(req);
         if let Err(e) = write_msg(&mut stream, &resp) {
             log(&format!("写响应失败: {e}"));
@@ -227,9 +237,77 @@ fn dispatch(req: Request) -> Response {
         Request::Reinit { seed_hex, hostname, wall_time_ns } => {
             run_reinit(&seed_hex, &hostname, wall_time_ns)
         }
-        // Connect 由 handle_conn 特判（脱离 dispatch 的 req/resp 模型）；到此属逻辑错误。
+        // Connect/Pty 由 handle_conn 特判（脱离 dispatch 的 req/resp 模型）；到此属逻辑错误。
         Request::Connect { .. } => Response::Error { message: "Connect 应由 handle_conn 处理".into() },
+        Request::Pty { .. } => Response::Error { message: "Pty 应由 handle_conn 处理".into() },
     }
+}
+
+/// W11 交互式 PTY：`forkpty` 起 `/bin/sh`（初始窗口 cols×rows）。回 `Ok` ack 后本连接进 PTY 模式：
+/// 线程把 pty master 输出裸写 vsock；主循环读 PTY 输入帧（stdin→master / resize→TIOCSWINSZ）。
+/// child 退出或任一端 EOF → 收敛：kill child + waitpid + close master。
+fn handle_pty(vsock_fd: RawFd, stream: &mut FdStream, cols: u16, rows: u16) {
+    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut master: RawFd = -1;
+    let pid = unsafe { libc::forkpty(&mut master, ptr::null_mut(), ptr::null(), &ws as *const _ as *mut _) };
+    if pid < 0 {
+        let _ = write_msg(stream, &Response::Error { message: format!("forkpty 失败: {}", std::io::Error::last_os_error()) });
+        return;
+    }
+    if pid == 0 {
+        // child：forkpty 已 setsid + TIOCSCTTY + dup slave→0/1/2；直接 exec 交互 shell。
+        let sh = cstr("/bin/sh");
+        let arg0 = cstr("/bin/sh");
+        let argi = cstr("-i");
+        let argv = [arg0.as_ptr(), argi.as_ptr(), ptr::null()];
+        unsafe {
+            libc::execv(sh.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    // parent
+    if write_msg(stream, &Response::Ok).is_err() {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, ptr::null_mut(), 0);
+            libc::close(master);
+        }
+        return;
+    }
+    // 线程 A：pty master → vsock（裸输出）。master EOF（shell 退出）即结束。
+    let out = thread::spawn(move || pipe_one(master, vsock_fd));
+    // 主循环：读 PTY 输入帧 → 写 master(stdin) / TIOCSWINSZ(resize)。vsock EOF/错误即结束。
+    loop {
+        let payload = match read_frame(stream) {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        match parse_pty_input(&payload) {
+            Some(PtyInput::Stdin(data)) => {
+                let mut off = 0usize;
+                while off < data.len() {
+                    let w = unsafe { libc::write(master, data[off..].as_ptr() as *const libc::c_void, data.len() - off) };
+                    if w <= 0 {
+                        break;
+                    }
+                    off += w as usize;
+                }
+            }
+            Some(PtyInput::Resize { cols, rows }) => {
+                let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+            }
+            None => {} // 非法帧忽略
+        }
+    }
+    // 收敛：解阻输出线程 + 杀 shell + 回收。
+    unsafe {
+        libc::shutdown(vsock_fd, libc::SHUT_RDWR);
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, ptr::null_mut(), 0);
+        libc::close(master);
+    }
+    let _ = out.join();
 }
 
 /// 带起 loopback（Connect dial 127.0.0.1 需 lo up）。busybox `ip`/`ifconfig` 皆可；失败仅记录。

@@ -194,6 +194,9 @@ struct Config {
     /// --gw-reconcile <模板目录>：M2-Q6 数据面网关对账（ticket 换直连 + 一次性/篡改/过期拒 + 端口暴露
     /// + 零残留），随后退出。免额外 root（走恢复路径）。
     gw_reconcile: Option<PathBuf>,
+    /// --pty-reconcile <模板目录>：M2-Q7 交互式 PTY 对账（双向流 + 窗口 resize + 会话收敛 + 零残留），
+    /// 随后退出。免 root（走恢复路径）。
+    pty_reconcile: Option<PathBuf>,
 }
 
 fn main() {
@@ -323,6 +326,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[gw] M2-Q6 gw-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --pty-reconcile：M2-Q7 交互式 PTY 对账（双向流 + resize）。
+    if let Some(tpl) = cfg.pty_reconcile.clone() {
+        match orch::pty_reconcile(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[pty] M2-Q7 pty-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -1985,6 +2000,7 @@ fn clone_paths(cfg: &Config) -> Config {
         q5_reconcile: None,
         gw_addr: None,
         gw_reconcile: None,
+        pty_reconcile: None,
     }
 }
 
@@ -2106,6 +2122,7 @@ fn parse_args() -> Config {
         q5_reconcile: None,
         gw_addr: None,
         gw_reconcile: None,
+        pty_reconcile: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2158,6 +2175,7 @@ fn parse_args() -> Config {
             "--q5-reconcile" => cfg.q5_reconcile = Some(PathBuf::from(take())),
             "--gw-addr" => cfg.gw_addr = Some(take()),
             "--gw-reconcile" => cfg.gw_reconcile = Some(PathBuf::from(take())),
+            "--pty-reconcile" => cfg.pty_reconcile = Some(PathBuf::from(take())),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
@@ -2176,7 +2194,7 @@ fn parse_args() -> Config {
             "run" => {}
             other => {
                 eprintln!("未知参数: {other}");
-                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--abi-contract 模板DIR] [--q5-reconcile 模板DIR] [--gw-reconcile 模板DIR] [--serve] [--gw-addr host:port] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
+                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--abi-contract 模板DIR] [--q5-reconcile 模板DIR] [--gw-reconcile 模板DIR] [--pty-reconcile 模板DIR] [--serve] [--gw-addr host:port] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
                 std::process::exit(2);
             }
         }
