@@ -339,6 +339,44 @@ jobs:
           echo "$q" | grep -q '"pass":true' || { echo "::error::M2-Q5 未 pass"; exit 1; }
           echo "M2-Q5 PASS：pause/resume 用户 API + fork 克隆熵（reinit 后身份必异）+ 零残留 + 能力门控"
 
+  # M2-Q6（M2 W10）：数据面网关（ADR-22）——一次性 HMAC 签名 URL + 无状态验签 + exec/端口经 ticket
+  #   换直连 + 端口暴露（FR-3.3，外部访问 VM 内部）+ 零残留。fc 走恢复需 /dev/kvm。KVM 缺失则 skip。
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装内核构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target，sl-envd 静态）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态，含 Connect 端口代理）
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs（含新 sl-envd：lo up + Connect 代理）
+        run: scripts/build-rootfs.sh
+      - name: M2-Q6 数据面网关对账（--gw-reconcile）
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过 M2-Q6 网关（fc 恢复需 KVM）"
+            exit 0
+          fi
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::未取到模板 version"; exit 1; }
+          g=$(./target/release/sl-node --gw-reconcile "build/templates/hello/$ver" --json)
+          echo "$g"
+          echo "$g" | grep -q '"metric":"gw_reconcile"' || { echo "::error::缺 gw_reconcile 指标"; exit 1; }
+          echo "$g" | grep -q '"port_exposure":true' || { echo "::error::端口暴露未过"; exit 1; }
+          echo "$g" | grep -q '"pass":true' || { echo "::error::M2-Q6 未 pass"; exit 1; }
+          echo "M2-Q6 PASS：一次性 HMAC 签名 URL + 无状态验签 + ticket 换直连 + 端口暴露 + 零残留"
+
   validate:
     runs-on: ubuntu-latest
     steps:

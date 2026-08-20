@@ -158,6 +158,46 @@ paths:
         '400':
           $ref: '#/components/responses/Error'
 
+  /v1/sandboxes/{id}/ticket:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 签发数据面网关一次性 HMAC 签名 URL（ADR-22 / M2-Q6）
+      description: >
+        M2 W10：控制面据进程内 secret 签发 ticket（`{action}` ∈ exec|file|logs|port，port 用于端口暴露）。
+        返回签名 URL（默认指向网关 127.0.0.1:7879 的 `/gw/*`）。网关**无状态验签**（HMAC 自包含）+ 未过期 +
+        **一次性**（nonce 消费一次即失效）。数据面（exec/文件/日志/端口反代）走网关直连，控制面不持连接态。
+      operationId: mintTicket
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [exec, file, logs, port] }
+                port: { type: integer, description: action=port 时暴露的 guest 端口 }
+                ttl: { type: integer, default: 300, description: ticket 有效期（秒） }
+      responses:
+        '200':
+          description: 签名 URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string }
+        '400':
+          $ref: '#/components/responses/Error'
+
+  # 数据面网关（默认 http://127.0.0.1:7879，与控制面分离，M3 可拆独立副本）：
+  #   POST /gw/exec?<ticket>   body{cmd}           — 经 ticket 直连 exec
+  #   PUT|GET /gw/file?<ticket>&p=<path>           — 文件读写
+  #   GET /gw/logs?<ticket>                        — 日志
+  #   GET /gw/p?<ticket>&p=<guest_path>            — 端口反代（HTTP over vsock，FR-3.3 外部访问 VM 内部）
+  # ticket 参数（query）：sid,action,port,exp,nonce,sig。均为一次性 + HMAC 验签。
+
   /v1/sandboxes/{id}/exec:
     parameters:
       - $ref: '#/components/parameters/SandboxId'
