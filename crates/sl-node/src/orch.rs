@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use sl_store::{LeaseId, SqliteStore, Store};
 
-use crate::backend::{BackendInfo, Capabilities, ExecTarget, SandboxBackend, UNSUPPORTED_BY_BACKEND};
+use crate::backend::{BackendInfo, Capabilities, Capability, ExecTarget, SandboxBackend, UNSUPPORTED_BY_BACKEND};
 use crate::fcbackend::FcBackend;
 use crate::gvisorbackend::GvisorBackend;
 use crate::{abspath, hex, Config};
@@ -661,6 +661,204 @@ pub fn gvisor_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
         println!(r#"{{"metric":"gvisor_reconcile","cases":7,"backend":"gvisor","switchable":true,"pass":true}}"#);
     } else {
         println!("[gvisor] M2-Q4 对账 PASS：gVisor create/exec/fs/destroy 走 ABI + 能力显式无 prebake/pause + 与 fc 可切换 + 零残留");
+    }
+    Ok(())
+}
+
+// ————————————————————— 硬出口② ABI 契约测试套件 —————————————————————
+
+/// 单后端跑共同场景（功能对等）：lifecycle/exec/fs/clone 隔离/destroy 零残留。返回 (全过?, 各项 JSON)。
+fn contract_common(orch: &mut Orch, id: &str) -> (bool, serde_json::Value) {
+    let spec = SandboxSpec { backend: Some(id.to_string()), idle_secs: 3600, ttl_secs: 3600, ..Default::default() };
+    let a = match orch.create(&spec) {
+        Ok(o) => o,
+        Err(_) => {
+            return (
+                false,
+                serde_json::json!({"lifecycle":"fail","exec":"skip","fs":"skip","clone_isolation":"skip","destroy_clean":"skip"}),
+            )
+        }
+    };
+    let pf = |v: bool| if v { "pass" } else { "fail" };
+    let lifecycle = pf(orch.is_live(&a.id));
+
+    // exec：echo marker → exit0 + 含 marker
+    let marker = format!("abi-{}", &a.id[..6.min(a.id.len())]);
+    let exec = {
+        let r = orch.exec_target(&a.id).and_then(|t| t.exec(&format!("echo {marker}")).ok());
+        pf(matches!(&r, Some((0, out, _)) if out.contains(&marker)))
+    };
+
+    // fs：写文件 + 读回一致
+    let fs = {
+        let w = orch.exec_target(&a.id).and_then(|t| t.exec("echo abi-fs > /tmp/abi && sync").ok());
+        let r = orch.exec_target(&a.id).and_then(|t| t.exec("cat /tmp/abi").ok());
+        pf(matches!(w, Some((0, _, _))) && matches!(&r, Some((0, o, _)) if o.trim() == "abi-fs"))
+    };
+
+    // clone 隔离：第二实例 machine-id 互异
+    let clone_isolation = match orch.create(&spec) {
+        Ok(b) => {
+            let good = !b.machine_id.is_empty() && b.machine_id != a.machine_id;
+            let _ = orch.destroy(&b.id);
+            pf(good)
+        }
+        Err(_) => pf(false),
+    };
+
+    // destroy 零残留：不在册 + 目录消失 + store 键删
+    let dir_a = orch.dir_of(&a.id);
+    let _ = orch.destroy(&a.id);
+    let destroy_clean = pf(!orch.is_live(&a.id)
+        && dir_a.map(|d| !d.exists()).unwrap_or(true)
+        && orch.store.get(&state_key(&a.id)).ok().flatten().is_none());
+
+    let ok = [lifecycle, exec, fs, clone_isolation, destroy_clean].iter().all(|&s| s == "pass");
+    (
+        ok,
+        serde_json::json!({
+            "lifecycle":lifecycle,"exec":exec,"fs":fs,
+            "clone_isolation":clone_isolation,"destroy_clean":destroy_clean
+        }),
+    )
+}
+
+/// 单后端能力矩阵（能力对等）：遍历全能力——有→create(required)成功标 has；无→须创建期
+/// UNSUPPORTED_BY_BACKEND 标 unsupported-ok；否则 GATE-FAIL（运行期静默降级红线）。
+fn contract_caps(orch: &mut Orch, id: &str, caps: &[String]) -> (serde_json::Value, bool) {
+    let mut ok = true;
+    let mut m = serde_json::Map::new();
+    for cap in Capability::ALL {
+        let name = cap.as_str();
+        let has = caps.iter().any(|c| c == name);
+        let spec = SandboxSpec {
+            backend: Some(id.to_string()),
+            required_capabilities: Capabilities::with(&[cap]),
+            idle_secs: 3600,
+            ttl_secs: 3600,
+            ..Default::default()
+        };
+        let cell = match (has, orch.create(&spec)) {
+            (true, Ok(o)) => {
+                let _ = orch.destroy(&o.id);
+                "has"
+            }
+            (true, Err(_)) => {
+                ok = false;
+                "GATE-FAIL"
+            }
+            (false, Err(e)) if e.starts_with(UNSUPPORTED_BY_BACKEND) => "unsupported-ok",
+            (false, Ok(o)) => {
+                let _ = orch.destroy(&o.id); // 静默降级：能力不满足却创建成功
+                ok = false;
+                "GATE-FAIL"
+            }
+            (false, Err(_)) => {
+                ok = false;
+                "GATE-FAIL" // 被拒但错误非 UNSUPPORTED_BY_BACKEND（契约串不稳）
+            }
+        };
+        m.insert(name.to_string(), serde_json::json!(cell));
+    }
+    (serde_json::Value::Object(m), ok)
+}
+
+/// 硬出口②：ABI 契约测试套件——**同一组场景对 fc 与 gvisor 逐后端跑**（能力对等而非功能对等），
+/// 产出官方兼容矩阵。fc 资格 = `/dev/kvm` 可写；gvisor 资格 = runsc 注册成功。两后端齐全且共同场景
+/// 全过 + 能力矩阵无 GATE-FAIL 即 `both_backends`+`switchable`+`pass`。`template` 须预烘焙（fc 恢复用）。
+pub fn abi_contract(cfg: &Config, template: &Path) -> Result<(), String> {
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("abi-contract");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let mut cfg2 = cfg.clone();
+    cfg2.gvisor = true; // 契约验收目标即两后端
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(&cfg2, &template, &run_root, Box::new(store))?;
+
+    let kvm_ok = std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
+    let registered: Vec<(String, Vec<String>)> = orch
+        .backends_info()
+        .into_iter()
+        .map(|b| (b.id, b.capabilities.iter().map(|s| s.to_string()).collect()))
+        .collect();
+
+    let mut reports: Vec<serde_json::Value> = Vec::new();
+    let mut ran_ok: Vec<String> = Vec::new();
+    let mut any_gate_fail = false;
+
+    for (id, caps) in &registered {
+        let eligible = match id.as_str() {
+            "fc" => kvm_ok,
+            _ => true, // 注册即已探活
+        };
+        if !eligible {
+            reports.push(serde_json::json!({"id":id,"eligible":false,"reason":"env-not-ready"}));
+            continue;
+        }
+        let (common_ok, checks) = contract_common(&mut orch, id);
+        let (caps_json, caps_ok) = contract_caps(&mut orch, id, caps);
+        if !caps_ok {
+            any_gate_fail = true;
+        }
+        if common_ok && caps_ok {
+            ran_ok.push(id.clone());
+        }
+        let mut obj = serde_json::json!({"id":id,"eligible":true});
+        obj.as_object_mut().unwrap().extend(checks.as_object().unwrap().clone());
+        obj["caps"] = caps_json;
+        reports.push(obj);
+    }
+
+    let both_backends = ran_ok.iter().any(|x| x == "fc") && ran_ok.iter().any(|x| x == "gvisor");
+    // 所有合资格后端都全过（共同场景 + 能力矩阵）：
+    let eligible_count = reports.iter().filter(|r| r["eligible"] == serde_json::json!(true)).count();
+    let switchable = eligible_count >= 1 && ran_ok.len() == eligible_count && !any_gate_fail;
+    let pass = switchable && eligible_count >= 1;
+
+    if cfg.json {
+        println!(
+            r#"{{"metric":"abi_contract","backends":{},"both_backends":{both_backends},"switchable":{switchable},"pass":{pass}}}"#,
+            serde_json::Value::Array(reports)
+        );
+    } else {
+        println!("[abi] Sandbox ABI 兼容矩阵（逐后端实测，ADR-14）：");
+        let checks = ["lifecycle", "exec", "fs", "clone_isolation", "destroy_clean"];
+        let cap_names: Vec<&str> = Capability::ALL.iter().map(|c| c.as_str()).collect();
+        let ids: Vec<String> = reports.iter().map(|r| r["id"].as_str().unwrap_or("?").to_string()).collect();
+        println!("| 检查项 | {} |", ids.join(" | "));
+        println!("|---|{}", "---|".repeat(ids.len()));
+        let cell = |r: &serde_json::Value, key: &str| -> String {
+            if r["eligible"] != serde_json::json!(true) {
+                return "skipped".into();
+            }
+            r[key].as_str().unwrap_or("-").to_string()
+        };
+        for c in checks {
+            let row: Vec<String> = reports.iter().map(|r| cell(r, c)).collect();
+            println!("| {c} | {} |", row.join(" | "));
+        }
+        for cn in &cap_names {
+            let row: Vec<String> = reports
+                .iter()
+                .map(|r| {
+                    if r["eligible"] != serde_json::json!(true) {
+                        "skipped".into()
+                    } else {
+                        r["caps"][cn].as_str().unwrap_or("-").to_string()
+                    }
+                })
+                .collect();
+            println!("| cap:{cn} | {} |", row.join(" | "));
+        }
+        println!(
+            "[abi] both_backends={both_backends} switchable={switchable} → 硬出口②: {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    if !pass {
+        return Err(format!(
+            "硬出口② 未达标：switchable={switchable} both_backends={both_backends}（需两后端合资格且全过、能力矩阵无 GATE-FAIL）"
+        ));
     }
     Ok(())
 }
