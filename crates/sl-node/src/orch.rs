@@ -663,11 +663,18 @@ pub fn pool_bench(cfg: &Config, template: &Path) -> Result<(), String> {
     let win_miss = m1.saturating_sub(m0);
     let hit_rate = win_hits as f64 / (win_hits + win_miss).max(1) as f64;
     let warm_le_100 = warm_p50 <= 100;
-    let pass = warm_p50 < cold_p50;
+
+    // 回归判据：温池不劣于冷档（`<=` 容忍 reflink fs 上 copy≈0 的等值噪声；ext4 上仍严格小于）。
+    let regression_ok = warm_p50 <= cold_p50;
+    // 绝对预算 gate（硬出口①）：env `POOL_P50_BUDGET_MS`>0 时追加 warm_p50 ≤ budget。缺省 0=关——
+    // bench-light 托管 runner 慢，不设预算只 gate 回归；裸金属 bench-density job 设 100 硬达标（PRD §8.1）。
+    let budget_ms: u128 = std::env::var("POOL_P50_BUDGET_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let budget_ok = budget_ms == 0 || warm_p50 <= budget_ms;
+    let pass = regression_ok && budget_ok;
 
     if cfg.json {
         println!(
-            r#"{{"metric":"pool_bench","n":{},"cold_p50":{cold_p50},"cold_p90":{cold_p90},"warm_p50":{warm_p50},"warm_p90":{warm_p90},"warm_hit_rate":{hit_rate:.3},"copy_saved_p50":{copy_saved_p50},"warm_le_100":{warm_le_100},"pass":{pass}}}"#,
+            r#"{{"metric":"pool_bench","n":{},"cold_p50":{cold_p50},"cold_p90":{cold_p90},"warm_p50":{warm_p50},"warm_p90":{warm_p90},"warm_hit_rate":{hit_rate:.3},"copy_saved_p50":{copy_saved_p50},"warm_le_100":{warm_le_100},"budget_ms":{budget_ms},"pass":{pass}}}"#,
             warm_totals.len()
         );
     } else {
@@ -675,13 +682,22 @@ pub fn pool_bench(cfg: &Config, template: &Path) -> Result<(), String> {
             "热档 n={} P50={warm_p50}ms P90={warm_p90}ms（命中率={hit_rate:.1}，省 copy≈{copy_saved_p50}ms）",
             warm_totals.len()
         ));
+        let budget_note = if budget_ms == 0 {
+            format!("warm_le_100={warm_le_100}（预算未设，仅 gate 回归）")
+        } else {
+            format!("预算 ≤{budget_ms}ms: {}", if budget_ok { "PASS" } else { "FAIL" })
+        };
         log(&format!(
-            "M2-Q2 起步：warm_p50<cold_p50 = {}（{warm_p50}<{cold_p50}）；warm_le_100={warm_le_100}（≤100ms 硬达标留 W5）",
+            "硬出口①：warm≤cold = {}（{warm_p50}≤{cold_p50}）；{budget_note}；总判 {}",
+            if regression_ok { "PASS" } else { "FAIL" },
             if pass { "PASS" } else { "FAIL" }
         ));
     }
-    if !pass {
-        return Err(format!("温池未见收益：warm_p50={warm_p50}ms 未低于 cold_p50={cold_p50}ms"));
+    if !regression_ok {
+        return Err(format!("温池未见收益：warm_p50={warm_p50}ms > cold_p50={cold_p50}ms"));
+    }
+    if !budget_ok {
+        return Err(format!("池命中 P50 未达预算：warm_p50={warm_p50}ms > POOL_P50_BUDGET_MS={budget_ms}ms"));
     }
     Ok(())
 }

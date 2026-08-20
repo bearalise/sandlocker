@@ -12,8 +12,13 @@ Milestone M2 (in progress).
   vmstate/mem hardlink) off the create critical path and warms the snapshot page cache
   (`posix_fadvise`); pool-hit `create` skips the copy (`copy_ms=0`) and restores from warm cache.
   `--serve --pool-template <name> --pool-size <N>` (default 2, 0 disables); `--pool-bench` reports
-  cold-vs-warm tiers. On a hello template: warm P50 ≈70 ms vs cold ≈100 ms. Toward M2-Q2 (pool-hit
-  P50 ≤100 ms hard target + CI land in W5).
+  cold-vs-warm tiers. On a hello template: warm P50 ≈70 ms vs cold ≈100 ms.
+- **Pool-hit latency in CI (M2 hard exit ①)** — `scripts/bench/bench-pool.sh` lands the cold/warm
+  pool-hit percentiles in the bench CI. `bench-light` (managed runner) gates regression only
+  (warm P50 must not exceed cold P50); the absolute pool-hit **P50 ≤100 ms** target is hard-gated
+  only on the bare-metal `bench-density` job (`POOL_P50_BUDGET_MS=100`), alongside the M2-Q10
+  density target (`DENSITY_MIN=200`, ≥200 sandboxes at default spec). Real SLO numbers await a
+  registered 64C/128G self-hosted runner (M2-Q10 pending bare-metal, per plan D4).
 - **OCI images as rootfs sources** — `from = "docker://<ref>"` or `docker-archive:`/`oci-archive:`
   tarballs are pulled (hand-written registry v2 over `ureq` + rustls), digest-verified, layer
   flattened (whiteout/opaque), and baked to ext4; image `Env`/`WorkingDir`/`Cmd` materialize as
