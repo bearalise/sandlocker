@@ -8,6 +8,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **gVisor (runsc) second backend (ADR-14 / M2-Q4)** — a `GvisorBackend` implements the same
+  `SandboxBackend` ABI: rootless `runsc run --detach` + `runsc exec` + `kill`/`delete`
+  (`--rootless --platform=systrap --network=none`, no root/KVM); the OCI bundle rootfs is extracted
+  from the template's `rootfs.ext4` via `debugfs rdump` (no root), cached per template + reflink-copied
+  per instance. `Orch` now holds a **multi-backend registry** and picks a backend per create
+  (`backend` field, default `fc`); each instance routes destroy/exec/logs to its owning backend. The
+  data path is abstracted behind `ExecTarget` (FC = vsock+sl-envd, gVisor = `runsc exec`), so
+  `exec`/file-put/file-get/logs work over either backend. gVisor's capability set is **empty**
+  (no prebake/pause/fork) — pools are capability-gated off, matching its short-task role. Same API,
+  two isolation kernels (gVisor Sentry vs Firecracker microVM). `sl-node --gvisor-reconcile` validates
+  M2-Q4 rootless end-to-end; `--serve --gvisor` registers it.
 - **Sandbox ABI + capability model (ADR-14)** — the Firecracker mechanism (restore, warm/hot pools,
   vsock endpoint, instance lifecycle) is refactored behind a `SandboxBackend` trait; `Orch` now holds
   a `Box<dyn SandboxBackend>` and keeps only orchestration (store / lease / TTL / tick). Backends

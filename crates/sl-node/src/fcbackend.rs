@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-use crate::backend::{BackendCreate, Capabilities, Capability, SandboxBackend};
+use crate::backend::{BackendCreate, Capabilities, Capability, ExecTarget, SandboxBackend};
 use crate::orch::{prepare_instance_dir, SandboxSpec};
 use crate::pool::{HotPool, HotSlot, WarmPool};
 use crate::{abspath, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome, RestoreCtx};
@@ -173,8 +173,12 @@ impl SandboxBackend for FcBackend<'_> {
         }
     }
 
-    fn control_path(&self, id: &str) -> Option<PathBuf> {
-        self.live.get(id).map(|i| i.dir.join("vsock.sock"))
+    fn exec_target(&self, id: &str) -> Option<ExecTarget> {
+        self.live.get(id).map(|i| ExecTarget::Vsock(i.dir.join("vsock.sock")))
+    }
+
+    fn instance_dir(&self, id: &str) -> Option<PathBuf> {
+        self.live.get(id).map(|i| i.dir.clone())
     }
 
     fn log_path(&self, id: &str) -> Option<PathBuf> {

@@ -24,7 +24,7 @@ use sl_store::SqliteStore;
 
 use crate::backend::Capabilities;
 use crate::orch::{Orch, SandboxSpec};
-use crate::{connect_guest, exec, Config};
+use crate::Config;
 
 /// 守护共享态：orchestrator（互斥）+ 模板仓库根（模板名→目录解析）。
 type Shared = Arc<Mutex<Orch<'static>>>;
@@ -371,6 +371,8 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
         }
         None => Capabilities::empty(),
     };
+    // M2 W7：可选 backend 字段（"fc"/"gvisor"）显式选后端；缺省 fc。
+    let backend = v.get("backend").and_then(|x| x.as_str()).map(|s| s.to_string());
     let spec = SandboxSpec {
         vcpus: cpu,
         mem_mib: mem,
@@ -378,6 +380,7 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
         idle_secs: idle,
         metadata,
         required_capabilities,
+        backend,
     };
 
     // 建走恢复（~130ms），全程持锁——单机 MVP 串行（如实标注）。
@@ -391,36 +394,33 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
     .into_bytes())
 }
 
-/// 取 vsock 路径（持锁）→ 释放锁 → 连 guest 执行（慢 IO 不阻塞 create/reaper）。
+/// 取 exec 目标（持锁）→ 释放锁 → 后端各自执行（慢 IO 不阻塞 create/reaper）。FC=vsock/gVisor=runsc。
 fn exec_in(id: &str, body: &[u8], shared: &Shared) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("请求体非 JSON: {e}"))?;
     let cmd = v.get("cmd").and_then(|x| x.as_str()).ok_or("缺 cmd 字段")?;
-    let vsock = shared.lock().unwrap().vsock_path(id).ok_or("未知沙箱或已回收")?;
-    let mut stream = connect_guest(&vsock)?;
-    let (code, out, err) = exec(&mut stream, cmd)?;
+    let target = shared.lock().unwrap().exec_target(id).ok_or("未知沙箱或已回收")?;
+    let (code, out, err) = target.exec(cmd)?;
     Ok(serde_json::json!({"exit_code": code, "stdout": out, "stderr": err}).to_string().into_bytes())
 }
 
-/// 文件写：body → base64 → guest `base64 -d` 落盘（复用 build.rs COPY 桥接思路）。
+/// 文件写：body → base64 → guest `base64 -d` 落盘（后端无关，走 exec 目标）。
 fn put_file(id: &str, fpath: &str, body: &[u8], shared: &Shared) -> Result<(), String> {
-    let vsock = shared.lock().unwrap().vsock_path(id).ok_or("未知沙箱或已回收")?;
-    let mut stream = connect_guest(&vsock)?;
+    let target = shared.lock().unwrap().exec_target(id).ok_or("未知沙箱或已回收")?;
     let b64 = b64_encode(body);
     let path = single_quote(&format!("/{}", fpath.trim_start_matches('/')));
     let cmd = format!("printf %s '{b64}' | base64 -d > {path}");
-    let (code, _out, err) = exec(&mut stream, &cmd)?;
+    let (code, _out, err) = target.exec(&cmd)?;
     if code != 0 {
         return Err(format!("写文件失败（exit={code}）: {}", err.trim()));
     }
     Ok(())
 }
 
-/// 文件读：guest `base64 <path>` → 解码回原始字节。
+/// 文件读：guest `base64 <path>` → 解码回原始字节（后端无关）。
 fn get_file(id: &str, fpath: &str, shared: &Shared) -> Result<Vec<u8>, String> {
-    let vsock = shared.lock().unwrap().vsock_path(id).ok_or("未知沙箱或已回收")?;
-    let mut stream = connect_guest(&vsock)?;
+    let target = shared.lock().unwrap().exec_target(id).ok_or("未知沙箱或已回收")?;
     let path = single_quote(&format!("/{}", fpath.trim_start_matches('/')));
-    let (code, out, err) = exec(&mut stream, &format!("base64 {path}"))?;
+    let (code, out, err) = target.exec(&format!("base64 {path}"))?;
     if code != 0 {
         return Err(format!("读文件失败（exit={code}）: {}", err.trim()));
     }

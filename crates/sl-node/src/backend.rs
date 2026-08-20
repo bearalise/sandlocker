@@ -10,9 +10,11 @@
 //! → 默认实现返回不支持，天然只冷创建。
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::orch::SandboxSpec;
+use crate::{connect_guest, exec};
 
 /// `required_capabilities` 不满足时错误串前缀（稳定契约，SDK/CLI 可据此判类）。
 pub const UNSUPPORTED_BY_BACKEND: &str = "UNSUPPORTED_BY_BACKEND";
@@ -143,6 +145,42 @@ pub struct BackendCreate {
     pub hot_hit: bool,
 }
 
+/// 数据面 exec 目标（ADR-14 exec 组抽象）：后端各自提供其触达方式，`Send` 以便 api.rs **取出后
+/// 释放 Orch 锁再执行**（慢 IO 不阻塞 create/reaper）。put_file/get_file/logs 由 `exec` 派生（base64）。
+pub enum ExecTarget {
+    /// FC：guest sl-envd 的 vsock uds（`connect_guest` + [`crate::exec`]，逐字节复用 M1 数据面）。
+    Vsock(PathBuf),
+    /// gVisor：`runsc <global_args> exec <id> /bin/sh -c <cmd>` 子进程（无 vsock/sl-envd）。
+    Runsc { bin: PathBuf, global_args: Vec<String>, id: String },
+}
+
+impl ExecTarget {
+    /// 在沙箱内跑一条 `sh -c` 命令，返回 (exit_code, stdout, stderr)。**调用方须已释放 Orch 锁。**
+    pub fn exec(&self, cmd: &str) -> Result<(i32, String, String), String> {
+        match self {
+            ExecTarget::Vsock(uds) => {
+                let mut stream = connect_guest(uds)?;
+                exec(&mut stream, cmd)
+            }
+            ExecTarget::Runsc { bin, global_args, id } => {
+                let out = Command::new(bin)
+                    .args(global_args)
+                    .arg("exec")
+                    .arg(id)
+                    .arg("/bin/sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output()
+                    .map_err(|e| format!("runsc exec 启动失败: {e}"))?;
+                let code = out.status.code().unwrap_or(-1);
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                Ok((code, stdout, stderr))
+            }
+        }
+    }
+}
+
 /// Sandbox ABI：后端机制统一抽象（ADR-14）。Orch 只经本 trait 触达后端。对象安全（`Box<dyn>`）。
 ///
 /// W6 覆盖：生命周期（create/destroy）+ 数据面 endpoint（control/log path）+ 能力上报 + 池（能力门控）。
@@ -165,8 +203,11 @@ pub trait SandboxBackend {
     /// 幂等销毁：杀进程 + 删实例目录（不在册即 no-op）。
     fn destroy(&mut self, id: &str);
 
-    /// 数据面控制端点（exec/fs 桥接）：FC = 实例目录下 vsock uds；不在册返回 None。
-    fn control_path(&self, id: &str) -> Option<PathBuf>;
+    /// 数据面 exec 目标（exec/fs 桥接，ADR-14 exec 组）：FC=vsock；gVisor=runsc exec。不在册返回 None。
+    fn exec_target(&self, id: &str) -> Option<ExecTarget>;
+
+    /// 实例目录（对账查残留 / 内省）；不在册返回 None。
+    fn instance_dir(&self, id: &str) -> Option<PathBuf>;
 
     /// console 日志路径（`GET /logs`）；不在册返回 None。
     fn log_path(&self, id: &str) -> Option<PathBuf>;

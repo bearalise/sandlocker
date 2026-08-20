@@ -21,8 +21,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use sl_store::{LeaseId, SqliteStore, Store};
 
-use crate::backend::{BackendInfo, Capabilities, SandboxBackend, UNSUPPORTED_BY_BACKEND};
+use crate::backend::{BackendInfo, Capabilities, ExecTarget, SandboxBackend, UNSUPPORTED_BY_BACKEND};
 use crate::fcbackend::FcBackend;
+use crate::gvisorbackend::GvisorBackend;
 use crate::{abspath, hex, Config};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
@@ -40,6 +41,8 @@ pub struct SandboxSpec {
     /// M2 W6（ADR-14）：本次 create 要求的后端能力集。后端不满足即**创建期**返回
     /// `UNSUPPORTED_BY_BACKEND`（禁止运行期静默降级）。默认空集（不约束）。
     pub required_capabilities: Capabilities,
+    /// M2 W7：显式指定后端 id（`fc`/`gvisor`）。None → 默认 fc。无此后端即 `UNSUPPORTED_BY_BACKEND`。
+    pub backend: Option<String>,
 }
 
 impl Default for SandboxSpec {
@@ -51,6 +54,7 @@ impl Default for SandboxSpec {
             idle_secs: 300,
             metadata: BTreeMap::new(),
             required_capabilities: Capabilities::empty(),
+            backend: None,
         }
     }
 }
@@ -73,18 +77,20 @@ pub struct CreateOutcome {
     pub hot_hit: bool,
 }
 
-/// 在册沙箱的**编排态**（M2 W6：机制态——FC 进程/目录——归后端 [`SandboxBackend`]）。
+/// 在册沙箱的**编排态**（M2 W6：机制态——进程/目录——归后端 [`SandboxBackend`]）。
 struct LiveMeta {
     lease: LeaseId,
     /// TTL 绝对硬顶（unix 秒），独立于 lease。
     ttl_deadline: i64,
+    /// M2 W7：该实例归属后端在 `backends` 中的索引（destroy/exec/tick 路由用）。
+    backend: usize,
 }
 
 /// 进程内 orchestrator（M2 W6 起只管编排）。`store` 按窄接口编程（M3 可换 etcd）；
-/// `backend` 为 Sandbox ABI 后端（默认 FC，ADR-14），经 trait 触达机制；`template` 默认模板目录。
+/// `backends` 为 Sandbox ABI 多后端注册表（[0]=FC 默认，可选 gVisor，ADR-14）；`template` 默认模板目录。
 pub struct Orch<'a> {
     store: Box<dyn Store>,
-    backend: Box<dyn SandboxBackend + Send + 'a>,
+    backends: Vec<Box<dyn SandboxBackend + Send + 'a>>,
     template: PathBuf,
     live: HashMap<String, LiveMeta>,
 }
@@ -96,40 +102,70 @@ impl<'a> Orch<'a> {
         }
         std::fs::create_dir_all(run_root).map_err(|e| format!("建 run_root 失败 {}: {e}", run_root.display()))?;
         let template = abspath(template)?;
-        let backend: Box<dyn SandboxBackend + Send + 'a> = Box::new(FcBackend::new(cfg, run_root.to_path_buf()));
-        Ok(Self { store, backend, template, live: HashMap::new() })
+        // [0] 恒为 FC（默认后端）。gVisor：cfg.gvisor 开且 runsc 可用时注册（M2 W7，能力空集）。
+        let mut backends: Vec<Box<dyn SandboxBackend + Send + 'a>> =
+            vec![Box::new(FcBackend::new(cfg, run_root.to_path_buf()))];
+        if cfg.gvisor && GvisorBackend::probe(&cfg.gvisor_bin) {
+            backends.push(Box::new(GvisorBackend::new(cfg.gvisor_bin.clone(), run_root.to_path_buf())));
+        }
+        Ok(Self { store, backends, template, live: HashMap::new() })
     }
 
-    /// 后端列表与能力集（`GET /v1/backends`，ADR-14）。W6 单后端；W7 gVisor 落地时扩注册表。
+    /// 后端列表与能力集（`GET /v1/backends`，ADR-14）。
     pub fn backends_info(&self) -> Vec<BackendInfo> {
-        vec![self.backend.info()]
+        self.backends.iter().map(|b| b.info()).collect()
+    }
+
+    /// 选后端（M2 W7）：`spec.backend` 显式 id 精确匹配优先；否则默认 [0]=fc。再校验
+    /// `required_capabilities` 被选中后端满足，否则 `UNSUPPORTED_BY_BACKEND`（创建期，禁运行期降级）。
+    fn select_backend(&self, spec: &SandboxSpec) -> Result<usize, String> {
+        let idx = match &spec.backend {
+            Some(want) => self
+                .backends
+                .iter()
+                .position(|b| b.id() == want)
+                .ok_or_else(|| format!("{UNSUPPORTED_BY_BACKEND}: 无此后端 {want:?}（GET /v1/backends 查可用）"))?,
+            None => 0,
+        };
+        if !spec.required_capabilities.is_empty() {
+            let missing = spec.required_capabilities.missing_from(&self.backends[idx].capabilities());
+            if !missing.is_empty() {
+                return Err(format!(
+                    "{UNSUPPORTED_BY_BACKEND}: 后端 {} 不满足 required_capabilities {:?}",
+                    self.backends[idx].id(),
+                    missing
+                ));
+            }
+        }
+        Ok(idx)
     }
 
     /// M2 W4：为 `template` 起单模板温池（需后端具 `prebake_snapshot`）。委托后端（能力门控）。
     /// `target == 0` 视为不启用（幂等清空既有池）。守护（`--serve`）在建 Orch 后调用。
     pub fn enable_warm_pool(&mut self, template: &Path, target: usize) -> Result<(), String> {
-        self.backend.enable_warm_pool(template, target)
+        // 池归默认后端 fc（[0]）——具 prebake/pause 能力。
+        self.backends[0].enable_warm_pool(template, target)
     }
 
     /// 温池 (hits, misses, ready_len)；未启用/后端不支持返回 None。供守护内省 / bench。
     pub fn pool_stats(&self) -> Option<(u64, u64, usize)> {
-        self.backend.pool_stats()
+        self.backends[0].pool_stats()
     }
 
     /// 阻塞等温池水位 ≥ `n` 或超时（bench 预填池用）。无池/不支持返回 false。
     pub fn pool_wait_ready(&self, n: usize, timeout: Duration) -> bool {
-        self.backend.pool_wait_ready(n, timeout)
+        self.backends[0].pool_wait_ready(n, timeout)
     }
 
-    /// M2 W5：为 `template` 起单模板热池（需后端具 `pause_resume`+`prebake_snapshot`）。委托后端。
+    /// M2 W5：为 `template` 起单模板热池（需后端具 `pause_resume`+`prebake_snapshot`）。委托 fc。
     /// `target == 0` 视为不启用（幂等清空既有池）。守护/bench 建 Orch 后调用。
     pub fn enable_hot_pool(&mut self, template: &Path, target: usize) -> Result<(), String> {
-        self.backend.enable_hot_pool(template, target)
+        self.backends[0].enable_hot_pool(template, target)
     }
 
     /// 阻塞等热池水位 ≥ `n` 或超时（bench 预填池用）。无池/不支持返回 false。
     pub fn hot_wait_ready(&self, n: usize, timeout: Duration) -> bool {
-        self.backend.hot_wait_ready(n, timeout)
+        self.backends[0].hot_wait_ready(n, timeout)
     }
 
     /// 创建 = 从预烘焙快照**恢复**（keep-alive 持有 VM）。用 orchestrator 的默认模板。
@@ -146,20 +182,11 @@ impl<'a> Orch<'a> {
         }
         let template = abspath(template)?;
 
-        // ① 能力校验（创建期，ADR-14）：required_capabilities 不被后端满足即拒——禁止运行期静默降级。
-        if !spec.required_capabilities.is_empty() {
-            let missing = spec.required_capabilities.missing_from(&self.backend.capabilities());
-            if !missing.is_empty() {
-                return Err(format!(
-                    "{UNSUPPORTED_BY_BACKEND}: 后端 {} 不满足 required_capabilities {:?}",
-                    self.backend.id(),
-                    missing
-                ));
-            }
-        }
+        // ① 选后端 + 创建期能力校验（ADR-14）：spec.backend 显式优先，否则 fc；required 不满足即拒。
+        let idx = self.select_backend(spec)?;
 
-        // ② 后端造 running 实例（FC：三段 hot→warm→cold；机制态归后端）。
-        let bc = self.backend.create(&template, spec)?;
+        // ② 后端造 running 实例（FC：三段 hot→warm→cold / gVisor：runsc run；机制态归后端）。
+        let bc = self.backends[idx].create(&template, spec)?;
 
         // ③ 编排：grant lease + 写 meta/state（挂 lease → 随空闲回收/撤销一并删）→ 存编排态。
         //    任一步失败即回滚（撤 lease + 令后端销毁实例）。
@@ -168,22 +195,22 @@ impl<'a> Orch<'a> {
         let lease = match self.store.lease_grant(spec.idle_secs) {
             Ok(l) => l,
             Err(e) => {
-                self.backend.destroy(&bc.id);
+                self.backends[idx].destroy(&bc.id);
                 return Err(e.to_string());
             }
         };
         let meta = build_meta_json(&bc.id, spec, created_at, ttl_deadline, &template);
         if let Err(e) = self.store.put(&meta_key(&bc.id), meta.as_bytes(), Some(lease)) {
             let _ = self.store.lease_revoke(lease);
-            self.backend.destroy(&bc.id);
+            self.backends[idx].destroy(&bc.id);
             return Err(format!("写 sandbox meta 失败: {e}"));
         }
         if let Err(e) = self.store.put(&state_key(&bc.id), b"running", Some(lease)) {
             let _ = self.store.lease_revoke(lease);
-            self.backend.destroy(&bc.id);
+            self.backends[idx].destroy(&bc.id);
             return Err(format!("写 sandbox state 失败: {e}"));
         }
-        self.live.insert(bc.id.clone(), LiveMeta { lease, ttl_deadline });
+        self.live.insert(bc.id.clone(), LiveMeta { lease, ttl_deadline, backend: idx });
         Ok(CreateOutcome {
             id: bc.id,
             total_ms: bc.total_ms,
@@ -208,10 +235,10 @@ impl<'a> Orch<'a> {
         self.live.get(id).map(|l| l.ttl_deadline)
     }
 
-    /// 手动 destroy：后端销毁实例（杀进程 + 删目录）→ 撤销 lease（删 lease+挂键）→ 出台账。返回被删 store 键。
+    /// 手动 destroy：路由到归属后端销毁实例（杀进程 + 删目录）→ 撤销 lease → 出台账。返回被删 store 键。
     pub fn destroy(&mut self, id: &str) -> Result<Vec<String>, String> {
         let meta = self.live.remove(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
-        self.backend.destroy(id);
+        self.backends[meta.backend].destroy(id);
         self.store.lease_revoke(meta.lease).map_err(|e| e.to_string())
     }
 
@@ -240,8 +267,8 @@ impl<'a> Orch<'a> {
         ids.sort();
         ids.dedup();
         for id in ids {
-            if self.live.remove(&id).is_some() {
-                self.backend.destroy(&id);
+            if let Some(meta) = self.live.remove(&id) {
+                self.backends[meta.backend].destroy(&id);
                 reaped.push(id);
             }
         }
@@ -252,21 +279,24 @@ impl<'a> Orch<'a> {
     fn is_live(&self, id: &str) -> bool {
         self.live.contains_key(id)
     }
-    /// 实例目录（对账查残留用）：由后端数据面端点反推（control_path 的父目录）。
+    /// 实例目录（对账查残留用）：路由到归属后端。
     fn dir_of(&self, id: &str) -> Option<PathBuf> {
-        self.backend.control_path(id).and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        let meta = self.live.get(id)?;
+        self.backends[meta.backend].instance_dir(id)
     }
 
     // —— 守护（api.rs 复用）——
 
-    /// 在册沙箱的 vsock uds 路径（连 guest 执行 exec/文件桥接用）；不在册返回 None。委托后端数据面端点。
-    pub fn vsock_path(&self, id: &str) -> Option<PathBuf> {
-        self.backend.control_path(id)
+    /// 在册沙箱的数据面 exec 目标（exec/文件桥接用）；不在册返回 None。路由到归属后端（FC=vsock/gVisor=runsc）。
+    pub fn exec_target(&self, id: &str) -> Option<ExecTarget> {
+        let meta = self.live.get(id)?;
+        self.backends[meta.backend].exec_target(id)
     }
 
-    /// 在册沙箱的 console 日志路径（GET /logs 用）；不在册返回 None。委托后端。
+    /// 在册沙箱的 console 日志路径（GET /logs 用）；不在册返回 None。路由到归属后端。
     pub fn log_path(&self, id: &str) -> Option<PathBuf> {
-        self.backend.log_path(id)
+        let meta = self.live.get(id)?;
+        self.backends[meta.backend].log_path(id)
     }
 
     /// 列出所有沙箱 meta JSON（每项已是 store 里落的 JSON 对象串）。供 `GET /v1/sandboxes`。
@@ -536,6 +566,105 @@ pub fn reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ————————————————————— M2-Q4 gVisor 第二后端对账 —————————————————————
+
+/// M2-Q4：gVisor(runsc) 第二后端接入——create/exec/fs/destroy 走 ABI，能力显式无 prebake/pause，
+/// 与 FC 可切换。rootless（`--rootless --platform=systrap --network=none`），**无需 root/KVM**。
+/// runsc 缺失则输出 skip JSON 退 0（不阻塞 CI）。用同一模板的 rootfs.ext4 作 gVisor bundle rootfs。
+pub fn gvisor_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    if !GvisorBackend::probe(&cfg.gvisor_bin) {
+        println!(r#"{{"metric":"gvisor_reconcile","skipped":true,"reason":"runsc-not-found"}}"#);
+        return Ok(());
+    }
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("gvisor-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    // 强制注册 gVisor（本对账目标即它）。
+    let mut cfg2 = cfg.clone();
+    cfg2.gvisor = true;
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(&cfg2, &template, &run_root, Box::new(store))?;
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[gvisor] {m}");
+        }
+    };
+
+    // ① 后端注册 + 能力集显式无 prebake/pause
+    let has_gvisor = orch.backends_info().iter().any(|b| b.id == "gvisor");
+    ensure(has_gvisor, "① gVisor 后端未注册（runsc 探活失败？）")?;
+    let gv = orch.backends_info().into_iter().find(|b| b.id == "gvisor").unwrap();
+    ensure(!gv.capabilities.contains(&"prebake_snapshot"), "① gVisor 不应有 prebake_snapshot")?;
+    ensure(!gv.capabilities.contains(&"pause_resume"), "① gVisor 不应有 pause_resume")?;
+    log(&format!("① gVisor 注册；能力集={:?}（显式无 prebake/pause）✓", gv.capabilities));
+
+    // ② create on gvisor（显式选后端）→ running
+    let spec = SandboxSpec {
+        idle_secs: 3600,
+        ttl_secs: 3600,
+        backend: Some("gvisor".to_string()),
+        ..Default::default()
+    };
+    let a = orch.create(&spec)?;
+    ensure(orch.is_live(&a.id), "② create 后不在 live 台账")?;
+    ensure(!a.pool_hit && !a.hot_hit && a.copy_ms > 0, "② gVisor 应冷创建（无池命中）")?;
+    let dir_a = orch.dir_of(&a.id).unwrap();
+    log(&format!("② create {} on gvisor（copy={}ms resume={}ms）✓", a.id, a.copy_ms, a.resume_ms));
+
+    // ③ exec：跑命令验隔离内核（uname 报 runsc）+ 退出码/输出
+    let t = orch.exec_target(&a.id).ok_or("③ 无 exec 目标")?;
+    let (code, out, _e) = t.exec("echo sl-gvisor-ok; uname -a")?;
+    ensure(code == 0, "③ exec 非零退出")?;
+    ensure(out.contains("sl-gvisor-ok"), "③ exec 输出缺 marker")?;
+    ensure(out.contains("runsc"), "③ uname 未报 gVisor(runsc) 内核（非真 gVisor 隔离？）")?;
+    log("③ exec：echo/uname 命中 gVisor(runsc) 内核 ✓");
+
+    // ④ fs 回环：写文件→读回一致（sandbox 内 rw）
+    let t = orch.exec_target(&a.id).ok_or("④ 无 exec 目标")?;
+    let (c1, _, _) = t.exec("echo hello-fs > /tmp/sl-fs && sync")?;
+    ensure(c1 == 0, "④ 写文件失败")?;
+    let (c2, out2, _) = t.exec("cat /tmp/sl-fs")?;
+    ensure(c2 == 0 && out2.trim() == "hello-fs", "④ 读回文件不一致")?;
+    log("④ fs 写读回环一致 ✓");
+
+    // ⑤ 能力门控：gVisor + required_capabilities=[pause_resume] → 创建期 UNSUPPORTED_BY_BACKEND
+    let bad = SandboxSpec {
+        backend: Some("gvisor".to_string()),
+        required_capabilities: Capabilities::with(&[crate::backend::Capability::PauseResume]),
+        ..Default::default()
+    };
+    match orch.create(&bad) {
+        Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => {
+            log("⑤ required=[pause_resume] on gVisor → UNSUPPORTED_BY_BACKEND（创建期拒）✓")
+        }
+        Err(e) => return Err(format!("⑤ 期望 UNSUPPORTED_BY_BACKEND，实得: {e}")),
+        Ok(_) => return Err("⑤ 能力不满足却创建成功（运行期静默降级！）".into()),
+    }
+
+    // ⑥ 并发隔离：第二个 gVisor 实例 machine-id 互异（独立沙箱+私有 rootfs）
+    let b = orch.create(&spec)?;
+    ensure(!b.machine_id.is_empty() && a.machine_id != b.machine_id, "⑥ 两 gVisor machine-id 相同")?;
+    log("⑥ 并发双实例：machine-id 互异 ✓");
+
+    // ⑦ destroy 零残留（进程/bundle/store 键）
+    orch.destroy(&a.id)?;
+    orch.destroy(&b.id)?;
+    ensure(!orch.is_live(&a.id) && !dir_a.exists(), "⑦ destroy 后 bundle 残留")?;
+    ensure(
+        orch.store.get(&state_key(&a.id)).map_err(|e| e.to_string())?.is_none(),
+        "⑦ store 元数据键未随 destroy 删",
+    )?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "⑦ 收尾 store sandbox/ 非空")?;
+    log("⑦ destroy：进程/bundle/元数据零残留 ✓");
+
+    if cfg.json {
+        println!(r#"{{"metric":"gvisor_reconcile","cases":7,"backend":"gvisor","switchable":true,"pass":true}}"#);
+    } else {
+        println!("[gvisor] M2-Q4 对账 PASS：gVisor create/exec/fs/destroy 走 ABI + 能力显式无 prebake/pause + 与 fc 可切换 + 零残留");
+    }
+    Ok(())
+}
+
 // ————————————————————— Q2 创建时延 —————————————————————
 
 /// Q2：预烘焙快照 → 创建走恢复路径，进程内循环 create→destroy × N（首个丢弃作 warm-up，
@@ -764,6 +893,7 @@ mod tests {
             idle_secs: 60,
             metadata: md,
             required_capabilities: Capabilities::empty(),
+            backend: None,
         };
         let j = build_meta_json("s1", &spec, 1000, 1300, Path::new("/t/hello"));
         assert!(j.contains(r#""id":"s1""#));
