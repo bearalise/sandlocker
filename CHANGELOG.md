@@ -8,6 +8,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone M2 (in progress).
 
 ### Added
+- **Warm pool (温池)** — a background refill thread pre-stages instance dirs (rootfs reflink copy +
+  vmstate/mem hardlink) off the create critical path and warms the snapshot page cache
+  (`posix_fadvise`); pool-hit `create` skips the copy (`copy_ms=0`) and restores from warm cache.
+  `--serve --pool-template <name> --pool-size <N>` (default 2, 0 disables); `--pool-bench` reports
+  cold-vs-warm tiers. On a hello template: warm P50 ≈70 ms vs cold ≈100 ms. Toward M2-Q2 (pool-hit
+  P50 ≤100 ms hard target + CI land in W5).
 - **OCI images as rootfs sources** — `from = "docker://<ref>"` or `docker-archive:`/`oci-archive:`
   tarballs are pulled (hand-written registry v2 over `ureq` + rustls), digest-verified, layer
   flattened (whiteout/opaque), and baked to ext4; image `Env`/`WorkingDir`/`Cmd` materialize as

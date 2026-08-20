@@ -33,6 +33,8 @@ mod build;
 mod oci;
 // W7：进程内 orchestrator（生命周期 create/keepalive/destroy/tick + Q2/Q9）。
 mod orch;
+// M2 W4：预热池·温池（把 rootfs 拷贝/page-cache 预热移出 create 关键路径，M2-Q2）。
+mod pool;
 // W8：长驻守护 + 手写极简 REST server（--serve）——HTTP API + orchestrator + reaper 全进程内。
 mod api;
 
@@ -155,6 +157,15 @@ struct Config {
     oci_pull: Option<String>,
     /// --oci-out <path>：--oci-pull 产出 ext4 的落点（缺省 build/oci-out/rootfs.ext4）。
     oci_out: Option<PathBuf>,
+    /// --pool-bench <模板目录>：M2 W4 温池冷/热分档基准（M2-Q2 起步）——同模板各跑 --cycles 次，
+    /// 对比无池（copy 在关键路径）vs 温池预填满（池命中 copy_ms=0），单行 `{"metric":"pool_bench",...}`，
+    /// 随后退出。免 root。
+    pool_bench: Option<PathBuf>,
+    /// --pool-size N：M2 W4 --serve 温池目标水位（默认 2；0 关闭退冷路径）。
+    pool_size: usize,
+    /// --pool-template <name>：M2 W4 --serve 温池绑定的模板名（经 template_root 解析）。
+    /// 缺省不建池（--serve 全走冷路径，零回归）。请求命中同模板走池命中路径。
+    pool_template: Option<String>,
 }
 
 fn main() {
@@ -224,6 +235,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[orch] Q2 bench FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --pool-bench：M2 W4 温池冷/热分档基准（M2-Q2 起步）。
+    if let Some(tpl) = cfg.pool_bench.clone() {
+        match orch::pool_bench(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[pool] M2-Q2 pool-bench FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -1821,6 +1844,9 @@ fn clone_paths(cfg: &Config) -> Config {
         net_live_reconcile: None,
         oci_pull: None,
         oci_out: None,
+        pool_bench: None,
+        pool_size: 2,
+        pool_template: None,
     }
 }
 
@@ -1931,6 +1957,9 @@ fn parse_args() -> Config {
         net_live_reconcile: None,
         oci_pull: None,
         oci_out: None,
+        pool_bench: None,
+        pool_size: 2,
+        pool_template: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -1968,6 +1997,11 @@ fn parse_args() -> Config {
             "--store" => cfg.store = Some(PathBuf::from(take())),
             "--orch-reconcile" => cfg.orch_reconcile = Some(PathBuf::from(take())),
             "--orch-bench" => cfg.orch_bench = Some(PathBuf::from(take())),
+            "--pool-bench" => cfg.pool_bench = Some(PathBuf::from(take())),
+            "--pool-size" => {
+                cfg.pool_size = take().parse().unwrap_or_else(|_| { eprintln!("--pool-size 需整数"); std::process::exit(2); })
+            }
+            "--pool-template" => cfg.pool_template = Some(take()),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
@@ -1986,7 +2020,7 @@ fn parse_args() -> Config {
             "run" => {}
             other => {
                 eprintln!("未知参数: {other}");
-                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--serve] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
+                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--serve] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
                 std::process::exit(2);
             }
         }
