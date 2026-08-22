@@ -112,7 +112,8 @@ impl Gateway {
         Self { secret: s, base, used: Mutex::new(HashSet::new()) }
     }
 
-    /// 签发签名 URL：`{base}/gw/{action}?sid=..&action=..&port=..&exp=..&nonce=..&sig=..`。
+    /// 签发签名 URL：`{base}/gw/{path}?sid=..&action=..&port=..&exp=..&nonce=..&sig=..`。
+    /// path 是网关路由段（port→`p`，其余同 action 名），须与 api.rs `handle_gw_conn` 路由表一致。
     /// 操作参数（exec 的 cmd / file|port 的路径）在使用时随请求带，不入签名（ticket = 该动作通道能力）。
     pub fn mint(&self, sid: &str, action: Action, port: u32, ttl_secs: i64, now: i64) -> String {
         let exp = now.saturating_add(ttl_secs);
@@ -120,10 +121,14 @@ impl Gateway {
         host_random(&mut nb);
         let nonce = hex(&nb);
         let sig = hex(&hmac_sha256(&self.secret, payload(sid, action, port, exp, &nonce).as_bytes()));
+        let path = match action {
+            Action::Port => "p",
+            a => a.as_str(),
+        };
         format!(
             "{}/gw/{}?sid={sid}&action={}&port={port}&exp={exp}&nonce={nonce}&sig={sig}",
             self.base,
-            action.as_str(),
+            path,
             action.as_str()
         )
     }
@@ -218,6 +223,16 @@ mod tests {
         let t = gw.verify(&q, 1000).unwrap();
         assert_eq!(t.sid, "sb1");
         assert_eq!(t.action, Action::Exec);
+    }
+
+    #[test]
+    fn mint_url_path_matches_gw_route_table() {
+        // 路由段契约（api.rs handle_gw_conn）：port→/gw/p，其余与 action 同名。
+        let gw = Gateway::new_random(String::new());
+        assert!(gw.mint("sb1", Action::Port, 3000, 60, 1000).contains("/gw/p?"));
+        assert!(gw.mint("sb1", Action::Exec, 0, 60, 1000).contains("/gw/exec?"));
+        assert!(gw.mint("sb1", Action::File, 0, 60, 1000).contains("/gw/file?"));
+        assert!(gw.mint("sb1", Action::Logs, 0, 60, 1000).contains("/gw/logs?"));
     }
 
     #[test]
