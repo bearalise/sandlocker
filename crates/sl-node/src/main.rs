@@ -33,6 +33,8 @@ mod build;
 mod oci;
 // M2 W10：数据面网关（ADR-22）——一次性 HMAC 签名 URL + 端口反代（FR-3.3）。
 mod gateway;
+
+mod expose;
 // M2 W6：Sandbox ABI 契约（trait + 能力模型，ADR-14）+ Firecracker 后端实现。
 mod backend;
 mod fcbackend;
@@ -197,6 +199,11 @@ struct Config {
     /// --pty-reconcile <模板目录>：M2-Q7 交互式 PTY 对账（双向流 + 窗口 resize + 会话收敛 + 零残留），
     /// 随后退出。免 root（走恢复路径）。
     pty_reconcile: Option<PathBuf>,
+    /// --expose-reconcile <模板目录>：端口暴露 L4 透传对账（keep-alive/非 GET/流式/并发/拆除/零残留），
+    /// 随后退出。免 root（走恢复路径）。
+    expose_reconcile: Option<PathBuf>,
+    /// --expose-allow-public：放行端口暴露 bind 到非回环地址（默认拒绝；纯 L4 透传无鉴权，仅可信网络）。
+    expose_allow_public: bool,
 }
 
 fn main() {
@@ -338,6 +345,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[pty] M2-Q7 pty-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --expose-reconcile：端口暴露 L4 透传对账（keep-alive/非 GET/流式/并发/拆除/零残留）。
+    if let Some(tpl) = cfg.expose_reconcile.clone() {
+        match orch::expose_reconcile(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[expose] expose-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2001,6 +2020,8 @@ fn clone_paths(cfg: &Config) -> Config {
         gw_addr: None,
         gw_reconcile: None,
         pty_reconcile: None,
+        expose_reconcile: None,
+        expose_allow_public: false,
     }
 }
 
@@ -2123,6 +2144,8 @@ fn parse_args() -> Config {
         gw_addr: None,
         gw_reconcile: None,
         pty_reconcile: None,
+        expose_reconcile: None,
+        expose_allow_public: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2176,6 +2199,8 @@ fn parse_args() -> Config {
             "--gw-addr" => cfg.gw_addr = Some(take()),
             "--gw-reconcile" => cfg.gw_reconcile = Some(PathBuf::from(take())),
             "--pty-reconcile" => cfg.pty_reconcile = Some(PathBuf::from(take())),
+            "--expose-reconcile" => cfg.expose_reconcile = Some(PathBuf::from(take())),
+            "--expose-allow-public" => cfg.expose_allow_public = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

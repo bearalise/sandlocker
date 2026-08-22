@@ -12,7 +12,7 @@
 //! 守护级操作（create/destroy/tick）在 `orch.lock()` 内**串行**（单机 MVP，密度/并发吞吐属 M2 池化）；
 //! exec/文件/日志的慢 IO 在**取路径后释放锁**再做，不阻塞 reaper/create。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sl_store::SqliteStore;
 
 use crate::backend::{Capabilities, ExecTarget, UNSUPPORTED_BY_BACKEND};
+use crate::expose::{self, ExposeHandle};
 use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::orch::{Orch, SandboxSpec};
 use crate::Config;
@@ -31,6 +32,24 @@ use crate::Config;
 type Shared = Arc<Mutex<Orch<'static>>>;
 /// 数据面网关（ADR-22）：控制面签发 + 网关验签共用（单机进程内）。
 type SharedGw = Arc<Gateway>;
+
+/// 端口暴露（L4 透传）共享态：sid→guest_port→监听器句柄 + 对外 bind 放行开关。
+/// 打包进一个 Arc 避免在 handle_conn/dispatch/reaper 到处加参数。
+struct ExposeState {
+    registry: Mutex<HashMap<String, HashMap<u32, ExposeHandle>>>,
+    /// `--expose-allow-public`：未开启时拒绝非回环 bind（对外暴露须显式选择）。
+    allow_public: bool,
+}
+type Exposes = Arc<ExposeState>;
+
+/// 停止并移除某沙箱的全部暴露监听器（destroy/回收路径调用，防悬挂/线程泄漏）。
+fn drop_exposes(exposes: &Exposes, id: &str) {
+    if let Some(m) = exposes.registry.lock().unwrap().remove(id) {
+        for (_gp, h) in m {
+            h.stop();
+        }
+    }
+}
 
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -83,14 +102,25 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     }
     let shared: Shared = Arc::new(Mutex::new(orch));
 
-    // 后台 reaper：周期 tick(now)（TTL 硬顶 + idle sweep）。
+    // 端口暴露注册表（L4 透传监听器）。allow_public 由 --expose-allow-public 控制。
+    let exposes: Exposes = Arc::new(ExposeState {
+        registry: Mutex::new(HashMap::new()),
+        allow_public: cfg.expose_allow_public,
+    });
+
+    // 后台 reaper：周期 tick(now)（TTL 硬顶 + idle sweep）。回收的沙箱须同步拆掉其暴露监听器。
     let tick_secs = if cfg.tick_secs > 0 { cfg.tick_secs } else { 5 };
     let reaper = Arc::clone(&shared);
+    let reaper_ex = Arc::clone(&exposes);
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(tick_secs));
         let now = now_unix();
         if let Ok(mut o) = reaper.lock() {
-            let _ = o.tick(now);
+            if let Ok(reaped) = o.tick(now) {
+                for id in reaped {
+                    drop_exposes(&reaper_ex, &id);
+                }
+            }
         }
     });
 
@@ -133,8 +163,9 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
             Ok(stream) => {
                 let sh = Arc::clone(&shared);
                 let g = Arc::clone(&gw);
+                let e = Arc::clone(&exposes);
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(stream, &sh, troot, &g) {
+                    if let Err(e) = handle_conn(stream, &sh, troot, &g, &e) {
                         eprintln!("[sandlocker] 连接处理错误: {e}");
                     }
                 });
@@ -246,6 +277,9 @@ enum Route {
     Resume(String),
     Fork(String),
     Ticket(String),
+    Expose(String),
+    Unexpose(String, u32),
+    ListExposes(String),
     Exec(String),
     PutFile(String, String),
     GetFile(String, String),
@@ -274,6 +308,12 @@ fn parse_route(method: &str, path: &str) -> Route {
         ("POST", ["v1", "sandboxes", id, "resume"]) => Route::Resume((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "fork"]) => Route::Fork((*id).to_string()),
         ("POST", ["v1", "sandboxes", id, "ticket"]) => Route::Ticket((*id).to_string()),
+        ("POST", ["v1", "sandboxes", id, "expose"]) => Route::Expose((*id).to_string()),
+        ("GET", ["v1", "sandboxes", id, "exposes"]) => Route::ListExposes((*id).to_string()),
+        ("DELETE", ["v1", "sandboxes", id, "expose", gp]) => match gp.parse() {
+            Ok(p) => Route::Unexpose((*id).to_string(), p),
+            Err(_) => Route::NotFound,
+        },
         ("POST", ["v1", "sandboxes", id, "exec"]) => Route::Exec((*id).to_string()),
         ("GET", ["v1", "sandboxes", id, "logs"]) => Route::Logs((*id).to_string()),
         (m, [.., ]) if segs.len() >= 5 && segs[0] == "v1" && segs[1] == "sandboxes" && segs[3] == "files" => {
@@ -291,9 +331,15 @@ fn parse_route(method: &str, path: &str) -> Route {
 
 // ————————————————————— 分派 / handler —————————————————————
 
-fn handle_conn(mut stream: TcpStream, shared: &Shared, template_root: &Path, gw: &SharedGw) -> Result<(), String> {
+fn handle_conn(
+    mut stream: TcpStream,
+    shared: &Shared,
+    template_root: &Path,
+    gw: &SharedGw,
+    exposes: &Exposes,
+) -> Result<(), String> {
     let (method, path, body) = read_request(&mut stream)?;
-    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw);
+    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes);
     write_response(&mut stream, code, ctype, &resp)
 }
 
@@ -304,6 +350,7 @@ fn dispatch(
     shared: &Shared,
     template_root: &Path,
     gw: &SharedGw,
+    exposes: &Exposes,
 ) -> (u16, &'static str, Vec<u8>) {
     let route = parse_route(method, path);
     let json = "application/json";
@@ -328,7 +375,10 @@ fn dispatch(
         Route::DeleteSandbox(id) => {
             let r = shared.lock().unwrap().destroy(&id);
             match r {
-                Ok(_) => (204, json, Vec::new()),
+                Ok(_) => {
+                    drop_exposes(exposes, &id); // 拆掉该沙箱的暴露监听器，防悬挂
+                    (204, json, Vec::new())
+                }
                 Err(_) => (404, json, err_json("未知沙箱")),
             }
         }
@@ -369,6 +419,21 @@ fn dispatch(
             Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => (409, json, err_json(&e)),
             Err(e) => (400, json, err_json(&e)),
         },
+        Route::Expose(id) => match expose_port(&id, body, shared, exposes) {
+            Ok(v) => (201, json, v),
+            Err(e) => (400, json, err_json(&e)),
+        },
+        Route::Unexpose(id, gp) => {
+            let removed = exposes.registry.lock().unwrap().get_mut(&id).and_then(|m| m.remove(&gp));
+            match removed {
+                Some(h) => {
+                    h.stop();
+                    (204, json, Vec::new())
+                }
+                None => (404, json, err_json("未暴露该端口")),
+            }
+        }
+        Route::ListExposes(id) => (200, json, list_exposes(&id, exposes)),
         Route::Exec(id) => match exec_in(&id, body, shared) {
             Ok(v) => (200, json, v),
             Err(e) => (500, json, err_json(&e)),
@@ -472,6 +537,68 @@ fn mint_ticket(id: &str, body: &[u8], gw: &SharedGw) -> Result<Vec<u8>, String> 
     let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
     let url = gw.mint(id, action, port, ttl, now_unix());
     Ok(format!(r#"{{"url":"{url}"}}"#).into_bytes())
+}
+
+/// 暴露结果 JSON（稳定地址 `http://<bind>:<host_port>/` + 端口映射）。
+fn expose_json(bind: &str, host_port: u16, guest_port: u32) -> Vec<u8> {
+    format!(r#"{{"url":"http://{bind}:{host_port}/","bind":"{bind}","host_port":{host_port},"guest_port":{guest_port}}}"#)
+        .into_bytes()
+}
+
+/// 端口暴露（L4 透传）：`body{port, host_port?, bind?}` → 起持久监听器把外部连接裸字节透传到 guest
+/// `127.0.0.1:port`。返回稳定地址（`http://bind:host_port/`），支持任意方法/流式/WS/keep-alive。
+/// 仅 FC（vsock）后端；同 guest_port 幂等；非回环 bind 需 `--expose-allow-public`。
+fn expose_port(id: &str, body: &[u8], shared: &Shared, exposes: &Exposes) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(if body.is_empty() { b"{}" } else { body }).map_err(|e| format!("请求体非 JSON: {e}"))?;
+    let guest_port = v.get("port").and_then(|x| x.as_u64()).ok_or("缺/非法 port")? as u32;
+    let host_port = v.get("host_port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+    let bind = v.get("bind").and_then(|x| x.as_str()).unwrap_or("127.0.0.1").to_string();
+
+    // 幂等：同沙箱同 guest_port 已暴露则直接回既有地址（不重复起监听）。
+    {
+        let reg = exposes.registry.lock().unwrap();
+        if let Some(h) = reg.get(id).and_then(|m| m.get(&guest_port)) {
+            return Ok(expose_json(&h.bind, h.host_port, guest_port));
+        }
+    }
+
+    // 对外 bind（非回环）门禁：纯 L4 透传无鉴权，须 --expose-allow-public 显式放行。
+    let loopback = bind == "127.0.0.1" || bind == "localhost" || bind == "::1";
+    if !loopback {
+        if !exposes.allow_public {
+            return Err(format!(
+                "bind={bind} 为非回环地址，纯 L4 透传无鉴权；如确需对外暴露，守护须带 --expose-allow-public"
+            ));
+        }
+        eprintln!("[sandlocker][WARN] expose bind={bind}:{host_port} → guest {id}:{guest_port}：无鉴权 L4 透传，仅限可信网络");
+    }
+
+    // 端口暴露仅 FC（vsock）；锁内取 vsock 路径，锁外起监听（不阻塞 create/reaper）。
+    let tgt = shared.lock().unwrap().exec_target(id).ok_or("未知沙箱或已回收")?;
+    let vsock = match tgt {
+        ExecTarget::Vsock(p) => p,
+        _ => return Err("端口暴露仅 FC 后端（vsock）支持".into()),
+    };
+
+    let h = expose::start_listener(&bind, host_port, vsock, guest_port)?;
+    let out = expose_json(&h.bind, h.host_port, guest_port);
+    exposes.registry.lock().unwrap().entry(id.to_string()).or_default().insert(guest_port, h);
+    Ok(out)
+}
+
+/// 列出某沙箱已暴露端口 → JSON 数组 `[{bind,host_port,guest_port,url}, ..]`。
+fn list_exposes(id: &str, exposes: &Exposes) -> Vec<u8> {
+    let reg = exposes.registry.lock().unwrap();
+    let items: Vec<String> = reg
+        .get(id)
+        .map(|m| {
+            m.values()
+                .map(|h| String::from_utf8(expose_json(&h.bind, h.host_port, h.guest_port)).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("[{}]", items.join(",")).into_bytes()
 }
 
 /// 数据面网关连接（M2-Q6）：验签一次性 ticket → 路由到 exec/file/logs/端口反代。端口反代把 guest
@@ -696,6 +823,15 @@ mod tests {
             parse_route("GET", "/v1/sandboxes/abc/files/etc/hostname"),
             Route::GetFile("abc".into(), "etc/hostname".into())
         );
+    }
+
+    #[test]
+    fn route_expose() {
+        assert_eq!(parse_route("POST", "/v1/sandboxes/abc/expose"), Route::Expose("abc".into()));
+        assert_eq!(parse_route("GET", "/v1/sandboxes/abc/exposes"), Route::ListExposes("abc".into()));
+        assert_eq!(parse_route("DELETE", "/v1/sandboxes/abc/expose/8080"), Route::Unexpose("abc".into(), 8080));
+        // 非数字端口 → NotFound（不 panic）。
+        assert_eq!(parse_route("DELETE", "/v1/sandboxes/abc/expose/xx"), Route::NotFound);
     }
 
     #[test]

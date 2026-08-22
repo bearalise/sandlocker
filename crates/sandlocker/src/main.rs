@@ -40,6 +40,8 @@ fn run(args: &[String]) -> i32 {
         "run" => cmd_run(&opts, sub),
         "ps" => cmd_ps(&opts),
         "exec" => cmd_exec(&opts, sub),
+        "expose" => cmd_expose(&opts, sub),
+        "unexpose" => cmd_unexpose(&opts, sub),
         "logs" => cmd_logs(&opts, sub),
         "snapshot" => cmd_snapshot(&opts, sub),
         "help" | "-h" | "--help" => {
@@ -71,6 +73,8 @@ fn usage() {
          \x20 run <template> [--ttl N] [--idle N] -- <cmd...>              建沙箱→执行→打印→销毁（跑完即焚）\n\
          \x20 ps [--json]                                                  列运行中沙箱\n\
          \x20 exec <id> -- <cmd...>                                        在沙箱内执行命令\n\
+         \x20 expose <id> <guest-port> [--host-port N] [--bind ADDR]       暴露 VM 内端口（稳定地址 L4 透传）\n\
+         \x20 unexpose <id> <guest-port>                                   撤销端口暴露\n\
          \x20 logs <id>                                                    打印沙箱串口/引导日志\n\
          \x20 snapshot ls [--json]                                         列预烘焙快照（M1：模板=快照）\n"
     );
@@ -254,6 +258,46 @@ fn cmd_exec(opts: &Opts, sub: &[String]) -> Result<i32, String> {
     print!("{out}");
     eprint!("{err}");
     Ok(exit)
+}
+
+/// `expose <id> <guest-port> [--host-port N] [--bind ADDR]`：暴露 VM 内端口为稳定地址（L4 透传）。
+/// 打印生成的 URL。非回环 bind 需守护带 --expose-allow-public。
+fn cmd_expose(opts: &Opts, sub: &[String]) -> Result<i32, String> {
+    let mut a = sub.to_vec();
+    let host_port = take_flag(&mut a, "--host-port");
+    let bind = take_flag(&mut a, "--bind");
+    let id = a.first().ok_or("用法: sandlocker expose <id> <guest-port> [--host-port N] [--bind ADDR]")?;
+    let gp: u32 = a.get(1).ok_or("缺 guest-port")?.parse().map_err(|_| "guest-port 非数字")?;
+    let mut obj = serde_json::Map::new();
+    obj.insert("port".into(), serde_json::Value::from(gp));
+    if let Some(p) = host_port.and_then(|s| s.parse::<u16>().ok()) {
+        obj.insert("host_port".into(), serde_json::Value::from(p));
+    }
+    if let Some(b) = bind {
+        obj.insert("bind".into(), serde_json::Value::String(b));
+    }
+    let body = serde_json::Value::Object(obj).to_string();
+    let (code, resp) = http(&opts.addr, "POST", &format!("/v1/sandboxes/{id}/expose"), Some(&body), "application/json")?;
+    if code != 201 {
+        return Err(format!("expose 失败（HTTP {code}）: {resp}"));
+    }
+    if opts.json {
+        println!("{resp}");
+    } else {
+        println!("{}", json_str(&resp, "url").unwrap_or(resp));
+    }
+    Ok(0)
+}
+
+/// `unexpose <id> <guest-port>`：撤销端口暴露（停止监听器）。
+fn cmd_unexpose(opts: &Opts, sub: &[String]) -> Result<i32, String> {
+    let id = sub.first().ok_or("用法: sandlocker unexpose <id> <guest-port>")?;
+    let gp: u32 = sub.get(1).ok_or("缺 guest-port")?.parse().map_err(|_| "guest-port 非数字")?;
+    let (code, resp) = http(&opts.addr, "DELETE", &format!("/v1/sandboxes/{id}/expose/{gp}"), None, "application/json")?;
+    if code != 204 {
+        return Err(format!("unexpose 失败（HTTP {code}）: {resp}"));
+    }
+    Ok(0)
 }
 
 /// `logs <id>`：打印守护读回的实例引导/串口日志。

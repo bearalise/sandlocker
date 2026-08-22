@@ -191,6 +191,76 @@ paths:
         '400':
           $ref: '#/components/responses/Error'
 
+  /v1/sandboxes/{id}/expose:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 暴露 VM 内端口为稳定地址（L4 透传持久反代，FR-3.3）
+      description: >
+        起一条持久 L4（TCP）透传监听器：外部每条连接直接与 guest `127.0.0.1:{port}` 建裸字节隧道，
+        对上层协议不可见——支持任意 HTTP 方法、流式/SSE、WebSocket、keep-alive。返回稳定地址
+        `http://{bind}:{host_port}/`（可分享、任意 path）。仅 FC（vsock）后端。**纯 L4 透传无每请求鉴权**，
+        默认 bind 127.0.0.1；非回环 bind 需守护带 `--expose-allow-public`（仅可信网络）。同 guest_port 幂等。
+      operationId: exposePort
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [port]
+              properties:
+                port: { type: integer, description: 要暴露的 guest 端口 }
+                host_port: { type: integer, description: host 监听端口（缺省 0=OS 分配） }
+                bind: { type: string, default: "127.0.0.1", description: host 监听地址（非回环需 --expose-allow-public） }
+      responses:
+        '201':
+          description: 已暴露
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string }
+                  bind: { type: string }
+                  host_port: { type: integer }
+                  guest_port: { type: integer }
+        '400':
+          $ref: '#/components/responses/Error'
+    get:
+      summary: 列出该沙箱已暴露端口
+      operationId: listExposes
+      responses:
+        '200':
+          description: 暴露列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    url: { type: string }
+                    bind: { type: string }
+                    host_port: { type: integer }
+                    guest_port: { type: integer }
+
+  /v1/sandboxes/{id}/expose/{guest_port}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - name: guest_port
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      summary: 撤销端口暴露（停止监听器）
+      operationId: unexposePort
+      responses:
+        '204':
+          description: 已撤销
+        '404':
+          $ref: '#/components/responses/Error'
+
   # 数据面网关（默认 http://127.0.0.1:7879，与控制面分离，M3 可拆独立副本）：
   #   POST /gw/exec?<ticket>   body{cmd}           — 经 ticket 直连 exec
   #   PUT|GET /gw/file?<ticket>&p=<path>           — 文件读写

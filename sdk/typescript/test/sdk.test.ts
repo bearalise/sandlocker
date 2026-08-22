@@ -136,6 +136,9 @@ test("contract alignment: ROUTES == openapi M1 集合", () => {
     "POST /v1/sandboxes/{id}/resume",
     "POST /v1/sandboxes/{id}/fork",
     "POST /v1/sandboxes/{id}/ticket",
+    "POST /v1/sandboxes/{id}/expose",
+    "GET /v1/sandboxes/{id}/exposes",
+    "DELETE /v1/sandboxes/{id}/expose/{guest_port}",
     "GET /v1/templates",
     "GET /v1/backends",
     // 注：POST /v1/templates:build M1 恒 501，SDK 不封装，故不入集。

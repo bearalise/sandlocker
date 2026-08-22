@@ -8,6 +8,7 @@
 - [Product requirements (PRD)](design/SandLocker沙箱开源项目PRD.md)
 - [M1 technical plan](design/M1技术计划.md)
 - [M2 technical plan](design/M2技术计划.md)
+- [Port exposure (外部访问 VM 内服务)](design/端口暴露.md)
 - [Guest kernel strategy](design/内核跟进策略.md)
 - [Deployment guide](design/部署指南.md)
 - [Release guide](design/RELEASING.md)

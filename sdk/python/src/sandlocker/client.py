@@ -32,6 +32,9 @@ ROUTES = frozenset(
         ("POST", "/v1/sandboxes/{id}/resume"),
         ("POST", "/v1/sandboxes/{id}/fork"),
         ("POST", "/v1/sandboxes/{id}/ticket"),
+        ("POST", "/v1/sandboxes/{id}/expose"),
+        ("GET", "/v1/sandboxes/{id}/exposes"),
+        ("DELETE", "/v1/sandboxes/{id}/expose/{guest_port}"),
         ("GET", "/v1/templates"),
         ("GET", "/v1/backends"),
     }
@@ -138,6 +141,26 @@ class Client:
         if ttl is not None:
             body["ttl"] = ttl
         return self._json("POST", "/v1/sandboxes/{}/ticket".format(sid), body_obj=body, expect=(200,))
+
+    # --- 端口暴露（L4 透传持久反代：外部经稳定地址访问 VM 内动态服务，支持完整协议） ---
+    def expose(self, sid, port, host_port=None, bind=None):
+        # type: (str, int, int, str) -> Dict[str, Any]
+        # 暴露 VM 内 port 为稳定地址。返回 {"url","bind","host_port","guest_port"}。仅 FC 后端；
+        # 非回环 bind 需守护带 --expose-allow-public。
+        body = {"port": port}
+        if host_port is not None:
+            body["host_port"] = host_port
+        if bind is not None:
+            body["bind"] = bind
+        return self._json("POST", "/v1/sandboxes/{}/expose".format(sid), body_obj=body, expect=(201,))
+
+    def unexpose(self, sid, guest_port):
+        # type: (str, int) -> None
+        self._json("DELETE", "/v1/sandboxes/{}/expose/{}".format(sid, guest_port), expect=(204,))
+
+    def list_exposes(self, sid):
+        # type: (str) -> List[Dict[str, Any]]
+        return self._json("GET", "/v1/sandboxes/{}/exposes".format(sid)) or []
 
     # --- 后端列表与能力集（M2 W6，ADR-14） ---
     def list_backends(self):

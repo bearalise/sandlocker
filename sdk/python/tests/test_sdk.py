@@ -293,6 +293,9 @@ class SdkTest(unittest.TestCase):
                 ("POST", "/v1/sandboxes/{id}/resume"),        # resumeSandbox (M2 W9)
                 ("POST", "/v1/sandboxes/{id}/fork"),          # forkSandbox (M2 W9)
                 ("POST", "/v1/sandboxes/{id}/ticket"),        # mintTicket (M2 W10)
+                ("POST", "/v1/sandboxes/{id}/expose"),        # exposePort (L4 透传)
+                ("GET", "/v1/sandboxes/{id}/exposes"),        # listExposes
+                ("DELETE", "/v1/sandboxes/{id}/expose/{guest_port}"),  # unexposePort
                 ("GET", "/v1/templates"),                     # listTemplates
                 ("GET", "/v1/backends"),                      # listBackends (M2 W6)
                 # 注：POST /v1/templates:build 在 M1 恒返 501，SDK 不封装，故不在此集合。

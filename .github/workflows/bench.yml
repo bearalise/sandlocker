@@ -415,6 +415,46 @@ jobs:
           echo "$p" | grep -q '"pass":true' || { echo "::error::M2-Q7 未 pass"; exit 1; }
           echo "M2-Q7 PASS：交互式 PTY 双向流 + 窗口 resize + 会话收敛 + 零残留"
 
+  # 端口暴露（FR-3.3）：持久 L4 透传反代——外部经稳定地址访问 VM 内动态服务，支持完整协议。
+  #   证明 L4 透传 + 并发（guest 每连接一线程）+ 拆除 + 零残留（busybox 模板）；node 模板另证
+  #   keep-alive/POST/流式。fc 走恢复需 /dev/kvm。KVM 缺失则 skip。
+  expose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装内核构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target，sl-envd 静态）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 构建 sl-node + sl-envd（静态，含每连接一线程 vsock 服务）
+        run: |
+          cargo build -p sl-node --release
+          cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
+      - name: 构建基座 rootfs（含新 sl-envd：并发 vsock + Connect 代理）
+        run: scripts/build-rootfs.sh
+      - name: 端口暴露 L4 透传对账（--expose-reconcile）
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过端口暴露对账（fc 恢复需 KVM）"
+            exit 0
+          fi
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::未取到模板 version"; exit 1; }
+          e=$(./target/release/sl-node --expose-reconcile "build/templates/hello/$ver" --json)
+          echo "$e"
+          echo "$e" | grep -q '"metric":"expose_reconcile"' || { echo "::error::缺 expose_reconcile 指标"; exit 1; }
+          echo "$e" | grep -q '"concurrent":true' || { echo "::error::并发（guest 每连接一线程）未过"; exit 1; }
+          echo "$e" | grep -q '"teardown":true' || { echo "::error::拆除未过"; exit 1; }
+          echo "$e" | grep -q '"pass":true' || { echo "::error::端口暴露对账未 pass"; exit 1; }
+          echo "PASS：L4 透传端口暴露 + 并发 + 拆除 + 零残留"
+
   validate:
     runs-on: ubuntu-latest
     steps:

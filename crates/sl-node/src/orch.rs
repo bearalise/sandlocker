@@ -1128,6 +1128,238 @@ pub fn gw_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ————————————————————— 端口暴露 L4 透传对账 —————————————————————
+
+/// 从 TcpStream 读一个 HTTP 响应（header 到 `\r\n\r\n`，body 按 Content-Length）。用于 keep-alive/POST 断言。
+fn recv_http(s: &mut std::net::TcpStream) -> Result<(String, Vec<u8>), String> {
+    use std::io::Read as _;
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let hdr_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p;
+        }
+        let n = s.read(&mut tmp).map_err(|e| format!("读响应头失败: {e}"))?;
+        if n == 0 {
+            return Err("响应头未完整即 EOF".into());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+    let clen = head
+        .split("\r\n")
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let body_start = hdr_end + 4;
+    while buf.len() < body_start + clen {
+        let n = s.read(&mut tmp).map_err(|e| format!("读响应体失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let end = (body_start + clen).min(buf.len());
+    Ok((head, buf[body_start..end].to_vec()))
+}
+
+/// 端口暴露 L4 透传对账：证明外部经稳定地址访问 VM 内动态服务，支持完整协议。
+///
+/// create A → guest 起服务器 → host `start_listener` 起持久 L4 监听器 → 用真 TcpStream 断言：
+/// ① keep-alive（同连接多请求）② 非 GET+body ③ 流式增量推送 ④ 并发（长连接未结束时另连接仍即时响应，
+/// 验证 guest 每连接一线程）⑤ 拆除（stop 后端口释放）⑥ destroy 零残留。
+///
+/// 模板含 node 时做「动态站点级」全证明；busybox-only 回退为 L4 透传 + 拆除 + 零残留基础证明
+/// （keep-alive/POST/流式/并发标记为 skipped，如实记录不静默）。免 root（走恢复路径）。
+pub fn expose_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::net::{Shutdown, TcpStream};
+
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("expose-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(cfg, &template, &run_root, Box::new(store))?;
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[expose] {m}");
+        }
+    };
+
+    let a = orch.create(&SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() })?;
+    let vsock = match orch.exec_target(&a.id) {
+        Some(ExecTarget::Vsock(p)) => p,
+        _ => return Err("端口暴露仅 FC 后端（vsock）".into()),
+    };
+    log(&format!("create A={}", a.id));
+
+    let has_node = orch
+        .exec_target(&a.id)
+        .ok_or("无 exec 目标")?
+        .exec("command -v node >/dev/null 2>&1 && echo yes || echo no")?
+        .1
+        .contains("yes");
+
+    // host 侧持久 L4 监听器（OS 分配端口）。
+    let handle = crate::expose::start_listener("127.0.0.1", 0, vsock.clone(), 8080)?;
+    let port = handle.host_port;
+    log(&format!("start_listener 127.0.0.1:{port} → guest 8080（node={has_node}）"));
+
+    let (mut keepalive, mut post, mut stream_ok, mut concurrent) = (false, false, false, false);
+
+    if has_node {
+        // 动态站点级服务器：GET / 自增计数（keep-alive）；POST /echo 回显 body；GET /stream 每 100ms 一条 SSE。
+        let script = "const http=require('http');let n=0;\
+const s=http.createServer((req,res)=>{\
+if(req.method==='POST'&&req.url==='/echo'){let b='';req.on('data',c=>b+=c);req.on('end',()=>res.end(b));return;}\
+if(req.url==='/stream'){res.writeHead(200,{'Content-Type':'text/event-stream'});let i=0;\
+const t=setInterval(()=>{res.write('data: '+(i++)+'\\n\\n');if(i>=3){clearInterval(t);res.end();}},100);return;}\
+n++;res.end('count='+n);});\
+s.listen(8080,'127.0.0.1');";
+        let setup = orch.exec_target(&a.id).ok_or("无 exec 目标")?.exec(&format!(
+            "printf '%s' \"{}\" > /tmp/srv.js; (node /tmp/srv.js >/dev/null 2>&1 &) ; sleep 1",
+            script.replace('"', "\\\"")
+        ))?;
+        ensure(setup.0 == 0, "guest node 服务器启动失败")?;
+
+        // ① keep-alive：同一连接连发两请求，count 递增。
+        let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("① 连 host_port 失败: {e}"))?;
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n").map_err(|e| e.to_string())?;
+        let (_, b1) = recv_http(&mut s)?;
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n").map_err(|e| e.to_string())?;
+        let (_, b2) = recv_http(&mut s)?;
+        let (c1, c2) = (String::from_utf8_lossy(&b1), String::from_utf8_lossy(&b2));
+        ensure(c1.starts_with("count=") && c2.starts_with("count=") && c1 != c2, "① keep-alive 计数未递增")?;
+        let _ = s.shutdown(Shutdown::Both);
+        keepalive = true;
+        log("① keep-alive：同连接多请求，计数递增 ✓");
+
+        // ② 非 GET + body：POST /echo 回显。
+        let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+        let payload = "PING-1234";
+        s.write_all(format!("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes())
+            .map_err(|e| e.to_string())?;
+        let (_, eb) = recv_http(&mut s)?;
+        ensure(String::from_utf8_lossy(&eb).contains(payload), "② POST body 未原样回显")?;
+        let _ = s.shutdown(Shutdown::Both);
+        post = true;
+        log("② 非 GET + body：POST /echo 回显正确 ✓");
+
+        // ③ 流式 + ④ 并发：开 /stream 长连接（未读完），期间另起连接 GET / 仍即时响应（验 guest 并发）。
+        let mut ss = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+        ss.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        ss.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+        // 读首个 data 块（约 100ms 到），但不读完（后续块随时间陆续到）。
+        let t0 = Instant::now();
+        let mut acc = Vec::new();
+        let mut tmp = [0u8; 1024];
+        {
+            use std::io::Read as _;
+            while t0.elapsed() < Duration::from_millis(250) {
+                match ss.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                    Err(_) => {}
+                }
+                if String::from_utf8_lossy(&acc).contains("data: 0") {
+                    break;
+                }
+            }
+        }
+        ensure(String::from_utf8_lossy(&acc).contains("data: 0"), "③ 流式首块未到达")?;
+        // 并发：/stream 仍开着，另起连接必须能即时拿到响应（串行 guest 会阻塞在这里超时）。
+        let mut sc = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+        sc.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+        let (_, cb) = recv_http(&mut sc)?;
+        ensure(String::from_utf8_lossy(&cb).starts_with("count="), "④ 并发连接未即时响应（guest 可能未并发化）")?;
+        concurrent = true;
+        let _ = sc.shutdown(Shutdown::Both);
+        // 继续把 /stream 读到出现第 2 块，证明增量推送（非一次性缓冲）。
+        {
+            use std::io::Read as _;
+            while t0.elapsed() < Duration::from_millis(600) {
+                match ss.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                    Err(_) => {}
+                }
+                if String::from_utf8_lossy(&acc).contains("data: 2") {
+                    break;
+                }
+            }
+        }
+        ensure(String::from_utf8_lossy(&acc).contains("data: 2"), "③ 流式后续块未增量到达")?;
+        stream_ok = true;
+        let _ = ss.shutdown(Shutdown::Both);
+        log("③ 流式：SSE 分多块增量到达 ✓");
+        log("④ 并发：长连接未结束时另连接即时响应（guest 每连接一线程）✓");
+    } else {
+        // busybox 回退：nc 循环单连接响应器（每连接回定值），仅证明 L4 透传 + 监听器。
+        let setup = orch.exec_target(&a.id).ok_or("无 exec 目标")?.exec(
+            "(while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 11\\r\\nConnection: close\\r\\n\\r\\nEXPOSE-OK-1' | nc -l -p 8080; done) >/dev/null 2>&1 & sleep 1",
+        )?;
+        ensure(setup.0 == 0, "guest nc 响应器启动失败")?;
+        let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("连 host_port 失败: {e}"))?;
+        s.write_all(b"GET / HTTP/1.0\r\n\r\n").map_err(|e| e.to_string())?;
+        s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        let mut got = Vec::new();
+        {
+            use std::io::Read as _;
+            let _ = s.read_to_end(&mut got);
+        }
+        ensure(String::from_utf8_lossy(&got).contains("EXPOSE-OK-1"), "L4 透传未取到 VM 内服务内容")?;
+        let _ = s.shutdown(Shutdown::Both);
+        log("L4 透传：外部经监听器取到 VM 内服务内容 ✓（busybox 回退，keep-alive/POST/流式 skipped）");
+
+        // 并发（验证 guest 每连接一线程，busybox 可测）：起一个 hold 监听器占住一条隧道（guest 端
+        // splice_bidi 阻塞），此时再 exec 必须仍能即时返回——若 guest 串行则第二条 vsock 连接无法被
+        // accept，exec 会阻塞至超时。
+        let hold = orch.exec_target(&a.id).ok_or("无 exec 目标")?.exec("(nc -l -p 8090 >/dev/null 2>&1 &) ; sleep 1")?;
+        ensure(hold.0 == 0, "guest hold 监听器启动失败")?;
+        let handle2 = crate::expose::start_listener("127.0.0.1", 0, vsock.clone(), 8090)?;
+        let mut hs = TcpStream::connect(("127.0.0.1", handle2.host_port)).map_err(|e| e.to_string())?;
+        hs.write_all(b"x").map_err(|e| e.to_string())?; // 建立并占住隧道
+        std::thread::sleep(Duration::from_millis(300)); // 等 guest 进入 splice_bidi
+        let et = orch.exec_target(&a.id).ok_or("无 exec 目标")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(et.exec("echo alive"));
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok((0, out, _))) if out.contains("alive") => concurrent = true,
+            _ => {}
+        }
+        let _ = hs.shutdown(Shutdown::Both);
+        handle2.stop();
+        ensure(concurrent, "④ 并发失败：hold 隧道期间 exec 未即时返回（guest 可能未并发化）")?;
+        log("④ 并发：hold 隧道占用期间 exec 仍即时返回（guest 每连接一线程）✓");
+    }
+
+    // ⑤ 拆除：stop 后端口释放，新连接被拒。
+    handle.stop();
+    std::thread::sleep(Duration::from_millis(700));
+    let teardown = TcpStream::connect(("127.0.0.1", port)).is_err();
+    ensure(teardown, "⑤ 拆除后端口仍可连接（监听器未停）")?;
+    log("⑤ 拆除：stop 后端口释放 ✓");
+
+    // ⑥ destroy 零残留。
+    let dir_a = orch.dir_of(&a.id);
+    orch.destroy(&a.id)?;
+    ensure(!orch.is_live(&a.id) && dir_a.map(|d| !d.exists()).unwrap_or(true), "⑥ destroy 后有残留")?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "⑥ 收尾 store 非空")?;
+    log("⑥ destroy：零残留 ✓");
+
+    if cfg.json {
+        println!(
+            r#"{{"metric":"expose_reconcile","node":{has_node},"keepalive":{keepalive},"post":{post},"stream":{stream_ok},"concurrent":{concurrent},"teardown":{teardown},"pass":true}}"#
+        );
+    } else {
+        println!("[expose] 对账 PASS：L4 透传端口暴露（keep-alive/非GET/流式/并发/拆除/零残留）");
+    }
+    Ok(())
+}
+
 // ————————————————————— M2-Q7 交互式 PTY 对账 —————————————————————
 
 /// 从 PTY 裸输出流累积读，直到含 `needle` 或超时（PTY 输出含回显+prompt，用 contains 定位）。
