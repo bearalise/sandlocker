@@ -20,6 +20,9 @@ export const ROUTES: ReadonlySet<string> = new Set<string>([
   "POST /v1/sandboxes/{id}/resume",
   "POST /v1/sandboxes/{id}/fork",
   "POST /v1/sandboxes/{id}/ticket",
+  "POST /v1/sandboxes/{id}/expose",
+  "GET /v1/sandboxes/{id}/exposes",
+  "DELETE /v1/sandboxes/{id}/expose/{guest_port}",
   "GET /v1/templates",
   "GET /v1/backends",
 ]);
@@ -94,6 +97,22 @@ export class Client {
   /** M2 W10：签发数据面网关一次性 HMAC 签名 URL（action: exec|file|logs|port）。 */
   async ticket(id: string, action: string, opts: { port?: number; ttl?: number } = {}): Promise<any> {
     return this.json("POST", `/v1/sandboxes/${id}/ticket`, { action, ...opts }, [200]);
+  }
+  /** 端口暴露（L4 透传持久反代）：外部经稳定地址访问 VM 内动态服务，支持完整协议。仅 FC 后端；
+   *  非回环 bind 需守护带 --expose-allow-public。返回 {url,bind,host_port,guest_port}。 */
+  async expose(id: string, port: number, opts: { hostPort?: number; bind?: string } = {}): Promise<any> {
+    const body: Record<string, unknown> = { port };
+    if (opts.hostPort !== undefined) body.host_port = opts.hostPort;
+    if (opts.bind !== undefined) body.bind = opts.bind;
+    return this.json("POST", `/v1/sandboxes/${id}/expose`, body, [201]);
+  }
+  /** 撤销端口暴露（停止监听器）。 */
+  async unexpose(id: string, guestPort: number): Promise<void> {
+    await this.json("DELETE", `/v1/sandboxes/${id}/expose/${guestPort}`, undefined, [204, 200]);
+  }
+  /** 列出某沙箱已暴露端口。 */
+  async listExposes(id: string): Promise<any[]> {
+    return (await this.json("GET", `/v1/sandboxes/${id}/exposes`)) ?? [];
   }
   /** M2 W6：后端列表与能力集（ADR-14）。 */
   async listBackends(): Promise<any[]> {

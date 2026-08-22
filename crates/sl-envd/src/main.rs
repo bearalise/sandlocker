@@ -175,7 +175,9 @@ fn serve_vsock() -> std::io::Result<()> {
         return Err(e);
     }
 
-    if unsafe { libc::listen(listen_fd, 8) } < 0 {
+    // backlog 128：端口暴露（W-expose）下真实浏览器会并行开多条 TCP → 多条 vsock 连接，
+    // 突发 accept 需要更大 backlog 兜底（原 8 为 exec/单连接时代够用值）。
+    if unsafe { libc::listen(listen_fd, 128) } < 0 {
         let e = std::io::Error::last_os_error();
         unsafe { libc::close(listen_fd) };
         return Err(e);
@@ -195,8 +197,15 @@ fn serve_vsock() -> std::io::Result<()> {
             continue;
         }
         log("host 已连接");
-        handle_conn(conn_fd);
-        log("连接关闭");
+        // 每连接一线程：Connect/Pty 分支会阻塞至隧道/会话关闭（splice_bidi/handle_pty），
+        // 若内联串行则一条 keep-alive/SSE/WebSocket 长连接会独占整个 vsock 服务，其余连接
+        // （含真实浏览器并行开的多条 TCP + HMR WS）全卡在 backlog → 动态站假死。
+        // FdStream(conn_fd) move 进线程（Drop 时 close）；reaped 表全局 Mutex，run_exec/
+        // splice_bidi/handle_pty 各自独立，并发安全。
+        thread::spawn(move || {
+            handle_conn(conn_fd);
+            log("连接关闭");
+        });
     }
 }
 
