@@ -27,16 +27,124 @@ try { /* ... */ } finally { await s2.kill(); }        // kill is idempotent
 ```
 
 `Sandbox.create` / `list` / `get` accept `{ addr }` (default `127.0.0.1:7878`, requires the
-`sandlocker up` daemon to be running), or you can share a `Client`. `Template.list()` lists
-registered templates.
+`sandlocker up` daemon to be running), or you can share a `Client`.
 
-## API (on par with the Python SDK)
+---
 
-- `Sandbox.create(template, opts)` / `Sandbox.list(opts)` / `Sandbox.get(id, opts)`
-- Instance: `run(cmd)→ExecResult`, `keepAlive()`, `logs()→string`, `info()→SandboxInfo`, `kill()`,
-  `files.write(path, string|Uint8Array)` / `files.read(path)→Buffer`, `[Symbol.asyncDispose]`
-- Low-level `Client` (one method per route), models `ExecResult`/`SandboxInfo`/`Template`,
-  errors `SandLockerError`/`ConnectionError`/`ApiError`/`NotFound` (only 404→NotFound).
+## High-level API — `Sandbox`
+
+The recommended entry point. Factory methods create/discover sandboxes; instance methods drive one.
+
+### Factories (static)
+
+| Method | Parameters | Returns | Notes |
+| --- | --- | --- | --- |
+| `Sandbox.create(template, opts?)` | `template: string`, `opts?: CreateOptions` | `Promise<Sandbox>` | Create + boot a sandbox from a template. |
+| `Sandbox.list(opts?)` | `opts?: { addr?: string; client?: Client }` | `Promise<SandboxInfo[]>` | List all sandboxes. |
+| `Sandbox.get(id, opts?)` | `id: string`, `opts?: { addr?: string; client?: Client }` | `Promise<Sandbox>` | Bind to an existing sandbox by id. |
+
+**`CreateOptions`** (all optional):
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `timeout` | `number` | `300` | Absolute TTL ceiling in seconds — a hard cap that `keepAlive()` cannot extend past. |
+| `idle` | `number` | server = `ttl` | Idle-reclaim window in seconds (sliding). |
+| `cpu` | `number` | daemon = `2` | vCPU count. |
+| `mem` | `number` | daemon = `512` | Memory in MiB. |
+| `env` | `Record<string, string>` | — | Injected as sandbox labels / metadata. |
+| `addr` | `string` | `127.0.0.1:7878` | Daemon address (ignored if `client` is supplied). |
+| `client` | `Client` | — | Reuse a shared low-level client. |
+
+### Instance methods
+
+| Method | Parameters | Returns | Notes |
+| --- | --- | --- | --- |
+| `run(cmd)` | `cmd: string` | `Promise<ExecResult>` | Run one command (buffered, non-streaming). |
+| `keepAlive()` | — | `Promise<any>` | Sliding renewal of the idle window (does not move the TTL ceiling). Returns `{ id, lease_deadline, ttl_deadline }`. |
+| `logs()` | — | `Promise<string>` | Fetch sandbox logs. |
+| `info()` | — | `Promise<SandboxInfo>` | Refresh metadata. |
+| `kill()` | — | `Promise<void>` | Destroy; idempotent (swallows `NotFound`). |
+| `files.write(path, data)` | `path: string`, `data: string \| Uint8Array` | `Promise<void>` | Write a file (strings are UTF-8 encoded). |
+| `files.read(path)` | `path: string` | `Promise<Buffer>` | Read a file (raw bytes). |
+| `[Symbol.asyncDispose]()` | — | `Promise<void>` | Enables `await using` → auto-`kill()` on scope exit. |
+
+### Instance properties (from the create response)
+
+- `id: string`
+- `machineId: string | undefined`
+- `totalMs: number | undefined`
+- `state: string | undefined`
+
+---
+
+## Low-level API — `Client`
+
+One method per OpenAPI route; no shared mutable state (new connection per call → concurrency-safe).
+Construct with `new Client(addr?, timeoutMs?)` — `addr` defaults to `127.0.0.1:7878`, `timeoutMs` to `120000`.
+
+### Lifecycle
+
+| Method | Parameters | Route | Returns |
+| --- | --- | --- | --- |
+| `createSandbox(body)` | `body: Record<string, unknown>` | `POST /v1/sandboxes` | `Promise<any>` (201) |
+| `listSandboxes()` | — | `GET /v1/sandboxes` | `Promise<any[]>` |
+| `getSandbox(id)` | `id: string` | `GET /v1/sandboxes/{id}` | `Promise<any>` |
+| `deleteSandbox(id)` | `id: string` | `DELETE /v1/sandboxes/{id}` | `Promise<void>` (204/200) |
+| `keepAlive(id)` | `id: string` | `POST /v1/sandboxes/{id}/keepalive` | `Promise<any>` |
+
+### pause / resume / fork (M2 W9)
+
+| Method | Parameters | Route | Notes |
+| --- | --- | --- | --- |
+| `pause(id)` | `id: string` | `POST /v1/sandboxes/{id}/pause` | Snapshot + stop VM (needs backend `pause_resume`). |
+| `resume(id)` | `id: string` | `POST /v1/sandboxes/{id}/resume` | Restore from snapshot (reinit issues a fresh machine-id). |
+| `fork(id, body?)` | `id: string`, `body?: Record<string, unknown>` (default `{}`) | `POST /v1/sandboxes/{id}/fork` | Derive a new sandbox from a paused parent (independent identity; needs backend `snapshot_fork`). Returns 201. |
+
+### Command / files / logs
+
+| Method | Parameters | Route | Returns |
+| --- | --- | --- | --- |
+| `exec(id, cmd)` | `id: string`, `cmd: string` | `POST /v1/sandboxes/{id}/exec` | `Promise<any>` |
+| `putFile(id, path, data)` | `id: string`, `path: string`, `data: Uint8Array` | `PUT /v1/sandboxes/{id}/files/{path}` | `Promise<void>` (leading `/` stripped) |
+| `getFile(id, path)` | `id: string`, `path: string` | `GET /v1/sandboxes/{id}/files/{path}` | `Promise<Buffer>` |
+| `logs(id)` | `id: string` | `GET /v1/sandboxes/{id}/logs` | `Promise<string>` |
+
+### Data-plane gateway & port exposure (M2 W10, FR-3.3)
+
+| Method | Parameters | Route | Notes |
+| --- | --- | --- | --- |
+| `ticket(id, action, opts?)` | `id: string`, `action: "exec"\|"file"\|"logs"\|"port"`, `opts?: { port?: number; ttl?: number }` | `POST /v1/sandboxes/{id}/ticket` | Mint a one-time HMAC-signed gateway URL. |
+| `expose(id, port, opts?)` | `id: string`, `port: number`, `opts?: { hostPort?: number; bind?: string }` | `POST /v1/sandboxes/{id}/expose` | L4 passthrough reverse proxy → stable external address to a VM-internal service (FC backend only; non-loopback `bind` needs the daemon's `--expose-allow-public`). Returns `{ url, bind, host_port, guest_port }` (201). |
+| `unexpose(id, guestPort)` | `id: string`, `guestPort: number` | `DELETE /v1/sandboxes/{id}/expose/{guest_port}` | Revoke an exposure (stop the listener). |
+| `listExposes(id)` | `id: string` | `GET /v1/sandboxes/{id}/exposes` | `Promise<any[]>` — exposed ports for a sandbox. |
+
+### Discovery
+
+| Method | Parameters | Route | Returns |
+| --- | --- | --- | --- |
+| `listBackends()` | — | `GET /v1/backends` | `Promise<any[]>` — backends + capability sets (ADR-14). |
+| `listTemplates()` | — | `GET /v1/templates` | `Promise<any[]>` |
+
+> `Template.list(opts?)` (`opts?: { addr?: string; client?: Client }`) is the high-level wrapper → `Promise<Template[]>`.
+
+---
+
+## Models
+
+- **`ExecResult`** — `exitCode: number`, `stdout: string`, `stderr: string`, `raw: Record<string, any>`, getter `ok` (`exitCode === 0`).
+- **`SandboxInfo`** — `id`, `template`, `vcpus`, `memMib`, `ttlSecs`, `idleSecs`, `createdAt`, `ttlDeadline`, `labels`, `raw`.
+- **`Template`** — `name: string`, `version: string | null`; plus static `Template.list(opts?)`.
+
+## Errors
+
+Only HTTP 404 is specialized to `NotFound`; all other non-expected statuses throw `ApiError`.
+
+```
+SandLockerError            — SDK error base (catch-all)
+├── ConnectionError        — daemon unreachable / bad address
+└── ApiError               — unexpected HTTP status (.status / .detail)
+    └── NotFound           — HTTP 404
+```
 
 ## Development
 
