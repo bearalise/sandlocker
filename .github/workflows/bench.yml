@@ -414,6 +414,21 @@ jobs:
           echo "$p" | grep -q '"resize":true' || { echo "::error::窗口 resize 未过"; exit 1; }
           echo "$p" | grep -q '"pass":true' || { echo "::error::M2-Q7 未 pass"; exit 1; }
           echo "M2-Q7 PASS：交互式 PTY 双向流 + 窗口 resize + 会话收敛 + 零残留"
+      - name: 流式 exec 对账（--exec-stream-reconcile）
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过流式 exec（fc 恢复需 KVM）"
+            exit 0
+          fi
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::未取到模板 version"; exit 1; }
+          e=$(./target/release/sl-node --exec-stream-reconcile "build/templates/hello/$ver" --json)
+          echo "$e"
+          echo "$e" | grep -q '"metric":"exec_stream_reconcile"' || { echo "::error::缺 exec_stream_reconcile 指标"; exit 1; }
+          echo "$e" | grep -q '"separated":true' || { echo "::error::stdout/stderr 未分离"; exit 1; }
+          echo "$e" | grep -q '"pass":true' || { echo "::error::流式 exec 未 pass"; exit 1; }
+          echo "流式 exec PASS：逐块到达 + stdout/stderr 分离 + 退出码透传 + 零残留"
 
   # 端口暴露（FR-3.3）：持久 L4 透传反代——外部经稳定地址访问 VM 内动态服务，支持完整协议。
   #   证明 L4 透传 + 并发（guest 每连接一线程）+ 拆除 + 零残留（busybox 模板）；node 模板另证

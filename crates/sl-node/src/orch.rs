@@ -21,7 +21,10 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use sl_proto::{pty_resize_frame, pty_stdin_frame, read_msg, write_frame, write_msg, Request, Response};
+use sl_proto::{
+    parse_exec_output, pty_resize_frame, pty_stdin_frame, read_frame, read_msg, write_frame, write_msg, ExecOutput,
+    Request, Response,
+};
 use sl_store::{LeaseId, SqliteStore, Store};
 
 use crate::backend::{BackendInfo, Capabilities, Capability, ExecTarget, SandboxBackend, UNSUPPORTED_BY_BACKEND};
@@ -1444,6 +1447,99 @@ pub fn pty_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
         println!(r#"{{"metric":"pty_reconcile","cases":4,"bidi":true,"resize":true,"pass":true}}"#);
     } else {
         println!("[pty] M2-Q7 对账 PASS：交互式 PTY 双向流 + 窗口 resize + 会话收敛 + 零残留");
+    }
+    Ok(())
+}
+
+/// 流式 exec 对账（真机）：起沙箱 → 发 ExecStream → 断言输出**逐块**到达（首块远早于命令结束，
+/// 证明非缓冲）、stdout/stderr 分离正确、退出码透传、destroy 零残留。
+pub fn exec_stream_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("exec-stream-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(cfg, &template, &run_root, Box::new(store))?;
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[exec-stream] {m}");
+        }
+    };
+
+    let a = orch.create(&SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() })?;
+    let vsock = match orch.exec_target(&a.id) {
+        Some(ExecTarget::Vsock(p)) => p,
+        _ => return Err("流式 exec 仅 FC 后端（vsock）".into()),
+    };
+    let mut s = connect_guest(&vsock)?;
+    // 每轮 out$i/err$i + sleep 0.3；三轮 ~0.9s。缓冲式实现首块也要等到 ~0.9s 后才到——用首块时延判别。
+    let cmd = "for i in 1 2 3; do echo out$i; echo err$i 1>&2; sleep 0.3; done; exit 5";
+    write_msg(&mut s, &Request::ExecStream { cmd: cmd.into() }).map_err(|e| format!("发 ExecStream 失败: {e}"))?;
+    match read_msg::<_, Response>(&mut s).map_err(|e| format!("读 ExecStream ack 失败: {e}"))? {
+        Response::Ok => {}
+        other => return Err(format!("ExecStream ack 异常: {other:?}")),
+    }
+    log(&format!("create A={} + 流式会话建立", a.id));
+
+    let t0 = Instant::now();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code: Option<i32> = None;
+    let mut first_out: Option<Duration> = None;
+    let mut frames = 0usize;
+    loop {
+        let payload = match read_frame(&mut s) {
+            Ok(p) => p,
+            Err(_) => break, // guest EOF：命令结束或连接断
+        };
+        match parse_exec_output(&payload) {
+            Some(ExecOutput::Stdout(b)) => {
+                if first_out.is_none() {
+                    first_out = Some(t0.elapsed());
+                }
+                frames += 1;
+                stdout.push_str(&String::from_utf8_lossy(&b));
+            }
+            Some(ExecOutput::Stderr(b)) => {
+                frames += 1;
+                stderr.push_str(&String::from_utf8_lossy(&b));
+            }
+            Some(ExecOutput::Exit(code)) => {
+                exit_code = Some(code);
+                break;
+            }
+            None => {}
+        }
+    }
+    drop(s);
+
+    // ① 逐块（非缓冲）：首个 stdout 块远早于命令总时长（~0.9s）到达。
+    let fo = first_out.ok_or("① 未收到任何 stdout 块")?;
+    ensure(fo < Duration::from_millis(600), &format!("① 首块时延 {fo:?} 过大，疑似缓冲非流式"))?;
+    log(&format!("① 逐块到达：首块 {fo:?} ≪ 命令 ~0.9s（{frames} 块）✓"));
+
+    // ② stdout/stderr 分离且完整、有序
+    ensure(stdout == "out1\nout2\nout3\n", &format!("② stdout 不符: {stdout:?}"))?;
+    ensure(stderr == "err1\nerr2\nerr3\n", &format!("② stderr 不符: {stderr:?}"))?;
+    log("② stdout/stderr 分离完整有序 ✓");
+
+    // ③ 退出码透传
+    ensure(exit_code == Some(5), &format!("③ 退出码不符: {exit_code:?}"))?;
+    log("③ 退出码=5 透传 ✓");
+
+    // ④ destroy 零残留
+    let dir_a = orch.dir_of(&a.id);
+    orch.destroy(&a.id)?;
+    ensure(!orch.is_live(&a.id) && dir_a.map(|d| !d.exists()).unwrap_or(true), "④ destroy 后有残留")?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "④ 收尾 store 非空")?;
+    log("④ destroy：零残留 ✓");
+
+    if cfg.json {
+        println!(
+            r#"{{"metric":"exec_stream_reconcile","first_out_ms":{},"frames":{frames},"exit_code":5,"separated":true,"pass":true}}"#,
+            fo.as_millis()
+        );
+    } else {
+        println!("[exec-stream] 流式 exec 对账 PASS：逐块到达 + stdout/stderr 分离 + 退出码透传 + 零残留");
     }
     Ok(())
 }

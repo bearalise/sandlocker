@@ -199,6 +199,9 @@ struct Config {
     /// --pty-reconcile <模板目录>：M2-Q7 交互式 PTY 对账（双向流 + 窗口 resize + 会话收敛 + 零残留），
     /// 随后退出。免 root（走恢复路径）。
     pty_reconcile: Option<PathBuf>,
+    /// --exec-stream-reconcile <模板目录>：流式 exec 对账（逐块到达 + stdout/stderr 分离 + 退出码
+    /// 透传 + 零残留），随后退出。免 root（走恢复路径）。
+    exec_stream_reconcile: Option<PathBuf>,
     /// --expose-reconcile <模板目录>：端口暴露 L4 透传对账（keep-alive/非 GET/流式/并发/拆除/零残留），
     /// 随后退出。免 root（走恢复路径）。
     expose_reconcile: Option<PathBuf>,
@@ -345,6 +348,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[pty] M2-Q7 pty-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --exec-stream-reconcile：流式 exec 对账（逐块到达 + stdout/stderr 分离 + 退出码透传 + 零残留）。
+    if let Some(tpl) = cfg.exec_stream_reconcile.clone() {
+        match orch::exec_stream_reconcile(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[exec-stream] exec-stream-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2020,6 +2035,7 @@ fn clone_paths(cfg: &Config) -> Config {
         gw_addr: None,
         gw_reconcile: None,
         pty_reconcile: None,
+        exec_stream_reconcile: None,
         expose_reconcile: None,
         expose_allow_public: false,
     }
@@ -2144,6 +2160,7 @@ fn parse_args() -> Config {
         gw_addr: None,
         gw_reconcile: None,
         pty_reconcile: None,
+        exec_stream_reconcile: None,
         expose_reconcile: None,
         expose_allow_public: false,
     };
@@ -2199,6 +2216,7 @@ fn parse_args() -> Config {
             "--gw-addr" => cfg.gw_addr = Some(take()),
             "--gw-reconcile" => cfg.gw_reconcile = Some(PathBuf::from(take())),
             "--pty-reconcile" => cfg.pty_reconcile = Some(PathBuf::from(take())),
+            "--exec-stream-reconcile" => cfg.exec_stream_reconcile = Some(PathBuf::from(take())),
             "--expose-reconcile" => cfg.expose_reconcile = Some(PathBuf::from(take())),
             "--expose-allow-public" => cfg.expose_allow_public = true,
             "--serve" => cfg.serve = true,
@@ -2219,7 +2237,7 @@ fn parse_args() -> Config {
             "run" => {}
             other => {
                 eprintln!("未知参数: {other}");
-                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--abi-contract 模板DIR] [--q5-reconcile 模板DIR] [--gw-reconcile 模板DIR] [--pty-reconcile 模板DIR] [--serve] [--gw-addr host:port] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
+                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--abi-contract 模板DIR] [--q5-reconcile 模板DIR] [--gw-reconcile 模板DIR] [--pty-reconcile 模板DIR] [--exec-stream-reconcile 模板DIR] [--serve] [--gw-addr host:port] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
                 std::process::exit(2);
             }
         }
