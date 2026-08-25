@@ -53,3 +53,44 @@ def request(
         )
     finally:
         conn.close()
+
+
+def request_lines(
+    method,
+    path,
+    body=None,
+    content_type=None,
+    addr=DEFAULT_ADDR,
+    timeout=120.0,
+    on_line=None,
+):
+    # type: (str, str, Optional[bytes], Optional[str], str, float, Optional[callable]) -> int
+    """发一个请求，**增量**按行读响应体（NDJSON 流式 exec 用），每整行回调 ``on_line(line_str)``。
+
+    守护以 ``Connection: close`` + 无 Content-Length 推流；``HTTPResponse.readline()`` 到 EOF
+    即增量读，不像 :func:`request` 那样 ``read()`` 读满才返回。返回 ``status_code``
+    （body 已由 on_line 消费）。连接失败抛 ConnectionError。
+    """
+    host, port = _split_addr(addr)
+    headers = {}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        while True:
+            raw = resp.readline()
+            if not raw:
+                break  # EOF：连接关闭
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if line and on_line is not None:
+                on_line(line)
+        return status
+    except (OSError, http.client.HTTPException) as e:
+        raise ConnectionError(
+            "连接守护 {} 失败：{}（sandlocker up 是否已起？）".format(addr, e)
+        )
+    finally:
+        conn.close()

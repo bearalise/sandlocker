@@ -12,6 +12,7 @@
 （需 PYTHONPATH 含 sdk/python/src，或先 `pip install -e sdk/python`）。
 """
 
+import base64
 import json
 import os
 import sys
@@ -122,6 +123,34 @@ class _Handler(BaseHTTPRequestHandler):
                     code = 0
                 return self._json(200, {"exit_code": code, "stdout": "", "stderr": ""})
             return self._json(200, {"exit_code": 0, "stdout": cmd + "\n", "stderr": ""})
+        # /v1/sandboxes/{id}/exec/stream —— NDJSON（无 Content-Length，分多次 write 模拟流式）
+        if (len(segs) == 5 and segs[:2] == ["v1", "sandboxes"]
+                and segs[3] == "exec" and segs[4] == "stream"):
+            sid = segs[2]
+            if sid not in self.state.sandboxes:
+                return self._err(404, "no such sandbox")
+            req = json.loads(body.decode("utf-8")) if body else {}
+            cmd = req.get("cmd", "")
+            code = 0
+            if cmd.strip().startswith("exit "):
+                try:
+                    code = int(cmd.strip().split()[1])
+                except (ValueError, IndexError):
+                    code = 0
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def emit(obj):
+                self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self.wfile.flush()
+
+            emit({"stream": "stdout", "data": base64.b64encode(b"out1\n").decode()})
+            emit({"stream": "stdout", "data": base64.b64encode(b"out2\n").decode()})
+            emit({"stream": "stderr", "data": base64.b64encode(b"err1\n").decode()})
+            emit({"exit_code": code})
+            return
         return self._err(404, "no route")
 
     def do_GET(self):
@@ -226,6 +255,28 @@ class SdkTest(unittest.TestCase):
                 self.assertEqual(sbx.run("exit 0").exit_code, 0)
                 self.assertFalse(sbx.run("exit 1").ok)
 
+    def test_run_streaming(self):
+        with FakeDaemon() as d:
+            with Sandbox.create(template="hello", addr=d.addr) as sbx:
+                outs, errs = [], []
+                r = sbx.run("whatever", on_stdout=outs.append, on_stderr=errs.append)
+                self.assertEqual(outs, ["out1\n", "out2\n"])   # 逐块（base64 解码回字符串）
+                self.assertEqual(errs, ["err1\n"])
+                self.assertEqual(r.stdout, "out1\nout2\n")      # 聚合
+                self.assertEqual(r.stderr, "err1\n")
+                self.assertEqual(r.exit_code, 0)
+                self.assertTrue(r.ok)
+                # 退出码透传
+                r2 = sbx.run("exit 7", on_stdout=lambda s: None)
+                self.assertEqual(r2.exit_code, 7)
+
+    def test_run_streaming_not_found(self):
+        with FakeDaemon() as d:
+            from sandlocker.client import Client
+            ghost = Sandbox("nope", Client(addr=d.addr))
+            with self.assertRaises(NotFound):
+                ghost.run("x", on_stdout=lambda s: None)
+
     def test_list_and_get(self):
         with FakeDaemon() as d:
             a = Sandbox.create(template="hello", addr=d.addr)
@@ -302,6 +353,7 @@ class SdkTest(unittest.TestCase):
                 ("DELETE", "/v1/sandboxes/{id}"),             # deleteSandbox
                 ("POST", "/v1/sandboxes/{id}/keepalive"),     # keepAliveSandbox
                 ("POST", "/v1/sandboxes/{id}/exec"),          # execInSandbox
+                ("POST", "/v1/sandboxes/{id}/exec/stream"),   # execStreamInSandbox
                 ("PUT", "/v1/sandboxes/{id}/files/{path}"),   # putFile
                 ("GET", "/v1/sandboxes/{id}/files/{path}"),   # getFile
                 ("GET", "/v1/sandboxes/{id}/logs"),           # getLogs

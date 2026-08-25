@@ -8,6 +8,7 @@
 openapi.yaml 手抄的期望集合。改了 openapi 却没同步 SDK（或反之）→ 单测红。
 """
 
+import base64
 import json
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +26,7 @@ ROUTES = frozenset(
         ("DELETE", "/v1/sandboxes/{id}"),
         ("POST", "/v1/sandboxes/{id}/keepalive"),
         ("POST", "/v1/sandboxes/{id}/exec"),
+        ("POST", "/v1/sandboxes/{id}/exec/stream"),
         ("PUT", "/v1/sandboxes/{id}/files/{path}"),
         ("GET", "/v1/sandboxes/{id}/files/{path}"),
         ("GET", "/v1/sandboxes/{id}/logs"),
@@ -174,6 +176,54 @@ class Client:
             "POST", "/v1/sandboxes/{}/exec".format(sid),
             body_obj={"cmd": cmd},
         )
+
+    # --- 流式 exec（POST /v1/sandboxes/{id}/exec/stream） ---
+    def exec_stream(self, sid, cmd, on_stdout=None, on_stderr=None):
+        # type: (str, str, Optional[callable], Optional[callable], ) -> Dict[str, Any]
+        """流式执行：守护以 NDJSON 边跑边推 ``{stream,data(base64)}`` 逐块 + 末行 ``{exit_code}``。
+
+        on_stdout/on_stderr 收到即回调（已 base64 解码为 UTF-8 str）；返回聚合
+        ``{exit_code,stdout,stderr}``（与缓冲式 exec 同形，便于复用 ExecResult）。
+        """
+        agg = {"stdout": [], "stderr": [], "exit_code": 0, "error": None}
+
+        def _on_line(line):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                return  # 容忍非 JSON 行
+            if ev.get("stream") == "stdout":
+                s = base64.b64decode(ev.get("data", "")).decode("utf-8", "replace")
+                agg["stdout"].append(s)
+                if on_stdout is not None:
+                    on_stdout(s)
+            elif ev.get("stream") == "stderr":
+                s = base64.b64decode(ev.get("data", "")).decode("utf-8", "replace")
+                agg["stderr"].append(s)
+                if on_stderr is not None:
+                    on_stderr(s)
+            elif "exit_code" in ev:
+                agg["exit_code"] = ev["exit_code"]
+            elif "error" in ev:
+                agg["error"] = ev["error"]  # 守护流前错误体 {"error":..}
+
+        status = _http.request_lines(
+            "POST", "/v1/sandboxes/{}/exec/stream".format(sid),
+            body=json.dumps({"cmd": cmd}).encode("utf-8"),
+            content_type="application/json",
+            addr=self.addr, timeout=self.timeout,
+            on_line=_on_line,
+        )
+        if status != 200:
+            detail = agg["error"] or "HTTP {}".format(status)
+            if status == 404:
+                raise NotFound(status, detail)
+            raise ApiError(status, detail)
+        return {
+            "exit_code": agg["exit_code"],
+            "stdout": "".join(agg["stdout"]),
+            "stderr": "".join(agg["stderr"]),
+        }
 
     # --- 文件（PUT/GET /v1/sandboxes/{id}/files/{path}，octet-stream 原始字节） ---
     def put_file(self, sid, path, data):

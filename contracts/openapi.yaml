@@ -274,7 +274,8 @@ paths:
     post:
       summary: 在沙箱内执行命令（缓冲式，返 exit/stdout/stderr）
       description: >
-        M1 缓冲式：命令跑完才返回聚合输出。流式 stdout（SSE/WebSocket）与 PTY 属 M2。
+        缓冲式：命令跑完才返回聚合输出。逐块流式 stdout/stderr 见
+        `POST /v1/sandboxes/{id}/exec/stream`；PTY 属独立交互通道。
       operationId: execInSandbox
       requestBody:
         required: true
@@ -289,6 +290,39 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExecResult'
+        '500':
+          $ref: '#/components/responses/Error'
+
+  /v1/sandboxes/{id}/exec/stream:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      summary: 在沙箱内流式执行命令（NDJSON，边跑边推 stdout/stderr）
+      description: >
+        流式对偶：守护劫持本连接，以 NDJSON（每行一个 JSON 事件、Connection: close、
+        无 Content-Length）边跑边推输出，stdout/stderr **分离**、逐块。每行事件为二选一：
+        输出块 `{"stream":"stdout"|"stderr","data":"<base64>"}`（data 为该块原始字节的
+        base64，二进制安全），或终帧 `{"exit_code":<int>}`（命令结束，退出码语义同 exec：
+        信号终止为 128+signo）。仅 FC/vsock 后端；非 vsock 后端返回 400。
+      operationId: execStreamInSandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecRequest'
+      responses:
+        '200':
+          description: NDJSON 事件流（application/x-ndjson，见 description）
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: 每行一个 JSON 对象——输出块 {stream,data} 或终帧 {exit_code}。
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
         '500':
           $ref: '#/components/responses/Error'
 

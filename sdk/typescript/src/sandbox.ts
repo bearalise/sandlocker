@@ -36,6 +36,13 @@ export interface CreateOptions {
   client?: Client;
 }
 
+export interface RunOptions {
+  /** 提供任一回调即走流式：stdout 逐块到达时回调（UTF-8 字符串）。 */
+  onStdout?: (data: string) => void;
+  /** 流式：stderr 逐块到达时回调（UTF-8 字符串）。 */
+  onStderr?: (data: string) => void;
+}
+
 export class Sandbox {
   readonly id: string;
   readonly files: FilesProxy;
@@ -90,8 +97,16 @@ export class Sandbox {
     return Sandbox.connect(id, { ...opts, verify: true });
   }
 
-  /** 在沙箱内跑一条命令（buffered，非流式）。 */
-  async run(cmd: string): Promise<ExecResult> {
+  /**
+   * 在沙箱内跑一条命令。缺省缓冲式（命令跑完返回聚合输出）；传 `onStdout`/`onStderr` 则走流式：
+   * 守护边跑边推，回调逐块收到 stdout/stderr（分离），命令结束 resolve 出含退出码的 ExecResult。
+   */
+  async run(cmd: string, opts: RunOptions = {}): Promise<ExecResult> {
+    if (opts.onStdout || opts.onStderr) {
+      return ExecResult.fromJson(
+        await this.client.execStream(this.id, cmd, { onStdout: opts.onStdout, onStderr: opts.onStderr }),
+      );
+    }
     return ExecResult.fromJson(await this.client.exec(this.id, cmd));
   }
   /** 续期：滑窗重置 idle（不动 TTL 硬顶）。返回 {id, lease_deadline, ttl_deadline}。 */

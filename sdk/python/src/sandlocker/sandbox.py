@@ -118,12 +118,18 @@ class Sandbox:
         return cls.connect(sid, addr=addr, client=client, verify=True)
 
     # --- 操作 ---
-    def run(self, cmd):
-        # type: (str) -> ExecResult
-        """在沙箱内跑命令（缓冲式，返 exit/stdout/stderr）。
+    def run(self, cmd, on_stdout=None, on_stderr=None):
+        # type: (str, Optional[callable], Optional[callable]) -> ExecResult
+        """在沙箱内跑命令。
 
         cmd 直接交给 guest ``/bin/sh -c``；退出码原样透传（run("exit 7").exit_code == 7）。
+        缺省缓冲式（命令跑完返回聚合输出）；传 on_stdout/on_stderr 则走流式：守护边跑边推，
+        回调逐块收到 stdout/stderr（分离，UTF-8 str），命令结束返回含退出码的 ExecResult。
         """
+        if on_stdout is not None or on_stderr is not None:
+            return ExecResult.from_json(
+                self._client.exec_stream(self.id, cmd, on_stdout=on_stdout, on_stderr=on_stderr)
+            )
         return ExecResult.from_json(self._client.exec(self.id, cmd))
 
     def keep_alive(self):

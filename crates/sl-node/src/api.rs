@@ -22,11 +22,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sl_store::SqliteStore;
 
+use sl_proto::{parse_exec_output, read_frame, read_msg, write_msg, ExecOutput, Request, Response};
+
 use crate::backend::{Capabilities, ExecTarget, UNSUPPORTED_BY_BACKEND};
 use crate::expose::{self, ExposeHandle};
 use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::orch::{Orch, SandboxSpec};
-use crate::Config;
+use crate::{connect_guest, Config};
 
 /// 守护共享态：orchestrator（互斥）+ 模板仓库根（模板名→目录解析）。
 type Shared = Arc<Mutex<Orch<'static>>>;
@@ -339,6 +341,10 @@ fn handle_conn(
     exposes: &Exposes,
 ) -> Result<(), String> {
     let (method, path, body) = read_request(&mut stream)?;
+    // 流式 exec：需劫持本连接（NDJSON 边收边发、无 Content-Length），不进 dispatch/write_response 一次性路径。
+    if let Some(id) = parse_exec_stream(&method, &path) {
+        return exec_stream_hijack(stream, &id, &body, shared);
+    }
     let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes);
     write_response(&mut stream, code, ctype, &resp)
 }
@@ -672,6 +678,85 @@ fn fork_sandbox(id: &str, body: &[u8], shared: &Shared) -> Result<Vec<u8>, Strin
         out.id, out.machine_id, out.total_ms, out.copy_ms
     )
     .into_bytes())
+}
+
+/// 若为流式 exec 路由（`POST /v1/sandboxes/{id}/exec/stream`）返回 sandbox id，否则 None。
+fn parse_exec_stream(method: &str, path: &str) -> Option<String> {
+    if method != "POST" {
+        return None;
+    }
+    let path = path.split('?').next().unwrap_or(path);
+    let trimmed = path.trim_matches('/');
+    let segs: Vec<&str> = if trimmed.is_empty() { vec![] } else { trimmed.split('/').collect() };
+    match segs.as_slice() {
+        ["v1", "sandboxes", id, "exec", "stream"] => Some((*id).to_string()),
+        _ => None,
+    }
+}
+
+/// 流式 exec（NDJSON）：劫持本连接，把 guest 的 exec 输出帧边收边转成 NDJSON 事件推给客户端。
+/// 事件逐行：`{"stream":"stdout"|"stderr","data":"<base64>"}` 逐块，末尾 `{"exit_code":N}`。仅 FC/vsock。
+/// 传输：`HTTP/1.1 200` + `Connection: close` + **无 Content-Length**（客户端读到连接关闭为止，可增量收）。
+/// 错误在写响应头之前用一次性 `write_response` 报（400/404/500/502）；头写出后只能中断连接。
+fn exec_stream_hijack(mut stream: TcpStream, id: &str, body: &[u8], shared: &Shared) -> Result<(), String> {
+    let json = "application/json";
+    let v: serde_json::Value = match serde_json::from_slice(if body.is_empty() { b"{}" } else { body }) {
+        Ok(v) => v,
+        Err(e) => return write_response(&mut stream, 400, json, &err_json(&format!("请求体非 JSON: {e}"))),
+    };
+    let cmd = match v.get("cmd").and_then(|x| x.as_str()) {
+        Some(c) => c.to_string(),
+        None => return write_response(&mut stream, 400, json, &err_json("缺 cmd 字段")),
+    };
+    // 取 target（锁内）后立即释放锁；仅 FC/vsock 支持流式 exec。
+    let tgt = shared.lock().unwrap().exec_target(id);
+    let vsock = match tgt {
+        Some(ExecTarget::Vsock(p)) => p,
+        Some(_) => return write_response(&mut stream, 400, json, &err_json("流式 exec 仅 FC 后端（vsock）支持")),
+        None => return write_response(&mut stream, 404, json, &err_json("未知沙箱或已回收")),
+    };
+    // 连 guest、发 ExecStream、等 Ok ack（此前的错误都还能回规范 HTTP 响应）。
+    let mut g = match connect_guest(&vsock) {
+        Ok(s) => s,
+        Err(e) => return write_response(&mut stream, 502, json, &err_json(&format!("连 guest 失败: {e}"))),
+    };
+    if let Err(e) = write_msg(&mut g, &Request::ExecStream { cmd }) {
+        return write_response(&mut stream, 502, json, &err_json(&format!("发 ExecStream 失败: {e}")));
+    }
+    match read_msg::<_, Response>(&mut g) {
+        Ok(Response::Ok) => {}
+        Ok(Response::Error { message }) => {
+            return write_response(&mut stream, 500, json, &err_json(&format!("guest 执行错误: {message}")))
+        }
+        Ok(other) => return write_response(&mut stream, 502, json, &err_json(&format!("非预期 ack: {other:?}"))),
+        Err(e) => return write_response(&mut stream, 502, json, &err_json(&format!("读 ack 失败: {e}"))),
+    }
+    // ack 成功 → 写 NDJSON 响应头（无 Content-Length），随后边收帧边发事件。
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).map_err(|e| format!("写响应头失败: {e}"))?;
+    stream.flush().ok();
+    loop {
+        let payload = match read_frame(&mut g) {
+            Ok(p) => p,
+            Err(_) => break, // guest EOF/错误：命令结束或连接断
+        };
+        // base64 字符集 [A-Za-z0-9+/=] 无需 JSON 转义，手拼行避免每块 serde 开销。
+        let line = match parse_exec_output(&payload) {
+            Some(ExecOutput::Stdout(b)) => format!("{{\"stream\":\"stdout\",\"data\":\"{}\"}}\n", b64_encode(&b)),
+            Some(ExecOutput::Stderr(b)) => format!("{{\"stream\":\"stderr\",\"data\":\"{}\"}}\n", b64_encode(&b)),
+            Some(ExecOutput::Exit(code)) => {
+                let _ = stream.write_all(format!("{{\"exit_code\":{code}}}\n").as_bytes());
+                stream.flush().ok();
+                break;
+            }
+            None => continue, // 非法帧忽略
+        };
+        if stream.write_all(line.as_bytes()).is_err() {
+            break; // 客户端断开
+        }
+        stream.flush().ok();
+    }
+    Ok(())
 }
 
 /// 取 exec 目标（持锁）→ 释放锁 → 后端各自执行（慢 IO 不阻塞 create/reaper）。FC=vsock/gVisor=runsc。

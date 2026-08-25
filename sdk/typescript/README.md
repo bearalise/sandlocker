@@ -72,7 +72,7 @@ The recommended entry point. Factory methods create/discover sandboxes; instance
 
 | Method | Parameters | Returns | Notes |
 | --- | --- | --- | --- |
-| `run(cmd)` | `cmd: string` | `Promise<ExecResult>` | Run one command (buffered, non-streaming). |
+| `run(cmd, opts?)` | `cmd: string`, `opts?: RunOptions` | `Promise<ExecResult>` | Run one command. Buffered by default; pass `onStdout`/`onStderr` to stream output chunk-by-chunk (see below). |
 | `keepAlive()` | — | `Promise<any>` | Sliding renewal of the idle window (does not move the TTL ceiling). Returns `{ id, lease_deadline, ttl_deadline }`. |
 | `logs()` | — | `Promise<string>` | Fetch sandbox logs. |
 | `info()` | — | `Promise<SandboxInfo>` | Refresh metadata. |
@@ -87,6 +87,27 @@ The recommended entry point. Factory methods create/discover sandboxes; instance
 - `machineId: string | undefined`
 - `totalMs: number | undefined`
 - `state: string | undefined`
+
+### Streaming output — `RunOptions`
+
+Pass either callback to `run` and output is delivered **chunk-by-chunk as the command runs**, with
+`stdout`/`stderr` kept separate. The returned `ExecResult` still carries the full aggregated
+`stdout`/`stderr` and `exitCode`. Under the hood this uses the daemon's NDJSON streaming endpoint
+(`POST /v1/sandboxes/{id}/exec/stream`, FC/vsock backend only).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `onStdout` | `(data: string) => void` | Called per stdout chunk (UTF-8 decoded). |
+| `onStderr` | `(data: string) => void` | Called per stderr chunk (UTF-8 decoded). |
+
+```ts
+const buffers = { stdout: "", stderr: "" };
+const result = await sbx.run("for i in 1 2 3; do echo $i; sleep 1; done", {
+  onStdout: (data) => { buffers.stdout += data; process.stdout.write(data); },
+  onStderr: (data) => { buffers.stderr += data; },
+});
+console.log(result.exitCode, result.stdout === buffers.stdout); // aggregate also returned
+```
 
 ---
 
@@ -118,6 +139,7 @@ Construct with `new Client(addr?, timeoutMs?)` — `addr` defaults to `127.0.0.1
 | Method | Parameters | Route | Returns |
 | --- | --- | --- | --- |
 | `exec(id, cmd)` | `id: string`, `cmd: string` | `POST /v1/sandboxes/{id}/exec` | `Promise<any>` |
+| `execStream(id, cmd, handlers?)` | `id: string`, `cmd: string`, `handlers?: { onStdout?; onStderr? }` | `POST /v1/sandboxes/{id}/exec/stream` | `Promise<{ exit_code, stdout, stderr }>` — NDJSON stream, FC/vsock only. |
 | `putFile(id, path, data)` | `id: string`, `path: string`, `data: Uint8Array` | `PUT /v1/sandboxes/{id}/files/{path}` | `Promise<void>` (leading `/` stripped) |
 | `getFile(id, path)` | `id: string`, `path: string` | `GET /v1/sandboxes/{id}/files/{path}` | `Promise<Buffer>` |
 | `logs(id)` | `id: string` | `GET /v1/sandboxes/{id}/logs` | `Promise<string>` |
