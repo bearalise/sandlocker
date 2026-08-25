@@ -50,7 +50,8 @@ with Sandbox.create(template="hello", timeout=300) as sbx:   # timeout → ttl�
 |---|---|---|
 | `Sandbox.create(template, timeout=300, idle=None, cpu=None, mem=None, env=None, addr=...)` | 创建并启动（走快照恢复，秒级） | `POST /v1/sandboxes` |
 | `Sandbox.list(addr=...) -> [SandboxInfo]` | 列出沙箱 | `GET /v1/sandboxes` |
-| `Sandbox.get(id, addr=...)` / `sbx.info()` | 取元数据 | `GET /v1/sandboxes/{id}` |
+| `Sandbox.connect(id, addr=..., verify=True)` | **附着**到已有沙箱拿句柄；`verify=False` 惰性绑定（不打网络，错误延迟到首个操作） | `GET /v1/sandboxes/{id}`（`verify=False` 时不发） |
+| `Sandbox.get(id, addr=...)` / `sbx.info()` | 取元数据（`connect` 的校验式别名） | `GET /v1/sandboxes/{id}` |
 | `sbx.run(cmd) -> ExecResult` | 跑命令（缓冲式，退出码透传） | `POST /v1/sandboxes/{id}/exec` |
 | `sbx.files.write(path, data)` | 写文件 | `PUT /v1/sandboxes/{id}/files/{path}` |
 | `sbx.files.read(path) -> bytes` | 读文件 | `GET /v1/sandboxes/{id}/files/{path}` |

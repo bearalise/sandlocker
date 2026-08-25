@@ -238,6 +238,22 @@ class SdkTest(unittest.TestCase):
             a.kill()
             b.kill()
 
+    def test_connect_verify_and_lazy(self):
+        with FakeDaemon() as d:
+            a = Sandbox.create(template="hello", addr=d.addr)
+            # verify=True（默认）：往返校验存在并填充元数据。
+            attached = Sandbox.connect(a.id, addr=d.addr)
+            self.assertEqual(attached.id, a.id)
+            self.assertEqual(attached.info().template, "hello")
+            with self.assertRaises(NotFound):
+                Sandbox.connect("nope", addr=d.addr)
+            # verify=False：惰性绑定，不打网络——即使 id 不存在也不抛，错误延迟到首个真实操作。
+            lazy = Sandbox.connect("nope", addr=d.addr, verify=False)
+            self.assertEqual(lazy.id, "nope")
+            with self.assertRaises(NotFound):
+                lazy.info()
+            a.kill()
+
     def test_templates_list(self):
         with FakeDaemon() as d:
             tpls = Template.list(addr=d.addr)

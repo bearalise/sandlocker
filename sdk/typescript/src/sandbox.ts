@@ -67,10 +67,27 @@ export class Sandbox {
     return (await c.listSandboxes()).map((d) => SandboxInfo.fromJson(d));
   }
 
-  static async get(id: string, opts: { addr?: string; client?: Client } = {}): Promise<Sandbox> {
+  /**
+   * 附着（attach）到一个已存在的沙箱以便后续异步操作（run/keepAlive/logs/files/...）。
+   * 典型场景：沙箱由别处（另一进程/请求/`sandlocker up` 会话）创建，此处只按 id 重新拿到句柄。
+   *
+   * - 默认 `verify: true`——做一次 `GET /v1/sandboxes/{id}` 校验存在并填充元数据（不存在 → NotFound）。
+   * - `verify: false`——惰性绑定，**不打任何网络**：立即返回句柄，错误延迟到首个真实操作时才抛。
+   *   适合"我确信它在、只想尽快开始"或规避多余往返的异步/并发场景。
+   */
+  static async connect(
+    id: string,
+    opts: { addr?: string; client?: Client; verify?: boolean } = {},
+  ): Promise<Sandbox> {
     const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR);
+    if (opts.verify === false) return new Sandbox(id, c);
     const meta = await c.getSandbox(id);
     return new Sandbox(id, c, meta);
+  }
+
+  /** `connect` 的校验式别名（总是往返一次拉取元数据）。 */
+  static async get(id: string, opts: { addr?: string; client?: Client } = {}): Promise<Sandbox> {
+    return Sandbox.connect(id, { ...opts, verify: true });
   }
 
   /** 在沙箱内跑一条命令（buffered，非流式）。 */

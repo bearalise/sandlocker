@@ -215,6 +215,25 @@ test("list / get / templates", async () => {
   }
 });
 
+test("connect：校验式往返 + 惰性绑定（verify:false 不打网络）", async () => {
+  const d = await startFakeDaemon();
+  try {
+    const a = await Sandbox.create("hello", { addr: d.addr });
+    // 默认 verify:true——往返拉元数据（不存在 → NotFound，与 get 同）。
+    const attached = await Sandbox.connect(a.id, { addr: d.addr });
+    assert.equal(attached.id, a.id);
+    assert.equal((await attached.info()).template, "hello");
+    await assert.rejects(Sandbox.connect("nope", { addr: d.addr }), (e: unknown) => e instanceof NotFound);
+    // verify:false——惰性绑定：即使 id 不存在也不抛（无往返），错误延迟到首个真实操作。
+    const lazy = await Sandbox.connect("nope", { addr: d.addr, verify: false });
+    assert.equal(lazy.id, "nope");
+    await assert.rejects(lazy.info(), (e: unknown) => e instanceof NotFound);
+    await a.kill();
+  } finally {
+    await d.close();
+  }
+});
+
 test("404 → NotFound（且是 ApiError 子类）", async () => {
   const d = await startFakeDaemon();
   try {

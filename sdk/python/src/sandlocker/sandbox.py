@@ -95,11 +95,27 @@ class Sandbox:
         return [SandboxInfo.from_json(d) for d in c.list_sandboxes()]
 
     @classmethod
-    def get(cls, sid, addr=DEFAULT_ADDR, client=None):
-        # type: (...) -> "Sandbox"
+    def connect(cls, sid, addr=DEFAULT_ADDR, client=None, verify=True):
+        # type: (str, str, Optional[Client], bool) -> "Sandbox"
+        """附着（attach）到已存在的沙箱以便后续操作（run/keep_alive/logs/files/...）。
+
+        典型场景：沙箱由别处（另一进程/请求/``sandlocker up`` 会话）创建，此处只按 id 重拿句柄。
+
+        verify=True（默认）：做一次 ``GET /v1/sandboxes/{id}`` 校验存在并填充元数据
+                            （不存在 → NotFound）。
+        verify=False       ：惰性绑定，**不打任何网络**，立即返回句柄，错误延迟到首个真实操作。
+        """
         c = client or Client(addr=addr)
+        if not verify:
+            return cls(sid, c)
         meta = c.get_sandbox(sid)
         return cls(sid, c, meta=meta)
+
+    @classmethod
+    def get(cls, sid, addr=DEFAULT_ADDR, client=None):
+        # type: (...) -> "Sandbox"
+        """connect 的校验式别名（总是往返一次拉取元数据）。"""
+        return cls.connect(sid, addr=addr, client=client, verify=True)
 
     # --- 操作 ---
     def run(self, cmd):

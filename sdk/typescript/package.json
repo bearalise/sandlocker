@@ -1,6 +1,6 @@
 {
   "name": "sandlocker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "SandLocker TypeScript SDK — 零运行时依赖的薄 REST 客户端（对标 Python SDK / contracts/openapi.yaml）",
   "license": "Apache-2.0",
   "author": "SandLocker",
@@ -10,7 +10,12 @@
     "url": "git+https://github.com/bearalise/sandlocker.git",
     "directory": "sdk/typescript"
   },
-  "keywords": ["sandbox", "firecracker", "microvm", "code-execution"],
+  "keywords": [
+    "sandbox",
+    "firecracker",
+    "microvm",
+    "code-execution"
+  ],
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -30,7 +35,10 @@
       }
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json && node ./scripts/fixup-cjs.mjs",
     "build:test": "tsc -p tsconfig.test.json",

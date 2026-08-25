@@ -26,7 +26,19 @@ const s2 = await Sandbox.create("hello");
 try { /* ... */ } finally { await s2.kill(); }        // kill is idempotent
 ```
 
-`Sandbox.create` / `list` / `get` accept `{ addr }` (default `127.0.0.1:7878`, requires the
+Attach to a sandbox created elsewhere (another process / request / `sandlocker up` session) by id:
+
+```ts
+import { Sandbox } from "sandlocker";
+
+const sbx = await Sandbox.connect("sbx-123");                 // verify it exists, then drive it
+const r = await sbx.run("echo attached");
+
+// Lazy attach — no network round-trip; errors surface on the first real op:
+const lazy = await Sandbox.connect("sbx-123", { verify: false });
+```
+
+`Sandbox.create` / `list` / `connect` / `get` accept `{ addr }` (default `127.0.0.1:7878`, requires the
 `sandlocker up` daemon to be running), or you can share a `Client`.
 
 ---
@@ -41,7 +53,8 @@ The recommended entry point. Factory methods create/discover sandboxes; instance
 | --- | --- | --- | --- |
 | `Sandbox.create(template, opts?)` | `template: string`, `opts?: CreateOptions` | `Promise<Sandbox>` | Create + boot a sandbox from a template. |
 | `Sandbox.list(opts?)` | `opts?: { addr?: string; client?: Client }` | `Promise<SandboxInfo[]>` | List all sandboxes. |
-| `Sandbox.get(id, opts?)` | `id: string`, `opts?: { addr?: string; client?: Client }` | `Promise<Sandbox>` | Bind to an existing sandbox by id. |
+| `Sandbox.connect(id, opts?)` | `id: string`, `opts?: { addr?: string; client?: Client; verify?: boolean }` | `Promise<Sandbox>` | **Attach** to an existing sandbox by id for subsequent async ops. `verify: true` (default) does a `GET /v1/sandboxes/{id}` round-trip (throws `NotFound` if gone); `verify: false` binds **lazily with no network call** — errors defer to the first real operation. |
+| `Sandbox.get(id, opts?)` | `id: string`, `opts?: { addr?: string; client?: Client }` | `Promise<Sandbox>` | Verifying alias of `connect` (always round-trips to fetch metadata). |
 
 **`CreateOptions`** (all optional):
 
