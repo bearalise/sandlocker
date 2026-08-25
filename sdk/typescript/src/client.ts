@@ -1,6 +1,6 @@
 // 低层 REST 客户端（对标 sdk/python/src/sandlocker/client.py）：一方法一 OpenAPI 路由。
 // 无共享可变状态、每调用新连接 → 天然并发安全。
-import { request, DEFAULT_ADDR } from "./http.js";
+import { request, requestLines, DEFAULT_ADDR } from "./http.js";
 import { ApiError, NotFound } from "./errors.js";
 
 // 契约漂移防线（替代 codegen，对标 Python client.ROUTES）：改 openapi 或路由时，
@@ -13,6 +13,7 @@ export const ROUTES: ReadonlySet<string> = new Set<string>([
   "DELETE /v1/sandboxes/{id}",
   "POST /v1/sandboxes/{id}/keepalive",
   "POST /v1/sandboxes/{id}/exec",
+  "POST /v1/sandboxes/{id}/exec/stream",
   "PUT /v1/sandboxes/{id}/files/{path}",
   "GET /v1/sandboxes/{id}/files/{path}",
   "GET /v1/sandboxes/{id}/logs",
@@ -37,6 +38,12 @@ function decodeError(status: number, body: Buffer): ApiError {
     detail = body.toString("utf8");
   }
   return status === 404 ? new NotFound(status, detail) : new ApiError(status, detail);
+}
+
+/** 已拿到错误文本（如流式端点的 {"error":..} 行）时构造异常（404 特化 NotFound）。 */
+function decodeErrorDetail(status: number, detail: string): ApiError {
+  const d = detail || `HTTP ${status}`;
+  return status === 404 ? new NotFound(status, d) : new ApiError(status, d);
 }
 
 export class Client {
@@ -120,6 +127,54 @@ export class Client {
   }
   async exec(id: string, cmd: string): Promise<any> {
     return this.json("POST", `/v1/sandboxes/${id}/exec`, { cmd });
+  }
+  /**
+   * 流式执行：守护以 NDJSON 边跑边推 `{stream,data(base64)}` 逐块 + 末行 `{exit_code}`。
+   * onStdout/onStderr 收到即回调（已 base64 解码为 UTF-8 字符串）；返回聚合 `{exit_code,stdout,stderr}`
+   * （与缓冲式 exec 同形，便于复用 ExecResult）。
+   */
+  async execStream(
+    id: string,
+    cmd: string,
+    handlers: { onStdout?: (data: string) => void; onStderr?: (data: string) => void } = {},
+  ): Promise<{ exit_code: number; stdout: string; stderr: string }> {
+    const body = Buffer.from(JSON.stringify({ cmd }), "utf8");
+    let stdout = "";
+    let stderr = "";
+    let exitCode = 0;
+    let errorDetail = "";
+    const onLine = (line: string) => {
+      let ev: any;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        return; // 容忍非 JSON 行（防御）
+      }
+      if (ev.stream === "stdout") {
+        const s = Buffer.from(ev.data ?? "", "base64").toString("utf8");
+        stdout += s;
+        handlers.onStdout?.(s);
+      } else if (ev.stream === "stderr") {
+        const s = Buffer.from(ev.data ?? "", "base64").toString("utf8");
+        stderr += s;
+        handlers.onStderr?.(s);
+      } else if (typeof ev.exit_code === "number") {
+        exitCode = ev.exit_code;
+      } else if (typeof ev.error === "string") {
+        errorDetail = ev.error; // 守护流前错误体 {"error":".."}
+      }
+    };
+    const { status } = await requestLines("POST", `/v1/sandboxes/${id}/exec/stream`, {
+      body,
+      contentType: "application/json",
+      addr: this.addr,
+      timeoutMs: this.timeoutMs,
+      onLine,
+    });
+    if (status !== 200) {
+      throw decodeErrorDetail(status, errorDetail);
+    }
+    return { exit_code: exitCode, stdout, stderr };
   }
   async putFile(id: string, path: string, data: Uint8Array): Promise<void> {
     const resp = await request("PUT", `/v1/sandboxes/${id}/files/${Client.cleanPath(path)}`, {

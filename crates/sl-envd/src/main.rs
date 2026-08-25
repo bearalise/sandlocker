@@ -14,12 +14,13 @@ use std::mem;
 use std::os::fd::RawFd;
 use std::process::{Command, Stdio};
 use std::ptr;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use sl_proto::{
-    parse_pty_input, read_frame, read_msg, write_msg, FdStream, PtyInput, Request, Response, ENVD_VSOCK_PORT,
+    exec_exit_frame, exec_stderr_frame, exec_stdout_frame, parse_pty_input, read_frame, read_msg, write_msg, FdStream,
+    PtyInput, Request, Response, EXEC_KIND_STDERR, EXEC_KIND_STDOUT, ENVD_VSOCK_PORT,
 };
 
 fn log(msg: &str) {
@@ -231,6 +232,11 @@ fn handle_conn(conn_fd: RawFd) {
             handle_pty(conn_fd, &mut stream, cols, rows);
             break;
         }
+        // 流式 exec：Ok ack 后本连接进流式模式（guest→host 推 exec 输出帧 + 终帧），占用至命令结束。
+        if let Request::ExecStream { cmd } = req {
+            handle_exec_stream(conn_fd, &mut stream, &cmd);
+            break;
+        }
         let resp = dispatch(req);
         if let Err(e) = write_msg(&mut stream, &resp) {
             log(&format!("写响应失败: {e}"));
@@ -246,9 +252,10 @@ fn dispatch(req: Request) -> Response {
         Request::Reinit { seed_hex, hostname, wall_time_ns } => {
             run_reinit(&seed_hex, &hostname, wall_time_ns)
         }
-        // Connect/Pty 由 handle_conn 特判（脱离 dispatch 的 req/resp 模型）；到此属逻辑错误。
+        // Connect/Pty/ExecStream 由 handle_conn 特判（脱离 dispatch 的 req/resp 模型）；到此属逻辑错误。
         Request::Connect { .. } => Response::Error { message: "Connect 应由 handle_conn 处理".into() },
         Request::Pty { .. } => Response::Error { message: "Pty 应由 handle_conn 处理".into() },
+        Request::ExecStream { .. } => Response::Error { message: "ExecStream 应由 handle_conn 处理".into() },
     }
 }
 
@@ -403,6 +410,111 @@ fn pipe_one(from: RawFd, to: RawFd) {
             off += w as usize;
         }
     }
+}
+
+/// 全量写 fd（部分写循环）；对端关闭/出错返回 false。不拥有 fd（不 close）。
+fn write_all_fd(fd: RawFd, buf: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off < buf.len() {
+        let w = unsafe { libc::write(fd, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off) };
+        if w <= 0 {
+            return false;
+        }
+        off += w as usize;
+    }
+    true
+}
+
+/// 直接向裸 vsock fd 写一帧（`u32 大端长度 + 载荷`），不经 FdStream（后者 Drop 会 close，误关 vsock）。
+fn write_frame_fd(fd: RawFd, payload: &[u8]) -> bool {
+    write_all_fd(fd, &(payload.len() as u32).to_be_bytes()) && write_all_fd(fd, payload)
+}
+
+/// 流式执行 `/bin/sh -c cmd`：回 `Ok` ack 后，stdout/stderr 各起一线程边读边以 exec 输出帧推回 host
+/// （写帧持锁串行化，避免两方向交错），两管道 EOF 后再取退出码推一个 exit 帧（保证终帧在所有输出后）。
+/// 退出码经收割表取，语义同 [`run_exec`]（信号终止为 128+signo）。
+fn handle_exec_stream(vsock_fd: RawFd, stream: &mut FdStream, cmd: &str) {
+    log(&format!("exec-stream: {cmd}"));
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // ADR-18：同 run_exec 施加镜像环境（/etc/sl-envd/env）。
+    apply_env_file(&mut command);
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = write_msg(
+                stream,
+                &Response::Error { message: format!("spawn /bin/sh 失败: {e}（rootfs 缺 /bin/sh？）") },
+            );
+            return;
+        }
+    };
+    let pid = child.id() as i32;
+    let out = child.stdout.take().expect("stdout piped");
+    let err = child.stderr.take().expect("stderr piped");
+
+    // ack：spawn 成功后本连接进流式模式。ack 失败（host 断开）→ 杀 child + 回收后返回。
+    if write_msg(stream, &Response::Ok).is_err() {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = wait_reaped(pid);
+        return;
+    }
+
+    // 写帧串行化：两读线程可能同时有数据，一帧的“长度+载荷”必须整体不被打断。
+    let wlock = Arc::new(Mutex::new(()));
+    let out_t = spawn_forwarder(out, vsock_fd, EXEC_KIND_STDOUT, Arc::clone(&wlock));
+    let err_t = spawn_forwarder(err, vsock_fd, EXEC_KIND_STDERR, Arc::clone(&wlock));
+    // 等两管道 EOF（输出收尾）后再取退出码、推 exit 帧——保证 exit 帧排在所有输出帧之后。
+    let _ = out_t.join();
+    let _ = err_t.join();
+    let status = wait_reaped(pid);
+    let exit_code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    };
+    let _g = wlock.lock().unwrap();
+    let _ = write_frame_fd(vsock_fd, &exec_exit_frame(exit_code));
+}
+
+/// 起一线程把 reader 的字节按 kind 打成 exec 输出帧推到 vsock_fd（写帧持 wlock 串行化）。
+/// 写失败（host 断开）后转“继续读并丢弃”，让子进程不被管道填满卡死、能正常退出被收割。
+fn spawn_forwarder<R: Read + Send + 'static>(
+    mut reader: R,
+    vsock_fd: RawFd,
+    kind: u8,
+    wlock: Arc<Mutex<()>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buf = [0u8; 16384];
+        let mut alive = true;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if alive {
+                let frame = if kind == EXEC_KIND_STDERR {
+                    exec_stderr_frame(&buf[..n])
+                } else {
+                    exec_stdout_frame(&buf[..n])
+                };
+                let g = wlock.lock().unwrap();
+                let ok = write_frame_fd(vsock_fd, &frame);
+                drop(g);
+                if !ok {
+                    alive = false; // 继续读丢弃，避免子进程阻塞
+                }
+            }
+        }
+    })
 }
 
 /// ADR-12 恢复后 reinit（W4）：换发克隆身份 + 校时钟。host 在 resume 后、用户代码前下发一次。

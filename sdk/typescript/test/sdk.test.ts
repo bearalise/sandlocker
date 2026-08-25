@@ -83,6 +83,20 @@ function startFakeDaemon(): Promise<{ addr: string; close: () => Promise<void>; 
             const code = mExit ? Number(mExit[1]) : 0;
             return send(res, 200, { exit_code: code, stdout: mExit ? "" : `ran: ${cmd}\n`, stderr: "" });
           }
+          // 流式 exec：NDJSON（每行一 JSON 事件，无 Content-Length）。分多次 write 模拟边跑边推。
+          if (segs.length === 5 && segs[3] === "exec" && segs[4] === "stream" && m === "POST") {
+            if (!exists) return err(res, 404, "no such sandbox");
+            const cmd: string = JSON.parse(body.toString("utf8") || "{}").cmd ?? "";
+            const mExit = /^\s*exit\s+(\d+)/.exec(cmd);
+            const code = mExit ? Number(mExit[1]) : 0;
+            res.writeHead(200, { "Content-Type": "application/x-ndjson", Connection: "close" });
+            const emit = (obj: unknown) => res.write(JSON.stringify(obj) + "\n");
+            emit({ stream: "stdout", data: b64("out1\n") });
+            emit({ stream: "stdout", data: b64("out2\n") });
+            emit({ stream: "stderr", data: b64("err1\n") });
+            emit({ exit_code: code });
+            return res.end();
+          }
           if (segs.length === 4 && segs[3] === "logs" && m === "GET") {
             if (!exists) return err(res, 404, "no such sandbox");
             return send(res, 200, "boot ok\nready\n", "text/plain; charset=utf-8");
@@ -118,7 +132,6 @@ function startFakeDaemon(): Promise<{ addr: string; close: () => Promise<void>; 
     });
   });
 }
-void b64; // reserved helper（保留，未来文件 base64 场景）
 
 // ── 契约对账（三处同步防线，对标 Python test_contract_alignment）────────────
 test("contract alignment: ROUTES == openapi M1 集合", () => {
@@ -129,6 +142,7 @@ test("contract alignment: ROUTES == openapi M1 集合", () => {
     "DELETE /v1/sandboxes/{id}",
     "POST /v1/sandboxes/{id}/keepalive",
     "POST /v1/sandboxes/{id}/exec",
+    "POST /v1/sandboxes/{id}/exec/stream",
     "PUT /v1/sandboxes/{id}/files/{path}",
     "GET /v1/sandboxes/{id}/files/{path}",
     "GET /v1/sandboxes/{id}/logs",
@@ -192,6 +206,48 @@ test("退出码透传 + ok 语义", async () => {
     assert.equal(r.exitCode, 7);
     assert.equal(r.ok, false);
     await sbx.kill();
+  } finally {
+    await d.close();
+  }
+});
+
+test("run 流式：onStdout/onStderr 分离逐块 + 聚合 + 退出码", async () => {
+  const d = await startFakeDaemon();
+  try {
+    const sbx = await Sandbox.create("hello", { addr: d.addr });
+    const outs: string[] = [];
+    const errs: string[] = [];
+    const r = await sbx.run("whatever", { onStdout: (s) => outs.push(s), onStderr: (s) => errs.push(s) });
+    assert.deepEqual(outs, ["out1\n", "out2\n"]); // 逐块（base64 解码回字符串）
+    assert.deepEqual(errs, ["err1\n"]);
+    assert.equal(r.stdout, "out1\nout2\n"); // 聚合
+    assert.equal(r.stderr, "err1\n");
+    assert.equal(r.exitCode, 0);
+    assert.ok(r.ok);
+    await sbx.kill();
+  } finally {
+    await d.close();
+  }
+});
+
+test("run 流式：退出码透传", async () => {
+  const d = await startFakeDaemon();
+  try {
+    const sbx = await Sandbox.create("hello", { addr: d.addr });
+    const r = await sbx.run("exit 7", { onStdout: () => {} });
+    assert.equal(r.exitCode, 7);
+    assert.equal(r.ok, false);
+    await sbx.kill();
+  } finally {
+    await d.close();
+  }
+});
+
+test("run 流式：未知沙箱 → NotFound", async () => {
+  const d = await startFakeDaemon();
+  try {
+    const ghost = await Sandbox.connect("nope", { addr: d.addr, verify: false });
+    await assert.rejects(ghost.run("x", { onStdout: () => {} }), (e: unknown) => e instanceof NotFound);
   } finally {
     await d.close();
   }

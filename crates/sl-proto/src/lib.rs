@@ -23,6 +23,10 @@ pub enum Request {
     Ping { data: String },
     /// W3 同步执行：经 `/bin/sh -c cmd` 运行，阻塞到结束回传全部输出。
     Exec { cmd: String },
+    /// 流式执行：经 `/bin/sh -c cmd` 运行。回 [`Response::Ok`] ack 后，**guest→host** 边跑边推
+    /// exec 输出帧（[`exec_stdout_frame`]/[`exec_stderr_frame`]，末尾一个 [`exec_exit_frame`]）；
+    /// 与 [`Request::Exec`] 的一次性聚合相对（stdout/stderr 分离、逐块）。
+    ExecStream { cmd: String },
     /// W4 ADR-12：恢复后重置克隆身份。host 在 resume 之后、用户代码之前下发一次。
     /// 快照被同一模板反复 restore，若不换发则所有克隆共享身份/熵——安全红线。
     ///   seed_hex：host 生成的每恢复唯一 32B 熵（hex），guest 混入 /dev/urandom，
@@ -74,6 +78,57 @@ pub fn parse_pty_input(payload: &[u8]) -> Option<PtyInput> {
             cols: u16::from_be_bytes([payload[1], payload[2]]),
             rows: u16::from_be_bytes([payload[3], payload[4]]),
         }),
+        _ => None,
+    }
+}
+
+/// exec 输出帧种类（guest→host，装进 [`write_frame`] 的 payload 首字节）。
+/// [`Request::ExecStream`] ack 之后的每一帧都以此标记打头。
+pub const EXEC_KIND_STDOUT: u8 = 0;
+pub const EXEC_KIND_STDERR: u8 = 1;
+pub const EXEC_KIND_EXIT: u8 = 2;
+
+/// guest 编码：一段 stdout 字节 → 输出帧（payload = [0] ++ data）。
+pub fn exec_stdout_frame(data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(1 + data.len());
+    p.push(EXEC_KIND_STDOUT);
+    p.extend_from_slice(data);
+    p
+}
+
+/// guest 编码：一段 stderr 字节 → 输出帧（payload = [1] ++ data）。
+pub fn exec_stderr_frame(data: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(1 + data.len());
+    p.push(EXEC_KIND_STDERR);
+    p.extend_from_slice(data);
+    p
+}
+
+/// guest 编码：退出码 → 终帧（payload = [2, code_be(4)]）。退出码约定同 [`Response::Exec`]：
+/// 正常退出为进程码，被信号终止为 128+signo。
+pub fn exec_exit_frame(code: i32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5);
+    p.push(EXEC_KIND_EXIT);
+    p.extend_from_slice(&code.to_be_bytes());
+    p
+}
+
+/// host 解析：一个 exec 输出帧 payload → 语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
+}
+
+/// host 解析 exec 输出帧 payload（`read_frame` 得到的字节）；格式非法返回 None。
+pub fn parse_exec_output(payload: &[u8]) -> Option<ExecOutput> {
+    match payload.first().copied()? {
+        EXEC_KIND_STDOUT => Some(ExecOutput::Stdout(payload[1..].to_vec())),
+        EXEC_KIND_STDERR => Some(ExecOutput::Stderr(payload[1..].to_vec())),
+        EXEC_KIND_EXIT if payload.len() == 5 => {
+            Some(ExecOutput::Exit(i32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]])))
+        }
         _ => None,
     }
 }
@@ -293,5 +348,36 @@ mod tests {
             }
             other => panic!("解析错误: {other:?}"),
         }
+    }
+
+    #[test]
+    fn exec_stream_request_roundtrip() {
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &Request::ExecStream { cmd: "echo hi".into() }).unwrap();
+        let mut cur = Cursor::new(buf);
+        match read_msg::<_, Request>(&mut cur).unwrap() {
+            Request::ExecStream { cmd } => assert_eq!(cmd, "echo hi"),
+            other => panic!("解析错误: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_output_frames_roundtrip() {
+        // stdout/stderr 帧：首字节标记 + 原始字节（可含非 UTF-8）
+        let o = exec_stdout_frame(b"out\xff");
+        assert_eq!(o[0], EXEC_KIND_STDOUT);
+        assert_eq!(parse_exec_output(&o), Some(ExecOutput::Stdout(b"out\xff".to_vec())));
+        let e = exec_stderr_frame(b"err");
+        assert_eq!(parse_exec_output(&e), Some(ExecOutput::Stderr(b"err".to_vec())));
+        // exit 帧：i32 大端（含负值/信号约定值）
+        assert_eq!(parse_exec_output(&exec_exit_frame(7)), Some(ExecOutput::Exit(7)));
+        assert_eq!(parse_exec_output(&exec_exit_frame(137)), Some(ExecOutput::Exit(137)));
+        assert_eq!(parse_exec_output(&exec_exit_frame(-1)), Some(ExecOutput::Exit(-1)));
+        // 空 stdout 合法（payload = [0]）
+        assert_eq!(parse_exec_output(&exec_stdout_frame(b"")), Some(ExecOutput::Stdout(Vec::new())));
+        // 非法
+        assert_eq!(parse_exec_output(&[]), None);
+        assert_eq!(parse_exec_output(&[EXEC_KIND_EXIT, 1, 2]), None);
+        assert_eq!(parse_exec_output(&[9, 9, 9]), None);
     }
 }

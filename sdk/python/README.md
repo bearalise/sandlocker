@@ -53,6 +53,7 @@ with Sandbox.create(template="hello", timeout=300) as sbx:   # timeout → ttl�
 | `Sandbox.connect(id, addr=..., verify=True)` | **附着**到已有沙箱拿句柄；`verify=False` 惰性绑定（不打网络，错误延迟到首个操作） | `GET /v1/sandboxes/{id}`（`verify=False` 时不发） |
 | `Sandbox.get(id, addr=...)` / `sbx.info()` | 取元数据（`connect` 的校验式别名） | `GET /v1/sandboxes/{id}` |
 | `sbx.run(cmd) -> ExecResult` | 跑命令（缓冲式，退出码透传） | `POST /v1/sandboxes/{id}/exec` |
+| `sbx.run(cmd, on_stdout=…, on_stderr=…)` | 流式跑命令：回调逐块收 stdout/stderr（分离），返回聚合 ExecResult | `POST /v1/sandboxes/{id}/exec/stream` |
 | `sbx.files.write(path, data)` | 写文件 | `PUT /v1/sandboxes/{id}/files/{path}` |
 | `sbx.files.read(path) -> bytes` | 读文件 | `GET /v1/sandboxes/{id}/files/{path}` |
 | `sbx.logs() -> str` | 取日志 | `GET /v1/sandboxes/{id}/logs` |
