@@ -921,15 +921,21 @@ pub(crate) fn restore_park(cfg: &Config, ctx: &RestoreCtx) -> Result<ParkedVm, S
             c.arg("netns").arg("exec").arg(ns).arg(&cfg.fc_bin).arg("--api-sock").arg(&api_host);
             c
         }
-        // rootless mount-ns bind（M1 逐字节不变）。
+        // rootless mount-ns bind（M1 逐字节不变）。root 守护（egress 场景）下 user-ns 映射 root
+        // 里 bind 挂载会 EPERM（mount 退 32）——root 本就有 CAP_SYS_ADMIN，直接 mount-ns，无需 user-ns。
         (Some((src, dst)), None) => {
             let script = format!(
                 "mount --bind {} {} && exec {} --api-sock {}",
                 sq(src), sq(dst), sq(&cfg.fc_bin), sq(&api_host)
             );
+            let as_root = unsafe { libc::geteuid() } == 0;
             let mut c = Command::new("unshare");
-            c.arg("--user").arg("--map-root-user").arg("--mount").arg("--propagation").arg("private")
-                .arg("sh").arg("-c").arg(script);
+            if as_root {
+                c.arg("--mount").arg("--propagation").arg("private");
+            } else {
+                c.arg("--user").arg("--map-root-user").arg("--mount").arg("--propagation").arg("private");
+            }
+            c.arg("sh").arg("-c").arg(script);
             c
         }
         // 直呼 FC（M1 逐字节不变）。
