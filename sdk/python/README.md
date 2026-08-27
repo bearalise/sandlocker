@@ -48,7 +48,7 @@ with Sandbox.create(template="hello", timeout=300) as sbx:   # timeout → ttl�
 
 | 调用 | 说明 | REST 端点 |
 |---|---|---|
-| `Sandbox.create(template, timeout=300, idle=None, cpu=None, mem=None, env=None, addr=...)` | 创建并启动（走快照恢复，秒级） | `POST /v1/sandboxes` |
+| `Sandbox.create(template, timeout=300, idle=None, cpu=None, mem=None, env=None, network=None, addr=...)` | 创建并启动（走快照恢复，秒级）；`network="egress"` = 冷启动带 NIC 可出站（npm/pip，仅 FC+root，较慢不进池） | `POST /v1/sandboxes` |
 | `Sandbox.list(addr=...) -> [SandboxInfo]` | 列出沙箱 | `GET /v1/sandboxes` |
 | `Sandbox.connect(id, addr=..., verify=True)` | **附着**到已有沙箱拿句柄；`verify=False` 惰性绑定（不打网络，错误延迟到首个操作） | `GET /v1/sandboxes/{id}`（`verify=False` 时不发） |
 | `Sandbox.get(id, addr=...)` / `sbx.info()` | 取元数据（`connect` 的校验式别名） | `GET /v1/sandboxes/{id}` |

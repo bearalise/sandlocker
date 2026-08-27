@@ -202,6 +202,9 @@ struct Config {
     /// --exec-stream-reconcile <模板目录>：流式 exec 对账（逐块到达 + stdout/stderr 分离 + 退出码
     /// 透传 + 零残留），随后退出。免 root（走恢复路径）。
     exec_stream_reconcile: Option<PathBuf>,
+    /// --net-egress-reconcile <模板目录>：运行时网络出口对账（network:egress 冷启动带 NIC + DNS/NAT
+    /// 出站 + destroy 零残留），随后退出。需 root+KVM+nft（非 root skip）。
+    net_egress_reconcile: Option<PathBuf>,
     /// --expose-reconcile <模板目录>：端口暴露 L4 透传对账（keep-alive/非 GET/流式/并发/拆除/零残留），
     /// 随后退出。免 root（走恢复路径）。
     expose_reconcile: Option<PathBuf>,
@@ -360,6 +363,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[exec-stream] exec-stream-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --net-egress-reconcile：运行时网络出口对账（冷启动带 NIC + DNS/NAT 出站 + destroy 零残留）。
+    if let Some(tpl) = cfg.net_egress_reconcile.clone() {
+        match orch::net_egress_reconcile(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[egress] net-egress-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -1481,6 +1496,92 @@ fn send_reinit(
     }
 }
 
+/// 冷启动一台**带 NIC** 的 microVM 进 `net` 的 netns，到 sl-envd 就绪 → guest 配 eth0/默认路由/DNS →
+/// Reinit 换发身份。返回 `(Child, machine_id, rng_hex, session_key_hex)`。供运行时 egress 沙箱
+/// （[`crate::fcbackend`] `create_egress`）与 `--net-egress-reconcile` 共用。需 root（进 netns）。
+///
+/// 与恢复路径正交：egress 沙箱无快照可用（快照无网卡），故冷启动;身份天然全新（无克隆熵问题），
+/// 仍下发 Reinit 以物化 machine-id/hostname/会话密钥并校时钟。开放出口由调用方（不挂 nftfw drop 门禁）决定。
+#[allow(clippy::type_complexity)]
+pub(crate) fn cold_boot_egress(
+    cfg: &Config,
+    instance_dir: &Path,
+    net: &netlive::LiveNet,
+    vcpus: u32,
+    mem_mib: u32,
+) -> Result<(Child, String, String, String), String> {
+    let kernel = abspath(&cfg.kernel)?;
+    let rootfs = instance_dir.join("rootfs.ext4");
+    let api_host = instance_dir.join("api.sock");
+    let vsock = instance_dir.join("vsock.sock");
+    let console = instance_dir.join("console.load.log");
+    let _ = std::fs::remove_file(&api_host);
+    let _ = std::fs::remove_file(&vsock);
+
+    let mut c = Command::new("ip");
+    c.arg("netns").arg("exec").arg(&net.ns).arg(&cfg.fc_bin).arg("--api-sock").arg(&api_host);
+    let mut child = spawn_with_log(c, &console)?;
+
+    let boot = (|| -> Result<(String, String, String), String> {
+        let api = FcApi::new(&api_host);
+        wait_api_ready(&api, &mut child)?;
+        api.put("/machine-config", &format!(r#"{{"vcpu_count":{vcpus},"mem_size_mib":{mem_mib}}}"#))?;
+        api.put(
+            "/boot-source",
+            &format!(r#"{{"kernel_image_path":"{}","boot_args":"{}"}}"#, kernel.display(), boot_args()),
+        )?;
+        api.put(
+            "/drives/rootfs",
+            &format!(
+                r#"{{"drive_id":"rootfs","path_on_host":"{}","is_root_device":true,"is_read_only":false}}"#,
+                rootfs.display()
+            ),
+        )?;
+        api.put(
+            "/network-interfaces/eth0",
+            &format!(r#"{{"iface_id":"eth0","host_dev_name":"{}","guest_mac":"{GUEST_MAC}"}}"#, net.tap()),
+        )?;
+        api.put("/vsock", &format!(r#"{{"guest_cid":{GUEST_CID},"uds_path":"{}"}}"#, vsock.display()))?;
+        api.put("/actions", r#"{"action_type":"InstanceStart"}"#)?;
+
+        let mut stream = wait_guest(&vsock, &mut child)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| format!("设读超时失败: {e}"))?;
+        match request(&mut stream, &Request::Ping { data: "egress".into() })? {
+            Response::Pong { data } if data == "egress" => {}
+            other => return Err(format!("guest Ping 自检失败: {other:?}")),
+        }
+        // guest 侧接线：静态 eth0 + 默认路由 + DNS（不依赖内核 IP autoconfig；DNS 走 NAT 出 uplink）。
+        let dns = std::env::var("SL_EGRESS_DNS").unwrap_or_else(|_| "1.1.1.1".into());
+        let netup = format!(
+            "ip addr add {}/30 dev eth0 && ip link set eth0 up && ip route add default via {} && printf 'nameserver {dns}\\n' > /etc/resolv.conf",
+            net.guest_ip(),
+            net.gateway_ip()
+        );
+        let (rc, _o, e) = exec(&mut stream, &netup)?;
+        if rc != 0 {
+            return Err(format!("guest 配网失败（rc={rc}）: {}", e.trim()));
+        }
+        // Reinit：换发 machine-id/hostname/会话密钥 + 混种子 + 校时钟（冷启动身份物化）。
+        let mut seed = [0u8; 32];
+        host_random(&mut seed);
+        let seed_hex = hex(&seed);
+        let hostname = format!("sandlocker-{}", hex(&seed[..4]));
+        let wall_time_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        send_reinit(&mut stream, &seed_hex, &hostname, wall_time_ns)
+    })();
+
+    match boot {
+        Ok((mid, rng, sess)) => Ok((child, mid, rng, sess)),
+        Err(e) => {
+            kill_group(&mut child);
+            Err(e)
+        }
+    }
+}
+
 /// host 侧填充随机字节（libc::getrandom；短读重试）。
 fn host_random(buf: &mut [u8]) {
     let mut off = 0;
@@ -1810,7 +1911,7 @@ fn drive_exec(cfg: &Config, uds_path: &Path, child: &mut Child, spawn_at: Instan
 }
 
 /// 发一个 Exec 请求，返回 (exit_code, stdout, stderr)。
-fn exec(stream: &mut UnixStream, cmd: &str) -> Result<(i32, String, String), String> {
+pub(crate) fn exec(stream: &mut UnixStream, cmd: &str) -> Result<(i32, String, String), String> {
     match request(stream, &Request::Exec { cmd: cmd.into() })? {
         Response::Exec { exit_code, stdout, stderr } => Ok((exit_code, stdout, stderr)),
         Response::Error { message } => Err(format!("envd 执行错误: {message}")),
@@ -2036,6 +2137,7 @@ fn clone_paths(cfg: &Config) -> Config {
         gw_reconcile: None,
         pty_reconcile: None,
         exec_stream_reconcile: None,
+        net_egress_reconcile: None,
         expose_reconcile: None,
         expose_allow_public: false,
     }
@@ -2161,6 +2263,7 @@ fn parse_args() -> Config {
         gw_reconcile: None,
         pty_reconcile: None,
         exec_stream_reconcile: None,
+        net_egress_reconcile: None,
         expose_reconcile: None,
         expose_allow_public: false,
     };
@@ -2217,6 +2320,7 @@ fn parse_args() -> Config {
             "--gw-reconcile" => cfg.gw_reconcile = Some(PathBuf::from(take())),
             "--pty-reconcile" => cfg.pty_reconcile = Some(PathBuf::from(take())),
             "--exec-stream-reconcile" => cfg.exec_stream_reconcile = Some(PathBuf::from(take())),
+            "--net-egress-reconcile" => cfg.net_egress_reconcile = Some(PathBuf::from(take())),
             "--expose-reconcile" => cfg.expose_reconcile = Some(PathBuf::from(take())),
             "--expose-allow-public" => cfg.expose_allow_public = true,
             "--serve" => cfg.serve = true,
@@ -2237,7 +2341,7 @@ fn parse_args() -> Config {
             "run" => {}
             other => {
                 eprintln!("未知参数: {other}");
-                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--abi-contract 模板DIR] [--q5-reconcile 模板DIR] [--gw-reconcile 模板DIR] [--pty-reconcile 模板DIR] [--exec-stream-reconcile 模板DIR] [--serve] [--gw-addr host:port] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
+                eprintln!("用法: sl-node [run] [--boot api|config-file|jailer] [--kernel P] [--rootfs P] [--fc P] [--jailer P] [--workdir P] [--cmd \"命令\"] [--snap-create DIR] [--snap-load DIR] [--clone-entropy-check DIR] [--dmthin-reconcile] [--nftfw-reconcile] [--net-gate-reconcile] [--net-live-reconcile 模板DIR] [--net-live] [--uplink IFACE] [--thin] [--oci-pull ref|archive] [--oci-out PATH] [--build sandlocker.toml] [--store DIR] [--orch-reconcile 模板DIR] [--orch-bench 模板DIR] [--pool-bench 模板DIR] [--gvisor-reconcile 模板DIR] [--abi-contract 模板DIR] [--q5-reconcile 模板DIR] [--gw-reconcile 模板DIR] [--pty-reconcile 模板DIR] [--exec-stream-reconcile 模板DIR] [--net-egress-reconcile 模板DIR] [--serve] [--gw-addr host:port] [--addr host:port] [--tick-secs N] [--template-root DIR] [--run-root DIR] [--pool-size N] [--pool-template NAME] [--hot-size N] [--gvisor] [--gvisor-bin PATH] [--no-netns] [--uid N] [--gid N] [--cycles N] [--json] [--hold-secs N]");
                 std::process::exit(2);
             }
         }

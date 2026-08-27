@@ -472,7 +472,7 @@ components:
           type: array
           items:
             type: string
-            enum: [pause_resume, snapshot_fork, prebake_snapshot, gpu_passthrough, persistent_volume]
+            enum: [pause_resume, snapshot_fork, prebake_snapshot, gpu_passthrough, persistent_volume, network_egress]
           description: >
             要求后端具备的能力集（ADR-14）。后端不满足即创建期返回 UNSUPPORTED_BY_BACKEND；
             未知能力名恒不被满足。缺省空（不约束）。
@@ -481,6 +481,15 @@ components:
           enum: [fc, gvisor]
           description: >
             显式选后端（ADR-14，M2 W7）。缺省 fc。无此后端（如 gVisor 未注册）即 UNSUPPORTED_BY_BACKEND。
+        network:
+          type: string
+          enum: [none, egress]
+          default: none
+          description: >
+            运行时网络（FR-3.3）。none（默认）= 无网卡（快照恢复，秒级，出口为零）；egress = 冷启动进
+            per-instance netns 带 NIC + NAT，可出站（npm/pip install，开放出口无过滤）。egress 仅 FC
+            后端且守护 root 运行（隐含 network_egress 能力），否则 create 期 UNSUPPORTED_BY_BACKEND；
+            egress 沙箱走冷启动（比恢复慢）、不进池。
     Sandbox:
       type: object
       properties:

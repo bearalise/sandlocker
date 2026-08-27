@@ -52,6 +52,7 @@ function startFakeDaemon(): Promise<{ addr: string; close: () => Promise<void>; 
               created_at: 1000,
               ttl_deadline: 1000 + (b.ttl ?? 300),
               labels: b.env ?? {},
+              network: b.network ?? "none", // 回显以便断言 SDK 透传 network 选项
             });
             return send(res, 201, meta);
           }
@@ -266,6 +267,20 @@ test("list / get / templates", async () => {
     const tpls = await Template.list({ addr: d.addr });
     assert.equal(tpls[0]!.name, "hello");
     await a.kill();
+  } finally {
+    await d.close();
+  }
+});
+
+test("create：network 选项透传到 body（none 不发 / egress 发）", async () => {
+  const d = await startFakeDaemon();
+  try {
+    const a = await Sandbox.create("hello", { addr: d.addr });
+    assert.equal(d.state.sandboxes.get(a.id).network, "none"); // 缺省不发 → 守护默认 none
+    const b = await Sandbox.create("hello", { addr: d.addr, network: "egress" });
+    assert.equal(d.state.sandboxes.get(b.id).network, "egress");
+    await a.kill();
+    await b.kill();
   } finally {
     await d.close();
   }

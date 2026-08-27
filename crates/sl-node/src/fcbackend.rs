@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{BackendCreate, Capabilities, Capability, ExecTarget, SandboxBackend};
 use crate::fcapi::FcApi;
-use crate::orch::{prepare_instance_dir, SandboxSpec};
+use crate::netlive::{self, LiveNet};
+use crate::orch::{cp_reflink, prepare_instance_dir, NetworkMode, SandboxSpec};
 use crate::pool::{HotPool, HotSlot, WarmPool};
 use crate::{
-    abspath, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome, RestoreCtx,
+    abspath, cold_boot_egress, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome,
+    RestoreCtx,
 };
 
 /// 后端独占的在册实例：FC 进程 + 实例目录 + 原始模板 + ADR-12 克隆身份 + 暂停态标记。
@@ -29,6 +31,9 @@ struct FcInst {
     machine_id: String,
     /// M2 W9：已暂停（快照落盘 + VM 停）。paused 时不可 exec；resume 从快照拉起。
     paused: bool,
+    /// 运行时 egress（冷启动带 NIC）：持 live 网络句柄，销毁时 `down()` 拆 netns/veth/nft/iptables。
+    /// None = 普通（无网卡）恢复态沙箱。
+    net: Option<LiveNet>,
 }
 
 /// Firecracker 后端。持 cfg（借用，serve 侧 `'static`）+ run_root + 自有在册表 + 温/热池。
@@ -83,6 +88,65 @@ impl<'a> FcBackend<'a> {
         Ok(self.register_inst(id, dir, template.to_path_buf(), child, o, 0, activate_ms, true, true))
     }
 
+    /// 运行时 egress 创建（开放出口 MVP）：冷启动一台带 NIC 的 VM 进 per-instance netns，可出站
+    /// （npm/pip install）。与恢复路径正交——egress 沙箱无快照可用（快照无网卡）。步骤：
+    /// ① 私有 rootfs 副本（冷启动会写，须私有；vmstate/mem 不需要）→ ② `LiveNet::up`（netns+veth+tap+NAT，
+    /// **不挂 nftfw drop 门禁** = 开放出口）→ ③ `cold_boot_egress`（boot+配网+DNS+Reinit）→ ④ 登记（挂 net 供拆网）。
+    /// 需 root（capabilities() 已门控）；失败即拆网 + 删目录，零残留。
+    fn create_egress(&mut self, template: &Path, spec: &SandboxSpec) -> Result<BackendCreate, String> {
+        let t = Instant::now();
+        let mut idb = [0u8; 6];
+        host_random(&mut idb);
+        let id = hex(&idb);
+        let dir = self.run_root.join(&id);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("建实例目录失败: {e}"))?;
+        let dir = abspath(&dir)?;
+        // 私有 rootfs 副本（reflink 优先→回退全拷）；冷启动只需 rootfs（无 vmstate/mem）。
+        if let Err(e) = cp_reflink(&template.join("rootfs.ext4"), &dir.join("rootfs.ext4")) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        // live 网络：per-instance netns + tap + NAT masquerade（开放出口=不调 gate_up）。
+        let root = unsafe { libc::geteuid() } == 0;
+        let uplink = self.cfg.uplink.clone().or_else(|| netlive::detect_uplink(root)).unwrap_or_else(|| "lo".into());
+        let ns = netlive::ns_for(&id);
+        let net = match LiveNet::up(&id, &ns, &uplink, root) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(format!("egress 起 live 网络失败: {e}"));
+            }
+        };
+        // 冷启动带 NIC + 配网 + DNS + Reinit。失败即拆网 + 删目录。
+        let (child, machine_id, rng_hex, session_key_hex) =
+            match cold_boot_egress(self.cfg, &dir, &net, spec.vcpus, spec.mem_mib) {
+                Ok(v) => v,
+                Err(e) => {
+                    net.down();
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(format!("egress 冷启动失败: {e}"));
+                }
+            };
+        let total_ms = t.elapsed().as_millis();
+        self.live.insert(
+            id.clone(),
+            FcInst { child, dir, template: template.to_path_buf(), machine_id: machine_id.clone(), paused: false, net: Some(net) },
+        );
+        Ok(BackendCreate {
+            id,
+            machine_id,
+            rng_hex,
+            session_key_hex,
+            total_ms,
+            copy_ms: 0,
+            api_ready_ms: 0,
+            load_ms: 0,
+            resume_ms: 0,
+            pool_hit: false,
+            hot_hit: false,
+        })
+    }
+
     /// 存 `FcInst` 到自有在册表，组装 `BackendCreate`（编排 lease/meta 由 Orch 依此包装）。
     /// `template` 记入 FcInst——resume/fork 须以**原始模板**做 bind（快照烘焙的是模板绝对路径）。
     #[allow(clippy::too_many_arguments)]
@@ -99,7 +163,8 @@ impl<'a> FcBackend<'a> {
         hot_hit: bool,
     ) -> BackendCreate {
         let machine_id = o.machine_id.clone();
-        self.live.insert(id.clone(), FcInst { child, dir, template, machine_id: machine_id.clone(), paused: false });
+        self.live
+            .insert(id.clone(), FcInst { child, dir, template, machine_id: machine_id.clone(), paused: false, net: None });
         BackendCreate {
             id,
             machine_id,
@@ -122,14 +187,26 @@ impl SandboxBackend for FcBackend<'_> {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::with(&[Capability::PauseResume, Capability::PrebakeSnapshot, Capability::SnapshotFork])
+        let mut caps =
+            Capabilities::with(&[Capability::PauseResume, Capability::PrebakeSnapshot, Capability::SnapshotFork]);
+        // 运行时 egress 需 netns/nft/ip（root）→ 仅 root 守护报告 NetworkEgress。非 root 请求 egress 在
+        // orch::select_backend 以 UNSUPPORTED_BY_BACKEND 清晰拒绝（不静默降级为无网）。
+        if unsafe { libc::geteuid() } == 0 {
+            caps.insert(Capability::NetworkEgress);
+        }
+        caps
     }
 
-    fn create(&mut self, template: &Path, _spec: &SandboxSpec) -> Result<BackendCreate, String> {
+    fn create(&mut self, template: &Path, spec: &SandboxSpec) -> Result<BackendCreate, String> {
         if !template.is_dir() {
             return Err(format!("模板目录不存在: {}（先跑 --build / --snap-create）", template.display()));
         }
         let template = abspath(template)?;
+
+        // 运行时 egress：无快照可用（快照无网卡）→ 冷启动带 NIC 路径，不进池。
+        if spec.network == NetworkMode::Egress {
+            return self.create_egress(&template, spec);
+        }
 
         // 三段式（M2 W5）：hot → warm → cold。命中**热池**最快——暂停态 VM 只 activate（resume+reinit），
         // FC spawn + snapshot load 已在关键路径外；其次**温池**（省 copy）；再次**冷路径**（现场 copy）。
@@ -181,6 +258,10 @@ impl SandboxBackend for FcBackend<'_> {
     fn destroy(&mut self, id: &str) {
         if let Some(mut inst) = self.live.remove(id) {
             kill_group(&mut inst.child);
+            // egress 沙箱：拆 live 网络（netns/veth/nft/iptables，幂等）——先杀 VM 再拆网。
+            if let Some(net) = &inst.net {
+                net.down();
+            }
             let _ = std::fs::remove_dir_all(&inst.dir);
         }
     }

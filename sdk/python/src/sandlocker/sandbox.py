@@ -59,6 +59,7 @@ class Sandbox:
         cpu=None,
         mem=None,
         env=None,
+        network=None,
         addr=DEFAULT_ADDR,
         client=None,
     ):
@@ -70,6 +71,8 @@ class Sandbox:
         idle    : 空闲回收窗口（秒），缺省 = ttl（服务端语义）。
         cpu/mem : vCPU 数 / 内存 MiB，缺省用守护默认（2 / 512）。
         env     : dict[str,str]，注入为沙箱 labels/元数据。
+        network : "none"（默认）| "egress"。egress = 冷启动带 NIC 可出站（npm/pip install，
+                  开放出口）；仅 FC 后端 + 守护 root，且走冷启动（比恢复慢）、不进池。
         """
         c = client or Client(addr=addr)
         body = {"template": template, "ttl": int(timeout)}
@@ -81,6 +84,8 @@ class Sandbox:
             body["mem"] = int(mem)
         if env:
             body["env"] = dict(env)
+        if network and network != "none":
+            body["network"] = network
         resp = c.create_sandbox(body)
         sid = resp.get("id")
         if not sid:

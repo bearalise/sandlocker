@@ -32,16 +32,20 @@ pub enum Capability {
     GpuPassthrough,
     /// 持久卷（MVP 无）。
     PersistentVolume,
+    /// 运行时网络出口（FR-3.3）：沙箱冷启动进 per-instance netns + tap + NAT，可出站（npm/pip install）。
+    /// 仅 FC 后端且守护以 root 运行时具备（netns/nft/ip 需 root）。
+    NetworkEgress,
 }
 
 impl Capability {
     /// 全部能力（`from_names` 校验 + 遍历用）。
-    pub const ALL: [Capability; 5] = [
+    pub const ALL: [Capability; 6] = [
         Capability::PauseResume,
         Capability::SnapshotFork,
         Capability::PrebakeSnapshot,
         Capability::GpuPassthrough,
         Capability::PersistentVolume,
+        Capability::NetworkEgress,
     ];
 
     /// 契约用 snake_case 名（API/能力集串）。
@@ -52,6 +56,7 @@ impl Capability {
             Capability::PrebakeSnapshot => "prebake_snapshot",
             Capability::GpuPassthrough => "gpu_passthrough",
             Capability::PersistentVolume => "persistent_volume",
+            Capability::NetworkEgress => "network_egress",
         }
     }
 
