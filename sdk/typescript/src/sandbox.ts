@@ -32,6 +32,11 @@ export interface CreateOptions {
   mem?: number;
   /** 注入为沙箱 labels/元数据。 */
   env?: Record<string, string>;
+  /**
+   * 运行时网络（FR-3.3）。`"none"`（默认）= 无网卡；`"egress"` = 冷启动带 NIC 可出站
+   * （npm/pip install，开放出口）。egress 仅 FC 后端 + 守护 root，且走冷启动（比恢复慢）、不进池。
+   */
+  network?: "none" | "egress";
   addr?: string;
   client?: Client;
 }
@@ -63,6 +68,7 @@ export class Sandbox {
     if (opts.cpu != null) body.cpu = Math.trunc(opts.cpu);
     if (opts.mem != null) body.mem = Math.trunc(opts.mem);
     if (opts.env && Object.keys(opts.env).length > 0) body.env = { ...opts.env };
+    if (opts.network && opts.network !== "none") body.network = opts.network;
     const resp = await c.createSandbox(body);
     const id = resp?.id;
     if (!id) throw new ApiError(201, `create 响应缺 id: ${JSON.stringify(resp)}`);

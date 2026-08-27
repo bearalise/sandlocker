@@ -27,7 +27,7 @@ use sl_proto::{parse_exec_output, read_frame, read_msg, write_msg, ExecOutput, R
 use crate::backend::{Capabilities, ExecTarget, UNSUPPORTED_BY_BACKEND};
 use crate::expose::{self, ExposeHandle};
 use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
-use crate::orch::{Orch, SandboxSpec};
+use crate::orch::{NetworkMode, Orch, SandboxSpec};
 use crate::{connect_guest, Config};
 
 /// 守护共享态：orchestrator（互斥）+ 模板仓库根（模板名→目录解析）。
@@ -509,6 +509,13 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
     };
     // M2 W7：可选 backend 字段（"fc"/"gvisor"）显式选后端；缺省 fc。
     let backend = v.get("backend").and_then(|x| x.as_str()).map(|s| s.to_string());
+    // 运行时网络（FR-3.3）：可选 network 字段 "none"（默认）| "egress"。egress → 冷启动带 NIC 可出站
+    // （npm/pip install），仅 FC+root（能力门控，非法值/非支持后端 create 期报错）。
+    let network = match v.get("network").and_then(|x| x.as_str()) {
+        None | Some("none") => NetworkMode::None,
+        Some("egress") => NetworkMode::Egress,
+        Some(other) => return Err(format!("network 取值 none|egress，得到 {other:?}")),
+    };
     let spec = SandboxSpec {
         vcpus: cpu,
         mem_mib: mem,
@@ -517,6 +524,7 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
         metadata,
         required_capabilities,
         backend,
+        network,
     };
 
     // 建走恢复（~130ms），全程持锁——单机 MVP 串行（如实标注）。

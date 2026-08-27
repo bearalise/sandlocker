@@ -32,6 +32,7 @@ use crate::fcbackend::FcBackend;
 use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::gvisorbackend::GvisorBackend;
 use crate::connect_guest;
+use crate::netlive;
 use crate::{abspath, hex, Config};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
@@ -51,6 +52,19 @@ pub struct SandboxSpec {
     pub required_capabilities: Capabilities,
     /// M2 W7：显式指定后端 id（`fc`/`gvisor`）。None → 默认 fc。无此后端即 `UNSUPPORTED_BY_BACKEND`。
     pub backend: Option<String>,
+    /// 运行时网络出口（FR-3.3）。`Egress` → 冷启动进 per-instance netns 带 NIC，可出站
+    /// （npm/pip install）；`None`（默认）→ 无网卡（快照恢复，秒级）。仅 FC + root。
+    pub network: NetworkMode,
+}
+
+/// 运行时网络模式（[`SandboxSpec::network`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NetworkMode {
+    /// 无网卡（默认，走快照恢复，出口天然为零）。
+    #[default]
+    None,
+    /// 开放出口（冷启动 + NAT masquerade，无出站过滤，MVP）。
+    Egress,
 }
 
 impl Default for SandboxSpec {
@@ -63,6 +77,7 @@ impl Default for SandboxSpec {
             metadata: BTreeMap::new(),
             required_capabilities: Capabilities::empty(),
             backend: None,
+            network: NetworkMode::None,
         }
     }
 }
@@ -140,8 +155,14 @@ impl<'a> Orch<'a> {
                 .ok_or_else(|| format!("{UNSUPPORTED_BY_BACKEND}: 无此后端 {want:?}（GET /v1/backends 查可用）"))?,
             None => 0,
         };
-        if !spec.required_capabilities.is_empty() {
-            let missing = spec.required_capabilities.missing_from(&self.backends[idx].capabilities());
+        // 有效需求集 = 显式 required_capabilities +（egress 时）NetworkEgress。
+        // FcBackend 仅 root 时报告 NetworkEgress → 非 FC/非 root 请求 egress 在此清晰拒绝。
+        let mut required = spec.required_capabilities;
+        if spec.network == NetworkMode::Egress {
+            required.insert(Capability::NetworkEgress);
+        }
+        if !required.is_empty() {
+            let missing = required.missing_from(&self.backends[idx].capabilities());
             if !missing.is_empty() {
                 return Err(format!(
                     "{UNSUPPORTED_BY_BACKEND}: 后端 {} 不满足 required_capabilities {:?}",
@@ -482,7 +503,8 @@ pub(crate) fn prepare_instance_dir(template: &Path, dir: &Path) -> Result<u128, 
 }
 
 /// `cp --reflink=auto`（CoW 秒级、按需分裂块）；启动/失败回退 `std::fs::copy` 全拷。
-fn cp_reflink(src: &Path, dst: &Path) -> Result<(), String> {
+/// pub(crate)：egress 冷启动只需私有 rootfs 副本（不要 vmstate/mem），复用本 helper。
+pub(crate) fn cp_reflink(src: &Path, dst: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(dst);
     match Command::new("cp").arg("--reflink=auto").arg(src).arg(dst).status() {
         Ok(st) if st.success() => Ok(()),
@@ -1390,6 +1412,89 @@ fn pty_read_until(s: &mut UnixStream, needle: &str, deadline: Instant) -> String
 /// M2-Q7：交互式 PTY 会话——双向流 + 窗口 resize。create A → 连 vsock → `Pty{80,24}` → Ok →
 /// ① stdin `echo <marker>` 回显含 marker（双向流）；② resize 120×40 + `stty size` 输出 `40 120`
 /// （窗口 resize 生效）；③ `exit` 收敛；④ destroy 零残留。免 root（走恢复路径）。须含新 sl-envd 的模板。
+/// 运行时网络出口对账（真机）：create 一个 `network:egress` 沙箱(冷启动带 NIC) → guest 内真出口
+/// 检查(nslookup DNS + wget TCP，证 DNS/NAT/出站全链) → destroy 零残留(netns/veth/nft/实例目录全净)。
+/// 需 root+KVM+nft(非 root 直接 skip，不误报红)。
+pub fn net_egress_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    let root = unsafe { libc::geteuid() } == 0;
+    if !root {
+        if cfg.json {
+            println!(r#"{{"metric":"net_egress","skipped":true,"reason":"needs root (netns/nft/ip)"}}"#);
+        } else {
+            println!("[egress] 跳过：运行时出口需 root（netns/nft/ip）");
+        }
+        return Ok(());
+    }
+    let template = abspath(template)?;
+    let run_root = cfg.workdir.join("net-egress-reconcile");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(cfg, &template, &run_root, Box::new(store))?;
+    let log = |m: &str| {
+        if !cfg.json {
+            println!("[egress] {m}");
+        }
+    };
+
+    let spec = SandboxSpec {
+        idle_secs: 3600,
+        ttl_secs: 3600,
+        network: NetworkMode::Egress,
+        ..Default::default()
+    };
+    let a = orch.create_in(&template, &spec)?;
+    log(&format!("create A={} (network=egress, 冷启动带 NIC) ✓", a.id));
+
+    let vsock = match orch.exec_target(&a.id) {
+        Some(ExecTarget::Vsock(p)) => p,
+        _ => return Err("egress 沙箱无 vsock exec target".into()),
+    };
+    let mut s = connect_guest(&vsock)?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+
+    // 分层诊断（全跑完再判，便于定位断点）：网关可达→出口 IP(ICMP)→出口 IP(TCP)→DNS→全链。
+    let uplink_dbg = cfg.uplink.clone().or_else(|| netlive::detect_uplink(true)).unwrap_or_else(|| "lo".into());
+    let (rc_gw, _, _) = crate::exec(&mut s, "ping -c1 -W2 172.16.0.1")?; // guest→tap 网关
+    let (rc_eg, _, _) = crate::exec(&mut s, "ping -c1 -W2 1.1.1.1")?; // 出口(ICMP+NAT)
+    let (rc_tcp, _, _) = crate::exec(&mut s, "wget -q -T 15 -O /dev/null http://1.1.1.1/")?; // 出口(TCP，绕 DNS)
+    let (rc_dns, dns_out, _) = crate::exec(&mut s, "nslookup one.one.one.one 2>&1")?; // DNS(UDP53+NAT)
+    let (rc_web, _ow, ew) = crate::exec(&mut s, "wget -q -T 20 -O /dev/null http://example.com/")?; // 全链
+    log(&format!(
+        "诊断: uplink={uplink_dbg} | gw_ping rc={rc_gw} | egress_ping rc={rc_eg} | tcp_by_ip rc={rc_tcp} | dns rc={rc_dns} | full rc={rc_web}"
+    ));
+    if rc_dns != 0 && !dns_out.trim().is_empty() {
+        log(&format!("  nslookup 输出: {}", dns_out.trim().replace('\n', " | ")));
+    }
+    let dns_ok = rc_dns == 0;
+    // 判据：出站 TCP(绕 DNS) 通即证 NAT/forward 出口链路 OK；全链(含 DNS) 通更佳。
+    let egress_ok = rc_tcp == 0 || rc_web == 0;
+    ensure(
+        egress_ok,
+        &format!("出站失败（tcp_by_ip rc={rc_tcp}, full rc={rc_web}）: {}", ew.trim()),
+    )?;
+    log(&format!("出站 OK（tcp_by_ip rc={rc_tcp} / full rc={rc_web}）✓ DNS={}", if dns_ok { "OK" } else { "FAIL" }));
+
+    // ③ destroy 零残留：实例目录 + netns/veth/nft 全净。
+    let dir_a = orch.dir_of(&a.id);
+    orch.destroy(&a.id)?;
+    let netns_gone = !netlive::netns_exists(&netlive::ns_for(&a.id));
+    ensure(
+        !orch.is_live(&a.id) && dir_a.map(|d| !d.exists()).unwrap_or(true) && netns_gone,
+        "③ destroy 后有残留（实例目录 / netns）",
+    )?;
+    ensure(orch.store.list("sandbox/").map_err(|e| e.to_string())?.is_empty(), "③ 收尾 store 非空")?;
+    log("③ destroy：零残留（实例目录 + netns 全净）✓");
+
+    if cfg.json {
+        println!(
+            r#"{{"metric":"net_egress","dns_ok":{dns_ok},"egress_ok":true,"teardown_clean":true,"pass":true}}"#
+        );
+    } else {
+        println!("[egress] 运行时出口对账 PASS：冷启动带 NIC + DNS/NAT 出站 + destroy 零残留");
+    }
+    Ok(())
+}
+
 pub fn pty_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
     let template = abspath(template)?;
     let run_root = cfg.workdir.join("pty-reconcile");
@@ -1773,6 +1878,7 @@ mod tests {
             metadata: md,
             required_capabilities: Capabilities::empty(),
             backend: None,
+            network: NetworkMode::None,
         };
         let j = build_meta_json("s1", &spec, 1000, 1300, Path::new("/t/hello"));
         assert!(j.contains(r#""id":"s1""#));

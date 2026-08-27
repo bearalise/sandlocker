@@ -65,6 +65,7 @@ The recommended entry point. Factory methods create/discover sandboxes; instance
 | `cpu` | `number` | daemon = `2` | vCPU count. |
 | `mem` | `number` | daemon = `512` | Memory in MiB. |
 | `env` | `Record<string, string>` | — | Injected as sandbox labels / metadata. |
+| `network` | `"none" \| "egress"` | `"none"` | `"egress"` cold-boots the sandbox with a NIC + NAT so it can reach the internet (e.g. `npm install`). FC backend + root daemon only; slower than snapshot-restore, not pooled. |
 | `addr` | `string` | `127.0.0.1:7878` | Daemon address (ignored if `client` is supplied). |
 | `client` | `Client` | — | Reuse a shared low-level client. |
 

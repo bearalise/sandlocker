@@ -94,6 +94,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "idle_secs": req.get("idle", req.get("ttl")),
                 "total_ms": 123,
                 "labels": req.get("env", {}),
+                "network": req.get("network", "none"),  # 回显以便断言 SDK 透传
             }
             self.state.sandboxes[sid] = meta
             return self._json(201, meta)
@@ -254,6 +255,15 @@ class SdkTest(unittest.TestCase):
                 self.assertEqual(sbx.run("exit 7").exit_code, 7)
                 self.assertEqual(sbx.run("exit 0").exit_code, 0)
                 self.assertFalse(sbx.run("exit 1").ok)
+
+    def test_create_network_option(self):
+        with FakeDaemon() as d:
+            a = Sandbox.create(template="hello", addr=d.addr)
+            self.assertEqual(d.state.sandboxes[a.id]["network"], "none")  # 缺省不发
+            b = Sandbox.create(template="hello", network="egress", addr=d.addr)
+            self.assertEqual(d.state.sandboxes[b.id]["network"], "egress")
+            a.kill()
+            b.kill()
 
     def test_run_streaming(self):
         with FakeDaemon() as d:

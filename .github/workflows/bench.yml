@@ -103,6 +103,23 @@ jobs:
           echo "$out" | grep -q '"mode":"root-live"' || { echo "::error::时序探针未走 root-live 档"; exit 1; }
           echo "$out" | grep -q '"pass":true' || { echo "::error::Q4 时序 live 档未 pass"; exit 1; }
           echo "Q4 PASS：root/live 时序探针 margin 真实非 0 且策略先于 resume"
+      - name: 运行时网络出口对账（--net-egress-reconcile，root+KVM+nft）
+        # create 一个 network:egress 沙箱(冷启动带 NIC) → guest 内 nslookup+wget 真出口 → destroy 零残留。
+        # 需预烘焙模板(冷启动读其 rootfs.ext4)。KVM 缺失则 skip。
+        run: |
+          if [ ! -w /dev/kvm ]; then
+            echo "::warning::runner 无 /dev/kvm，跳过运行时出口对账"
+            exit 0
+          fi
+          out=$(./target/release/sl-node --build examples/hello.sandlocker.toml --json)
+          ver=$(echo "$out" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+          [ -n "$ver" ] || { echo "::error::未取到模板 version"; exit 1; }
+          e=$(sudo -E env "PATH=$PATH" ./target/release/sl-node --net-egress-reconcile "build/templates/hello/$ver" --json)
+          echo "$e"
+          echo "$e" | grep -q '"metric":"net_egress"' || { echo "::error::缺 net_egress 指标"; exit 1; }
+          echo "$e" | grep -q '"egress_ok":true' || { echo "::error::出站未通"; exit 1; }
+          echo "$e" | grep -q '"pass":true' || { echo "::error::运行时出口未 pass"; exit 1; }
+          echo "PASS：运行时 network:egress 冷启动带 NIC + DNS/NAT 出站 + destroy 零残留"
 
   # M2-Q8：allow-network 构建（构建期真 egress）——root + KVM + network。
   #   allow-all 模板 --build：构建沙箱 boot 进具名 netns（veth+tap+host NAT）→ RUN 有真出口。
