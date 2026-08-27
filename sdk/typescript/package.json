@@ -1,6 +1,6 @@
 {
   "name": "sandlocker",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "SandLocker TypeScript SDK — 零运行时依赖的薄 REST 客户端（对标 Python SDK / contracts/openapi.yaml）",
   "license": "Apache-2.0",
   "author": "SandLocker",

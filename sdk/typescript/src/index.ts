@@ -6,4 +6,4 @@ export { ExecResult, SandboxInfo, Template } from "./models.js";
 export { SandLockerError, ConnectionError, ApiError, NotFound } from "./errors.js";
 export { DEFAULT_ADDR } from "./http.js";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
