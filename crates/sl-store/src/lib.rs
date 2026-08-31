@@ -17,6 +17,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// 后端无关的 store 契约套件（M3-Q1）：SqliteStore 与 EtcdStore 跑同一套断言。
+pub mod contract;
+
+/// EtcdStore（集群模式，M3 W1）：over etcd v3 gRPC-gateway 的 sync ureq+JSON 实现。
+/// `cluster` feature 门控——单机构建不拉入任何 HTTP/TLS 依赖（守 M2 D5 精简依赖哲学）。
+#[cfg(feature = "cluster")]
+pub mod etcd;
+
 pub type LeaseId = i64;
 pub type Revision = i64;
 
@@ -487,6 +495,13 @@ mod tests {
 
     fn store() -> SqliteStore {
         SqliteStore::open_in_memory().unwrap()
+    }
+
+    /// M3-Q1：SqliteStore 跑后端无关契约套件（EtcdStore 在 `--store-contract --etcd` 跑同一套）。
+    #[test]
+    fn sqlite_passes_store_contract() {
+        let s = store();
+        crate::contract::run_all(&s).expect("SqliteStore 应通过 store 契约");
     }
 
     #[test]

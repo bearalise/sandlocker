@@ -683,3 +683,35 @@ jobs:
           name: bench-density-${{ github.sha }}
           path: build/bench/results.jsonl
           if-no-files-found: ignore
+
+  # M3 W1（M3-Q1）：store 契约双实现对账——SqliteStore（单机）与 EtcdStore（集群）跑**同一套**
+  #   后端无关契约（contract::run_all），证「单机→集群无两套语义」。免 root（纯元数据）。
+  #   etcd 用 service 容器（gRPC-gateway HTTP/JSON 端口 2379）；EtcdStore 走同步 ureq，零 tokio。
+  store-contract:
+    runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: gcr.io/etcd-development/etcd:v3.5.17
+        ports:
+          - 2379:2379
+        env:
+          # 监听 0.0.0.0 才能经端口映射从 job 侧 localhost 访问；advertise 用回环（单节点 dev）。
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+      - name: sl-store 单元测试（SqliteStore 过后端无关契约）
+        run: cargo test -p sl-store
+      - name: 构建 sl-node（cluster feature：编入 EtcdStore over sync ureq）
+        run: cargo build -p sl-node --features cluster
+      - name: 等 etcd gRPC-gateway 就绪
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2379/v3/kv/range -X POST -d '{"key":"AA=="}' >/dev/null && exit 0
+            sleep 1
+          done
+          echo "etcd gateway 30s 未就绪"; exit 1
+      - name: M3-Q1 store 契约双实现对账（SQLite + 真 etcd 跑同一套）
+        run: ./target/debug/sl-node --store-contract --etcd http://127.0.0.1:2379

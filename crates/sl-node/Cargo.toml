@@ -25,3 +25,9 @@ ed25519-dalek = "2"
 ureq = { version = "2", features = ["tls"] }
 flate2 = "1"
 tar = "0.4"
+
+[features]
+default = []
+# cluster（M3 W1）：启用 sl-store 的 etcd 后端，供 `--store-contract --etcd` 对 EtcdStore 跑契约。
+# 单机构建（默认）不启用，不拉入 etcd 相关代码路径。
+cluster = ["sl-store/cluster"]
