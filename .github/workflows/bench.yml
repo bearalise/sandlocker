@@ -715,3 +715,5 @@ jobs:
           echo "etcd gateway 30s 未就绪"; exit 1
       - name: M3-Q1 store 契约双实现对账（SQLite + 真 etcd 跑同一套）
         run: ./target/debug/sl-node --store-contract --etcd http://127.0.0.1:2379
+      - name: M3-Q2 选主对账（双竞选者 → 单 leader + resign failover + 无双主，真 etcd）
+        run: ./target/debug/sl-node --election-reconcile --etcd http://127.0.0.1:2379

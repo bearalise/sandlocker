@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,12 +111,24 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         allow_public: cfg.expose_allow_public,
     });
 
+    // M3 W2（M3-Q2）：leader 选举门控。**单机模式 SQLite 无选主，本节点恒 leader**（ADR-17：
+    // 「单机模式 SQLite + 进程内 orchestrator 无选主」）——故此处恒 true，reaper 照常跑（零回归）。
+    // active-standby 真选主是 etcd 多副本的事：当 Orch 迁至 etcd（W3/W4 多节点调度）后，改由
+    // `sl_store::election::Election`（本 W2 已交付并对真 etcd 验证：`--election-reconcile --etcd`）
+    // 驱动此标志——leader 跑 reaper、standby 置 false 不 tick（下方门控已就位，防双写）。
+    let is_leader = Arc::new(AtomicBool::new(true));
+
     // 后台 reaper：周期 tick(now)（TTL 硬顶 + idle sweep）。回收的沙箱须同步拆掉其暴露监听器。
+    // 仅 leader 执行——standby 不 tick（active-standby 无双写；单机恒 leader 即恒执行）。
     let tick_secs = if cfg.tick_secs > 0 { cfg.tick_secs } else { 5 };
     let reaper = Arc::clone(&shared);
     let reaper_ex = Arc::clone(&exposes);
+    let reaper_leader = Arc::clone(&is_leader);
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(tick_secs));
+        if !reaper_leader.load(Ordering::SeqCst) {
+            continue; // standby：不回收，避免与 leader 双写
+        }
         let now = now_unix();
         if let Ok(mut o) = reaper.lock() {
             if let Ok(reaped) = o.tick(now) {
