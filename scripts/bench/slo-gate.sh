@@ -28,8 +28,29 @@ DENSITY_DEFAULT="${SLO_DENSITY_DEFAULT:-200}"  # 密度 ≥200 @ 默认规格 2v
 DENSITY_MICRO="${SLO_DENSITY_MICRO:-500}"      # 密度 ≥500 @ micro 规格 128MiB
 
 if [ ! -f "$FILE" ]; then
-  echo "[slo-gate] 找不到 $FILE——先跑 scripts/bench/run-all.sh" >&2
+  echo "[slo-gate] 找不到 ${FILE}——先跑 scripts/bench/run-all.sh" >&2
   exit 2
+fi
+
+# —— 宿主类型闸：§8.1 的**绝对**口径只在真裸金属上成立（计划 §4 D4）——
+#
+# 云 VM（腾讯云 CVM 标准型、普通 EC2 等）里跑 Firecracker 是嵌套虚拟化，分位数没有可比性。
+# 那条路是 D4 明确写的**逃生口**——「产方法学 + 相对分位，绝对 SLO 标『待补』+ go/no-go 上报」，
+# 不是取证。严格档因此直接拒收：宁可当场红，也不要事后有人把一份虚拟机数据当成出口证据
+# （两者在 JSONL 里长得一模一样，除了这个标记）。
+HOST_KIND="$(grep -o '"host_kind":"[a-z-]*"' "$FILE" 2>/dev/null | tail -1 | cut -d'"' -f4)"
+HOST_KIND="${HOST_KIND:-unknown}"
+if [ "$HOST_KIND" != "bare-metal" ]; then
+  if [ "$STRICT" = "1" ]; then
+    echo "[slo-gate] 拒收：宿主类型=${HOST_KIND}，非裸金属。" >&2
+    echo "[slo-gate] §8.1 绝对口径只在真裸金属上成立（计划 §4 D4）。云 VM 上的 Firecracker 是嵌套" >&2
+    echo "[slo-gate] 虚拟化，分位不可比。若确实只能用云 VM，走 D4 逃生口：去掉 SLO_STRICT 跑，" >&2
+    echo "[slo-gate] 产出**方法学 + 相对分位**，绝对 SLO 标「待补」并做 go/no-go 上报——不得当作取证。" >&2
+    exit 3
+  fi
+  echo "⚠️  宿主类型=${HOST_KIND}（非裸金属）：以下数字仅可作**相对**回归对照，"
+  echo "⚠️  不能充当 §8.1 绝对口径取证。见计划 §4 D4 逃生口。"
+  echo
 fi
 
 # 从 results.jsonl 取某 metric 的某字段。多行取**最后一条**（同一 metric 可能跑多档）。
@@ -94,7 +115,7 @@ _hot="$(field pool_bench hot_p50)"
 [ -n "$_hot" ] && echo "备查：热池命中 P50 = ${_hot}ms"
 
 echo
-echo "[slo-gate] PASS=${PASS} FAIL=${FAIL} SKIP=${SKIP}（严格档=${STRICT}，口径来源 PRD §8.1）"
+echo "[slo-gate] PASS=${PASS} FAIL=${FAIL} SKIP=${SKIP} 宿主=${HOST_KIND}（严格档=${STRICT}，口径来源 PRD §8.1）"
 if [ "$FAIL" -gt 0 ]; then
   echo "[slo-gate] 未达标——**口径不下调**（计划 §4 D4）；须以配置/实现改进补，或走 go/no-go 上报。" >&2
   exit 1

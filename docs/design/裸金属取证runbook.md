@@ -34,6 +34,20 @@
 
 - **真裸金属 / 真 KVM，不能是嵌套虚拟化。** 嵌套虚拟化下 Firecracker 的冷启动与恢复数字对
   §8.1 毫无参考价值——这是整件事的前提，选型时第一个确认项。开机后先跑 §3 的自检。
+
+  > **易踩的坑：把云厂商的「云服务器」当成裸金属。** 腾讯云 **CVM 是虚拟机**产品，其物理服务器
+  > 叫**黑石（CBM）**；阿里云对应的是**神龙/弹性裸金属**；AWS 要选 `*.metal` 实例族而非普通 EC2。
+  > 标准云 VM 多数根本不向 guest 暴露 VMX/SVM，`/dev/kvm` 压根不存在，基准会整批 skip；
+  > 即便某机型支持嵌套，分位也不能当 §8.1 的绝对口径。
+  >
+  > **工具侧已经把这条钉死**：`run-all.sh` 把宿主类型（`host_kind`）写进结果的**每一行**，
+  > `slo-gate.sh` 严格档对非 `bare-metal` 直接**拒收并退 3**。两份 JSONL 除了这个标记长得
+  > 一模一样，不钉住就迟早有人拿虚拟机数据当出口证据。`host_kind` 采**必须有正面证据才判
+  > bare-metal**的策略（容器 / systemd-detect-virt / hypervisor flag / DMI 厂商串逐级判定），
+  > 判不出就是 `unknown`，严格档同样拒收。
+  >
+  > **只能用云 VM 时**走计划 §4 D4 的**逃生口**：去掉 `SLO_STRICT` 跑，产出**方法学 + 相对分位**，
+  > 绝对 SLO 标「待补」并做 go/no-go 上报——**不作为计划，只作兜底**。
 - **≥64 核 / ≥128 GiB 内存**（§8.1 密度口径就是按 64C/128G 节点写的）。低于此规格的数字
   不能直接对口径，只能做方法学验证。
 - **本地 NVMe**。存储栈用 reflink/CoW（ADR-23），网络盘会把 copy 段的分位彻底带偏。
@@ -43,6 +57,8 @@
 
 | 供应商 | 备注 |
 | --- | --- |
+| 腾讯云**黑石 CBM** | 物理服务器。**不是 CVM**——CVM 是虚拟机，不满足硬要求 |
+| 阿里云**弹性裸金属（神龙）** | 物理服务器 |
 | Equinix Metal | 真裸金属、按小时，常用于此类基准 |
 | AWS `*.metal`（如 `m5.metal` / `c5.metal`） | 按小时，裸金属实例族；注意区分普通 EC2（嵌套） |
 | OVH / Hetzner 独服 | 更便宜，但常按月起租，算清最短周期 |
@@ -77,12 +93,16 @@ ls -l /dev/kvm && grep -c -E 'vmx|svm' /proc/cpuinfo
 # 嵌套虚拟化的判别：裸金属上 hypervisor flag 应当**不存在**
 grep -q hypervisor /proc/cpuinfo && echo "⚠️ 检测到 hypervisor flag——很可能不是裸金属，停下确认" || echo "OK：无 hypervisor flag"
 
-# ② 规格对得上口径？
+# ② 规格对得上口径？（要 ≥64C / ≥128G）
 nproc && free -g
 
 # ③ 仓库自带的环境检查
 git clone https://github.com/bearalise/sandlocker && cd sandlocker
 scripts/bench/check-env.sh
+
+# ④ 让工具自己判一次——这是 slo-gate.sh 严格档用的**同一个函数**，
+#    它说 bare-metal 才作数（说 unknown / virtualized / container 都会被拒收）。
+( . scripts/bench/_common.sh; echo "host_kind=$(host_kind)" )
 ```
 
 ---
