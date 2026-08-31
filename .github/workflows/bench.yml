@@ -722,3 +722,5 @@ jobs:
         run: ./target/debug/sl-node --store-contract --etcd http://127.0.0.1:2379
       - name: M3-Q2 选主对账（双竞选者 → 单 leader + resign failover + 无双主，真 etcd）
         run: ./target/debug/sl-node --election-reconcile --etcd http://127.0.0.1:2379
+      - name: M3-Q2 节点失联回收对账（心跳 + 孤儿回收 + 存活不动 + 护栏，真 etcd）
+        run: ./target/debug/sl-node --node-reclaim-reconcile --etcd http://127.0.0.1:2379
