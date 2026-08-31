@@ -226,6 +226,9 @@ struct Config {
     /// --node-reclaim-reconcile：M3-Q2 节点失联回收对账——节点心跳 + 失联节点名下沙箱被回收 +
     /// 存活节点不受影响 + 护栏不回收自身。默认 SQLite 临时文件；--etcd 则对真 etcd 跑同一套。随后退出。
     node_reclaim_reconcile: bool,
+    /// --cluster-reconcile：M3 W4 集群合龙对账——跨副本共享态（A 写 B 见）+ 失联回收跨副本同步。
+    /// 默认 SQLite 两句柄；--etcd 则对真 etcd 跑（真跨副本）。随后退出。
+    cluster_reconcile: bool,
 }
 
 fn main() {
@@ -427,6 +430,18 @@ fn main() {
             Ok(()) => println!("[election] M3-Q2 election-reconcile PASS"),
             Err(e) => {
                 eprintln!("[election] M3-Q2 election-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --cluster-reconcile：M3 W4 集群合龙对账（跨副本共享态 + 失联回收跨副本同步）。
+    if cfg.cluster_reconcile {
+        match run_cluster_reconcile(&cfg) {
+            Ok(()) => println!("[cluster] M3 W4 cluster-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[cluster] M3 W4 cluster-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2215,6 +2230,7 @@ fn clone_paths(cfg: &Config) -> Config {
         cluster_init: false,
         election_reconcile: false,
         node_reclaim_reconcile: false,
+        cluster_reconcile: false,
 }
 }
 
@@ -2388,6 +2404,100 @@ fn run_election_reconcile(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// M3 W4 集群合龙对账：**跨副本共享态**——一副本写入的沙箱/节点，另一副本立即可见；
+/// 且失联节点的沙箱被（另一副本充当的）leader 回收、跨副本同步消失。两后端同一套（etcd 才有真跨副本；
+/// SQLite 用同文件两句柄模拟共享后端）。
+fn run_cluster_reconcile(cfg: &Config) -> Result<(), String> {
+    use sl_store::cluster::{live_nodes, reclaim_orphans, register_node, sandbox_node_key};
+    use sl_store::{SqliteStore, Store};
+
+    // 两个 store 句柄 = 两个副本，共享同一后端。
+    fn asserts(rep_a: &dyn Store, rep_b: &dyn Store) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        // 起点干净（经 A）。
+        for kv in rep_a.list("node/").map_err(|e| e.to_string())? {
+            rep_a.delete(&kv.key).map_err(|e| e.to_string())?;
+        }
+        for kv in rep_a.list("sandbox/").map_err(|e| e.to_string())? {
+            rep_a.delete(&kv.key).map_err(|e| e.to_string())?;
+        }
+        // 副本 A：注册节点 repA + 写一个属 repA 的沙箱（meta/node 同租约）。
+        register_node(rep_a, "repA", b"a", 30).map_err(|e| e.to_string())?;
+        let l = rep_a.lease_grant(30).map_err(|e| e.to_string())?;
+        rep_a.put("sandbox/s1/meta", br#"{"id":"s1"}"#, Some(l)).map_err(|e| e.to_string())?;
+        rep_a.put(&sandbox_node_key("s1"), b"repA", Some(l)).map_err(|e| e.to_string())?;
+
+        // 副本 B：**立即可见**（跨副本共享态，W4 核心）。
+        want!(
+            live_nodes(rep_b).map_err(|e| e.to_string())?.contains(&"repA".to_string()),
+            "B 应见到 A 注册的节点 repA（跨副本共享）"
+        );
+        want!(
+            rep_b.get("sandbox/s1/meta").map_err(|e| e.to_string())?.is_some(),
+            "B 应见到 A 创建的沙箱 s1（跨副本共享）"
+        );
+
+        // repA 失联（经 A 撤心跳）→ 副本 B 充当 leader 回收（护栏保自己 repB）。
+        let ids: Vec<i64> = rep_b
+            .list("node/")
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|kv| kv.lease)
+            .collect();
+        for id in ids {
+            // 撤销 repA 的心跳租约（这里 repA 是唯一注册节点）
+            rep_a.lease_revoke(id).map_err(|e| e.to_string())?;
+        }
+        want!(live_nodes(rep_b).map_err(|e| e.to_string())?.is_empty(), "repA 撤心跳后应无存活节点");
+        let reclaimed = reclaim_orphans(rep_b, Some("repB")).map_err(|e| e.to_string())?;
+        want!(reclaimed == vec!["s1"], "B 作 leader 应回收失联 repA 的 s1");
+        // 跨副本同步消失（经 A 看）。
+        want!(rep_a.get("sandbox/s1/meta").map_err(|e| e.to_string())?.is_none(), "s1 应跨副本同步消失");
+
+        // 收尾（经 A）。
+        for kv in rep_a.list("sandbox/").map_err(|e| e.to_string())? {
+            rep_a.delete(&kv.key).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let a = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            let b = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(&a, &b)?;
+            println!("[cluster] EtcdStore({ep}) 跨副本：A 写 B 见 + 失联回收跨副本同步 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--cluster-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-cluster-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let a = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        let b = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(&a, &b)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[cluster] SqliteStore(file) 两句柄共享：A 写 B 见 + 失联回收同步 PASS");
+    Ok(())
+}
+
 /// M3-Q2 节点失联回收对账：心跳 + 失联节点沙箱被回收 + 存活节点不动 + 护栏不回收自身，两后端同一套。
 fn run_node_reclaim_reconcile(cfg: &Config) -> Result<(), String> {
     use sl_store::cluster::{live_nodes, reclaim_orphans, register_node, sandbox_node_key};
@@ -2551,6 +2661,7 @@ fn parse_args() -> Config {
         cluster_init: false,
         election_reconcile: false,
         node_reclaim_reconcile: false,
+        cluster_reconcile: false,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2613,6 +2724,7 @@ fn parse_args() -> Config {
             "--cluster-init" => cfg.cluster_init = true,
             "--election-reconcile" => cfg.election_reconcile = true,
             "--node-reclaim-reconcile" => cfg.node_reclaim_reconcile = true,
+            "--cluster-reconcile" => cfg.cluster_reconcile = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
