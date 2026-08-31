@@ -749,7 +749,10 @@ dependencies = [
 name = "sl-store"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rusqlite",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

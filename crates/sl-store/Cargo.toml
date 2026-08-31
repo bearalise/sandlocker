@@ -5,7 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 # 窄 store 接口（D3 护栏②）：Get/Put/Delete/List/Txn(CAS)/Lease/Watch。
-# M1 用 SQLite 实现；接口按 etcd 形状收敛，M3 换 etcd 时改动有界。
+# M1 用 SQLite 实现；接口按 etcd 形状收敛，M3 W1 加 etcd 实现（cluster feature）。
 [dependencies]
 # bundled：编译内置 sqlite，不依赖系统 libsqlite3，延续运行时/控制面极简依赖风格
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# cluster feature（M3 W1，D2 精化）：EtcdStore over etcd v3 gRPC-gateway HTTP/JSON。
+#   全同步 ureq+rustls（复用 M2 OCI 依赖）+ serde_json + base64——零 tokio/tonic，
+#   守 M2 D5「全同步·精简依赖」哲学；D2 的「异步隔离区」只留给 W5 网关的持久 gRPC 流。
+#   单机构建（无 cluster）不拉入以下任一依赖。
+ureq = { version = "2", features = ["tls"], optional = true }
+serde_json = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+default = []
+cluster = ["dep:ureq", "dep:serde_json", "dep:base64"]

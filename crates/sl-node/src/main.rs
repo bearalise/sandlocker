@@ -210,6 +210,13 @@ struct Config {
     expose_reconcile: Option<PathBuf>,
     /// --expose-allow-public：放行端口暴露 bind 到非回环地址（默认拒绝；纯 L4 透传无鉴权，仅可信网络）。
     expose_allow_public: bool,
+    /// --store-contract：M3 W1 store 契约对账（M3-Q1）——恒对 SqliteStore（file+in-memory）跑
+    /// 后端无关契约套件；若同时给 --etcd 且以 `--features cluster` 构建，则对 EtcdStore 再跑同一套。
+    /// 随后退出。免 root（纯元数据）。
+    store_contract: bool,
+    /// --etcd <endpoint>：etcd v3 gateway 地址（如 http://127.0.0.1:2379）。仅 --store-contract 用；
+    /// 需以 `--features cluster` 构建，否则报错提示重建。
+    etcd: Option<String>,
 }
 
 fn main() {
@@ -387,6 +394,18 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[expose] expose-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --store-contract：M3 W1 store 契约对账（M3-Q1）——SqliteStore 恒跑；--etcd 时 EtcdStore 同跑。
+    if cfg.store_contract {
+        match run_store_contract(&cfg) {
+            Ok(()) => println!("[store] M3-Q1 store-contract PASS"),
+            Err(e) => {
+                eprintln!("[store] M3-Q1 store-contract FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2146,6 +2165,8 @@ fn clone_paths(cfg: &Config) -> Config {
         net_egress_reconcile: None,
         expose_reconcile: None,
         expose_allow_public: false,
+        store_contract: false,
+        etcd: None,
     }
 }
 
@@ -2219,6 +2240,41 @@ fn count_host_tap() -> usize {
         .unwrap_or(0)
 }
 
+/// M3 W1 store 契约对账（M3-Q1）：对 SqliteStore（in-memory + file）恒跑后端无关契约套件；
+/// 若给 `--etcd <ep>` 且以 `--features cluster` 构建，则对 EtcdStore 跑**同一套**——证双实现语义等价。
+fn run_store_contract(cfg: &Config) -> Result<(), String> {
+    use sl_store::{contract, SqliteStore};
+
+    let mem = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    contract::run_all(&mem)?;
+    println!("[store] SqliteStore(in-memory) 契约 PASS");
+
+    let path = std::env::temp_dir().join(format!("sl-store-contract-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    {
+        let file = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        contract::run_all(&file)?;
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    println!("[store] SqliteStore(file) 契约 PASS");
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let etcd = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            contract::run_all(&etcd)?;
+            println!("[store] EtcdStore({ep}) 契约 PASS");
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--etcd {ep} 需以 `--features cluster` 构建 sl-node（当前未启用该特性）"));
+        }
+    }
+    Ok(())
+}
+
 fn parse_args() -> Config {
     let mut cfg = Config {
         kernel: PathBuf::from("build/kernel/vmlinux"),
@@ -2272,6 +2328,8 @@ fn parse_args() -> Config {
         net_egress_reconcile: None,
         expose_reconcile: None,
         expose_allow_public: false,
+        store_contract: false,
+        etcd: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2329,6 +2387,8 @@ fn parse_args() -> Config {
             "--net-egress-reconcile" => cfg.net_egress_reconcile = Some(PathBuf::from(take())),
             "--expose-reconcile" => cfg.expose_reconcile = Some(PathBuf::from(take())),
             "--expose-allow-public" => cfg.expose_allow_public = true,
+            "--store-contract" => cfg.store_contract = true,
+            "--etcd" => cfg.etcd = Some(take()),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
