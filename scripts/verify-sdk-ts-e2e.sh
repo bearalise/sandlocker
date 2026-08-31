@@ -99,6 +99,7 @@ run_us() {
 run_us US-1 us1_quickstart.ts
 run_us US-4 us4_template.ts
 run_us US-7 us7_ci_ephemeral.ts
+run_us STREAM+CONNECT streaming_and_connect.ts   # 最新 SDK：流式 exec + Sandbox.connect
 
 # ③-KA keepalive 续期冒烟（纯 JS inline，导入已安装的 npm 包，免类型剥离）
 echo "[sdk-ts-e2e] 跑 keepalive 续期冒烟 ..." >&2
