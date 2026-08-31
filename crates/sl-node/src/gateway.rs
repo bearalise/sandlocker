@@ -16,8 +16,17 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 use sl_proto::{read_msg, write_msg, Request, Response};
+use sl_store::Store;
 
 use crate::{connect_guest, hex, host_random};
+
+/// 共享网关密钥键（集群模式，M3 W5）：所有网关/控制面副本从 store 收敛到同一 HMAC secret，
+/// 使**任一副本签发的 ticket 可被任一副本无状态验签**（ADR-22 拆分零语义变更的前提）。
+const GW_SECRET_KEY: &str = "cluster/gw_secret";
+/// 一次性 nonce 键前缀（集群模式）：验签消费经 store CAS，使「一次性」跨副本成立。
+fn nonce_key(nonce: &str) -> String {
+    format!("gw/nonce/{nonce}")
+}
 
 /// ticket 授权的数据面动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,20 +105,37 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     d == 0
 }
 
-/// 网关：持签发密钥 + 一次性 nonce 集。控制面签发、网关验签共用同实例（单机进程内）。
+/// 一次性 nonce 的看护：单机进程内集合 / 集群经 store（CAS 消费，跨副本一次性）。
+enum NonceGuard {
+    /// 单机：进程内 HashSet（M2 行为，零回归）。
+    Local(Mutex<HashSet<String>>),
+    /// 集群（M3 W5）：nonce 消费经 store CAS（挂租约按 ticket 到期自动清理，有界）。
+    Shared(Box<dyn Store>),
+}
+
+/// 网关：持签发密钥 + 一次性 nonce 看护。控制面签发、网关验签共用同 secret。
+/// 单机进程内（`new_random`）secret 随机、nonce 进程内；集群（`new_shared`）secret + nonce 走 store，
+/// **任一副本可验任一副本签发的 ticket、一次性跨副本生效**（ADR-22）。
 pub struct Gateway {
     secret: [u8; 32],
     /// 网关外部基址（`http://host:port`），mint 拼全 URL 用。
     base: String,
-    used: Mutex<HashSet<String>>,
+    nonces: NonceGuard,
 }
 
 impl Gateway {
-    /// 启动时随机 32B 密钥（M3 拆分时经配置/KMS 共享）。`base` = 网关外部基址。
+    /// 单机：启动时随机 32B 密钥 + 进程内 nonce 集。`base` = 网关外部基址（M2 行为，零回归）。
     pub fn new_random(base: String) -> Self {
         let mut s = [0u8; 32];
         host_random(&mut s);
-        Self { secret: s, base, used: Mutex::new(HashSet::new()) }
+        Self { secret: s, base, nonces: NonceGuard::Local(Mutex::new(HashSet::new())) }
+    }
+
+    /// 集群（M3 W5）：secret 从 store 收敛（`cluster/gw_secret`，CAS 首写者定，余副本读同值），
+    /// nonce 经 store CAS 消费（跨副本一次性）。`store` 为本副本的独立 store 句柄。
+    pub fn new_shared(base: String, store: Box<dyn Store>) -> Result<Self, String> {
+        let secret = ensure_gw_secret(store.as_ref())?;
+        Ok(Self { secret, base, nonces: NonceGuard::Shared(store) })
     }
 
     /// 签发签名 URL：`{base}/gw/{path}?sid=..&action=..&port=..&exp=..&nonce=..&sig=..`。
@@ -149,13 +175,60 @@ impl Gateway {
         if now >= exp {
             return Err("ticket 已过期".into());
         }
-        // 一次性：nonce 已用即拒；否则消费（机会性清理无需——nonce 集随 exp 窗有界，长驻可另加 GC）。
-        let mut used = self.used.lock().unwrap();
-        if !used.insert(nonce.clone()) {
-            return Err("ticket 已使用（一次性）".into());
+        // 一次性消费（在 sig/exp 校验之后，避免坏 ticket 污染 nonce 集）：
+        match &self.nonces {
+            // 单机：进程内集合。
+            NonceGuard::Local(used) => {
+                if !used.lock().unwrap().insert(nonce.clone()) {
+                    return Err("ticket 已使用（一次性）".into());
+                }
+            }
+            // 集群：store CAS（nonce 不存在→写入并挂租约；已存在→拒）。跨副本一次性。
+            NonceGuard::Shared(store) => {
+                let ttl = (exp - now).max(1);
+                let lease = store.lease_grant(ttl).map_err(|e| e.to_string())?;
+                let r = store
+                    .compare_and_swap(&nonce_key(nonce), None, b"1", Some(lease))
+                    .map_err(|e| e.to_string())?;
+                if !r.succeeded {
+                    let _ = store.lease_revoke(lease); // 让出刚 grant 的租约
+                    return Err("ticket 已使用（一次性）".into());
+                }
+            }
         }
         Ok(Ticket { sid: sid.clone(), action, port })
     }
+}
+
+/// 集群网关密钥收敛：读 `cluster/gw_secret`；无则随机生成并 CAS（首写者定），输者读回同值。
+/// 保证所有副本用同一 secret → 任一副本可无状态验签任一副本签发的 ticket。
+fn ensure_gw_secret(store: &dyn Store) -> Result<[u8; 32], String> {
+    if let Some(kv) = store.get(GW_SECRET_KEY).map_err(|e| e.to_string())? {
+        if kv.value.len() == 32 {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&kv.value);
+            return Ok(s);
+        }
+    }
+    let mut mine = [0u8; 32];
+    host_random(&mut mine);
+    let r = store
+        .compare_and_swap(GW_SECRET_KEY, None, &mine, None)
+        .map_err(|e| e.to_string())?;
+    if r.succeeded {
+        return Ok(mine);
+    }
+    // 输给别的副本 → 读它写入的 secret。
+    let kv = store
+        .get(GW_SECRET_KEY)
+        .map_err(|e| e.to_string())?
+        .ok_or("gw_secret CAS 失败后仍读不到")?;
+    if kv.value.len() != 32 {
+        return Err("gw_secret 长度异常".into());
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&kv.value);
+    Ok(s)
 }
 
 /// 端口反代（FR-3.3）：`connect_guest` → `Connect{port}` → guest dial 127.0.0.1:port → 发 HTTP/1.0 GET
