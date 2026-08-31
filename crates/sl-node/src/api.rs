@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sl_store::SqliteStore;
+use sl_store::election::Election;
+use sl_store::{SqliteStore, Store};
 
 use sl_proto::{parse_exec_output, read_frame, read_msg, write_msg, ExecOutput, Request, Response};
 
@@ -66,6 +67,22 @@ fn resolve_paths(cfg: &Config) -> (PathBuf, PathBuf, PathBuf) {
     (store_path, template_root, run_root)
 }
 
+/// 打开一个 store 句柄：`--etcd <ep>` → EtcdStore（集群模式，需 cluster feature）；否则 SQLite（单机）。
+/// M3 W4：daemon 迁 etcd 的装配点——Orch/心跳/选举各取一个独立句柄。
+fn open_store(cfg: &Config, db_str: &str) -> Result<Box<dyn Store>, String> {
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            return Ok(Box::new(sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?));
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--serve --etcd {ep} 需以 `--features cluster` 构建 sl-node"));
+        }
+    }
+    Ok(Box::new(SqliteStore::open(db_str).map_err(|e| format!("打开 store 失败: {e}"))?))
+}
+
 /// 起守护：打开 store → 建 Orch（`Box::leak` cfg 得 `'static`）→ reaper 线程 → TCP accept 循环。
 pub fn serve(cfg: &Config) -> Result<(), String> {
     let addr = cfg.serve_addr.clone().unwrap_or_else(|| "127.0.0.1:7878".to_string());
@@ -77,12 +94,14 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     std::fs::create_dir_all(&template_root).map_err(|e| format!("建模板根失败: {e}"))?;
     std::fs::create_dir_all(&run_root).map_err(|e| format!("建 run_root 失败: {e}"))?;
     let db_str = store_path.to_str().ok_or("store 路径非 UTF-8")?;
-    let store = SqliteStore::open(db_str).map_err(|e| format!("打开 store 失败: {e}"))?;
+    // M3 W4：store 后端 = --etcd 时 EtcdStore（集群共享态），否则 SQLite（单机）。
+    let store = open_store(cfg, db_str)?;
+    let etcd_mode = cfg.etcd.is_some();
 
     // Orch<'a> 借 &Config；守护存活全程 → leak 得 'static（无需改 Orch 生命周期）。
     let cfg_s: &'static Config = Box::leak(Box::new(cfg.clone()));
     // 默认模板占位：守护恒走 create_in（显式模板），此占位不被 create() 使用；取模板根（存在即合法）。
-    let mut orch = Orch::new(cfg_s, &template_root, &run_root, Box::new(store))?;
+    let mut orch = Orch::new(cfg_s, &template_root, &run_root, store)?;
 
     // M2 W4 温池：--pool-size>0 且指定 --pool-template 时，解析该模板→建单模板温池。请求命中同
     // 模板走池命中路径（copy_ms=0），其它模板/未启用均走冷路径（零回归）。模板解析失败仅告警不阻塞。
@@ -115,34 +134,57 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         allow_public: cfg.expose_allow_public,
     });
 
-    // M3 W2（M3-Q2）：leader 选举门控。**单机模式 SQLite 无选主，本节点恒 leader**（ADR-17：
-    // 「单机模式 SQLite + 进程内 orchestrator 无选主」）——故此处恒 true，reaper 照常跑（零回归）。
-    // active-standby 真选主是 etcd 多副本的事：当 Orch 迁至 etcd（W3/W4 多节点调度）后，改由
-    // `sl_store::election::Election`（本 W2 已交付并对真 etcd 验证：`--election-reconcile --etcd`）
-    // 驱动此标志——leader 跑 reaper、standby 置 false 不 tick（下方门控已就位，防双写）。
-    let is_leader = Arc::new(AtomicBool::new(true));
+    // M3 W2/W4（M3-Q2）：leader 选举门控。
+    //   - 单机 SQLite（无 --etcd）：ADR-17「单机无选主」→ 恒 leader（零回归）。
+    //   - 集群 etcd（--etcd）：**激活** `sl_store::election`——多副本竞争，仅 leader 跑 reaper/回收，
+    //     standby 热备（不 tick，防双写）；leader 崩溃 → 租约过期 → standby 夺主。
+    let is_leader = Arc::new(AtomicBool::new(!etcd_mode));
+    if etcd_mode {
+        let elect_store = open_store(cfg, db_str)?;
+        let node_id_el = node_id.clone();
+        let ttl = std::cmp::max(cfg.tick_secs as i64 * 3, 15);
+        let period = std::cmp::max((ttl / 3) as u64, 1);
+        let mut election = Election::new(elect_store, &node_id_el, ttl);
+        let leader_flag = Arc::clone(&is_leader);
+        thread::spawn(move || {
+            let mut last = false;
+            loop {
+                let now_leader = election.try_campaign().unwrap_or(false);
+                if now_leader != last {
+                    if now_leader {
+                        println!("[sandlocker] 本副本当选 leader（{node_id_el}）→ 启用 reaper/回收");
+                    } else {
+                        println!("[sandlocker] 本副本转 standby（暂停 reaper/回收）");
+                    }
+                    last = now_leader;
+                }
+                leader_flag.store(now_leader, Ordering::SeqCst);
+                thread::sleep(Duration::from_secs(period));
+            }
+        });
+    }
 
     // M3 W3（M3-Q2）：节点心跳（易失态走 lease TTL，ADR-17）。本节点在 `node/<id>` 写存活键并周期
     // 续租；崩溃/失联 → 租约到期 → 键消失 → leader 回收其名下沙箱。用独立 store 句柄（同文件另一连接）。
     // 单机：仅本节点、恒存活、无孤儿（回收含护栏，绝不回收自己名下沙箱）。
     {
-        let hb_store = SqliteStore::open(db_str).map_err(|e| format!("打开心跳 store 失败: {e}"))?;
+        let hb_store = open_store(cfg, db_str)?;
         let node_id_hb = node_id.clone();
         let meta = format!(r#"{{"addr":"{addr}"}}"#);
         // 心跳租约窗 max(tick*3, 15s)；续租周期 ~ttl/3。
         let ttl = std::cmp::max(cfg.tick_secs as i64 * 3, 15);
         let period = std::cmp::max((ttl / 3) as u64, 1);
         thread::spawn(move || {
-            let mut lease = sl_store::cluster::register_node(&hb_store, &node_id_hb, meta.as_bytes(), ttl).ok();
+            let mut lease = sl_store::cluster::register_node(hb_store.as_ref(), &node_id_hb, meta.as_bytes(), ttl).ok();
             loop {
                 thread::sleep(Duration::from_secs(period));
                 let alive = match lease {
-                    Some(l) => sl_store::cluster::heartbeat(&hb_store, l).is_ok(),
+                    Some(l) => sl_store::cluster::heartbeat(hb_store.as_ref(), l).is_ok(),
                     None => false,
                 };
                 if !alive {
                     // 租约丢失（被 sweep/首次注册失败）→ 重新注册，恢复存活。
-                    lease = sl_store::cluster::register_node(&hb_store, &node_id_hb, meta.as_bytes(), ttl).ok();
+                    lease = sl_store::cluster::register_node(hb_store.as_ref(), &node_id_hb, meta.as_bytes(), ttl).ok();
                 }
             }
         });
@@ -204,9 +246,12 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     }
 
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {addr} 失败: {e}"))?;
+    let store_desc = match &cfg.etcd {
+        Some(ep) => format!("etcd={ep}（集群模式·多副本 active-standby）"),
+        None => format!("store={}（单机 SQLite）", store_path.display()),
+    };
     println!(
-        "[sandlocker] API 守护就绪 http://{addr}（store={} templates={} run={} tick={tick_secs}s）",
-        store_path.display(),
+        "[sandlocker] API 守护就绪 http://{addr}（node={node_id} {store_desc} templates={} run={} tick={tick_secs}s）",
         template_root.display(),
         run_root.display()
     );
