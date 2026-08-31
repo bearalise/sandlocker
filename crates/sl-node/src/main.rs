@@ -47,6 +47,8 @@ mod pool;
 // W8：长驻守护 + 手写极简 REST server（--serve）——HTTP API + orchestrator + reaper 全进程内。
 mod api;
 mod auth;
+mod quota;
+mod audit;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -245,6 +247,15 @@ struct Config {
     /// --auth-reconcile：M3-Q4 鉴权对账——有效 key 放行 / 无或错 key 拒 / 作用域越权拒 / 跨项目隔离。
     /// 默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
     auth_reconcile: bool,
+    /// --quota-set：设项目配额（配 --project + --max-sandboxes/--max-vcpus/--max-mem，0=不限）。
+    /// 用 --store/--etcd 指定的 store。随后退出。
+    quota_set: bool,
+    max_sandboxes: u64,
+    max_vcpus: u64,
+    max_mem: u64,
+    /// --quota-reconcile：M3-Q4 配额+审计对账——超限 QUOTA_EXCEEDED / 删后可再建 / 审计 append 可查。
+    /// 默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
+    quota_reconcile: bool,
 }
 
 fn main() {
@@ -458,6 +469,30 @@ fn main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[apikey] 创建失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --quota-set：设项目配额，随后退出。
+    if cfg.quota_set {
+        match run_quota_set(&cfg) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[quota] 设置失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --quota-reconcile：M3-Q4 配额+审计对账（超限 QUOTA_EXCEEDED / 删后可再建 / 审计 append 可查）。
+    if cfg.quota_reconcile {
+        match run_quota_reconcile(&cfg) {
+            Ok(()) => println!("[quota] M3-Q4 quota-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[quota] M3-Q4 quota-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2290,6 +2325,11 @@ fn clone_paths(cfg: &Config) -> Config {
         project: None,
         scope: None,
         auth_reconcile: false,
+        quota_set: false,
+        max_sandboxes: 0,
+        max_vcpus: 0,
+        max_mem: 0,
+        quota_reconcile: false,
 }
 }
 
@@ -2484,6 +2524,110 @@ fn open_store_for(cfg: &Config) -> Result<Box<dyn sl_store::Store>, String> {
     }
     let p = path.to_str().ok_or("store 路径非 UTF-8")?;
     Ok(Box::new(sl_store::SqliteStore::open(p).map_err(|e| e.to_string())?))
+}
+
+/// M3 W7：设项目配额（--project + --max-*，0=不限）。
+fn run_quota_set(cfg: &Config) -> Result<(), String> {
+    use crate::quota::{set_limits, Limits};
+    let project = cfg.project.as_deref().ok_or("--quota-set 需 --project <项目>")?;
+    let store = open_store_for(cfg)?;
+    let l = Limits { max_sandboxes: cfg.max_sandboxes, max_vcpus: cfg.max_vcpus, max_mem_mib: cfg.max_mem };
+    set_limits(store.as_ref(), project, l)?;
+    println!(
+        "项目 {project} 配额已设：max_sandboxes={} max_vcpus={} max_mem_mib={}（0=不限）",
+        l.max_sandboxes, l.max_vcpus, l.max_mem_mib
+    );
+    Ok(())
+}
+
+/// M3-Q4 配额+审计对账：超限 QUOTA_EXCEEDED / 删后可再建 / 审计 append-only 可查，后端无关同一套。
+fn run_quota_reconcile(cfg: &Config) -> Result<(), String> {
+    use crate::quota::{check, set_limits, Limits, QUOTA_EXCEEDED};
+    use sl_store::{SqliteStore, Store};
+
+    fn asserts(store: &dyn Store) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        for kv in store.list("sandbox/").map_err(|e| e.to_string())? {
+            let _ = store.delete(&kv.key);
+        }
+        for kv in store.list("quota/").map_err(|e| e.to_string())? {
+            let _ = store.delete(&kv.key);
+        }
+        for kv in store.list("audit/").map_err(|e| e.to_string())? {
+            let _ = store.delete(&kv.key);
+        }
+        // 造沙箱记录（meta+project）辅助。
+        let put_sb = |id: &str, proj: &str, vcpu: u64, mem: u64| -> Result<(), String> {
+            let meta = format!(r#"{{"id":"{id}","vcpus":{vcpu},"mem_mib":{mem}}}"#);
+            store.put(&format!("sandbox/{id}/meta"), meta.as_bytes(), None).map_err(|e| e.to_string())?;
+            store.put(&format!("sandbox/{id}/project"), proj.as_bytes(), None).map_err(|e| e.to_string())?;
+            Ok(())
+        };
+
+        // 配额 max_sandboxes=2。
+        set_limits(store, "projA", Limits { max_sandboxes: 2, ..Default::default() }).map_err(|e| e.to_string())?;
+        want!(check(store, "projA", 1, 128).is_ok(), "空项目应可建");
+        put_sb("s1", "projA", 1, 128)?;
+        put_sb("s2", "projA", 1, 128)?;
+        // 已达上限：再建 → QUOTA_EXCEEDED。
+        let e = check(store, "projA", 1, 128).unwrap_err();
+        want!(e.starts_with(QUOTA_EXCEEDED), "超限应 QUOTA_EXCEEDED");
+        // 删一个 → 可再建（用量实时算）。
+        for k in ["sandbox/s2/meta", "sandbox/s2/project"] {
+            store.delete(k).map_err(|e| e.to_string())?;
+        }
+        want!(check(store, "projA", 1, 128).is_ok(), "删后应可再建");
+        // 其它项目不受 projA 配额影响。
+        want!(check(store, "projB", 100, 100_000).is_ok(), "projB 未设配额应不限");
+
+        // 审计 append-only 可查。
+        crate::audit::record(store, "projA", "create_sandbox", "s1", 201).map_err(|e| e.to_string())?;
+        crate::audit::record(store, "projA", "delete_sandbox", "s2", 204).map_err(|e| e.to_string())?;
+        let entries = crate::audit::list(store).map_err(|e| e.to_string())?;
+        want!(entries.len() == 2, "应两条审计");
+        want!(entries[0].contains("create_sandbox") && entries[1].contains("delete_sandbox"), "审计有序");
+
+        for pfx in ["sandbox/", "quota/", "audit/"] {
+            for kv in store.list(pfx).map_err(|e| e.to_string())? {
+                let _ = store.delete(&kv.key);
+            }
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let store = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(&store)?;
+            println!("[quota] EtcdStore({ep}) 配额+审计：超限拒 / 删后可建 / 项目隔离 / 审计 append 可查 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--quota-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-quota-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let store = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(&store)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[quota] SqliteStore(file) 配额+审计：超限拒 / 删后可建 / 项目隔离 / 审计 append 可查 PASS");
+    Ok(())
 }
 
 /// M3 W6：创建 API Key（--org/--project/--scope），打印明文 token（仅此一次）。
@@ -2925,6 +3069,11 @@ fn parse_args() -> Config {
         project: None,
         scope: None,
         auth_reconcile: false,
+        quota_set: false,
+        max_sandboxes: 0,
+        max_vcpus: 0,
+        max_mem: 0,
+        quota_reconcile: false,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2995,6 +3144,11 @@ fn parse_args() -> Config {
             "--project" => cfg.project = Some(take()),
             "--scope" => cfg.scope = Some(take()),
             "--auth-reconcile" => cfg.auth_reconcile = true,
+            "--quota-set" => cfg.quota_set = true,
+            "--max-sandboxes" => cfg.max_sandboxes = take().parse().unwrap_or(0),
+            "--max-vcpus" => cfg.max_vcpus = take().parse().unwrap_or(0),
+            "--max-mem" => cfg.max_mem = take().parse().unwrap_or(0),
+            "--quota-reconcile" => cfg.quota_reconcile = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

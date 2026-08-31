@@ -455,6 +455,27 @@ impl<'a> Orch<'a> {
         Ok(())
     }
 
+    /// 列审计条目（M3 W7，FR-7.3）：`project=Some(p)` 只返回 actor==p 的条目，`None` 全部。
+    pub fn list_audit(&self, project: Option<&str>) -> Result<Vec<String>, String> {
+        let all = crate::audit::list(self.store.as_ref())?;
+        Ok(match project {
+            None => all,
+            Some(p) => {
+                let needle = format!(r#""actor":"{p}""#);
+                all.into_iter().filter(|e| e.contains(&needle)).collect()
+            }
+        })
+    }
+
+    /// create/fork 前置配额检查（M3 W7，FR-7.2）：投影用量超项目限额即 `QUOTA_EXCEEDED`。
+    /// 未设配额 → 放行。project=None（无鉴权）→ 不检查。
+    pub fn check_quota(&self, project: Option<&str>, add_vcpus: u32, add_mem_mib: u32) -> Result<(), String> {
+        match project {
+            Some(p) => crate::quota::check(self.store.as_ref(), p, add_vcpus as u64, add_mem_mib as u64),
+            None => Ok(()),
+        }
+    }
+
     /// 读沙箱项目归属（None=无归属键）。供 dispatch 跨项目访问门控。
     pub fn sandbox_project(&self, id: &str) -> Result<Option<String>, String> {
         Ok(self

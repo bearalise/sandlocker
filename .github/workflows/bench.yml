@@ -733,3 +733,5 @@ jobs:
         run: ./target/debug/sl-node --gw-cluster-reconcile --etcd http://127.0.0.1:2379
       - name: M3-Q4 鉴权对账（key 有效性 + 作用域层级 + 项目隔离，真 etcd）
         run: ./target/debug/sl-node --auth-reconcile --etcd http://127.0.0.1:2379
+      - name: M3-Q4 配额+审计对账（超限 QUOTA_EXCEEDED / 删后可建 / 项目隔离 / 审计 append，真 etcd）
+        run: ./target/debug/sl-node --quota-reconcile --etcd http://127.0.0.1:2379

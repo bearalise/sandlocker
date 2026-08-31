@@ -461,6 +461,7 @@ enum Route {
     ListTemplates,
     BuildTemplate,
     ListBackends,
+    AuditLog,
     NotFound,
 }
 
@@ -470,13 +471,32 @@ impl Route {
         use crate::auth::Op;
         Some(match self {
             Route::ListSandboxes | Route::GetSandbox(_) | Route::Logs(_) | Route::ListExposes(_)
-            | Route::GetFile(_, _) | Route::ListTemplates | Route::ListBackends => Op::Read,
+            | Route::GetFile(_, _) | Route::ListTemplates | Route::ListBackends | Route::AuditLog => Op::Read,
             Route::BuildTemplate => Op::Build,
             Route::CreateSandbox | Route::DeleteSandbox(_) | Route::Keepalive(_) | Route::Pause(_)
             | Route::Resume(_) | Route::Fork(_) | Route::Ticket(_) | Route::Expose(_)
             | Route::Unexpose(_, _) | Route::Exec(_) | Route::PutFile(_, _) => Op::Write,
             Route::NotFound => return None,
         })
+    }
+
+    /// 审计动作名（M3 W7，FR-7.3）。
+    fn audit_action(&self) -> &'static str {
+        match self {
+            Route::CreateSandbox => "create_sandbox",
+            Route::DeleteSandbox(_) => "delete_sandbox",
+            Route::Keepalive(_) => "keepalive",
+            Route::Pause(_) => "pause",
+            Route::Resume(_) => "resume",
+            Route::Fork(_) => "fork",
+            Route::Ticket(_) => "mint_ticket",
+            Route::Expose(_) => "expose",
+            Route::Unexpose(_, _) => "unexpose",
+            Route::Exec(_) => "exec",
+            Route::PutFile(_, _) => "put_file",
+            Route::BuildTemplate => "build_template",
+            _ => "other",
+        }
     }
 
     /// 携带沙箱 id 的路由 → Some(id)（供跨项目访问门控）；无 id 路由 → None。
@@ -501,6 +521,7 @@ fn parse_route(method: &str, path: &str) -> Route {
         ("GET", ["v1", "sandboxes"]) => Route::ListSandboxes,
         ("GET", ["v1", "templates"]) => Route::ListTemplates,
         ("GET", ["v1", "backends"]) => Route::ListBackends,
+        ("GET", ["v1", "audit"]) => Route::AuditLog,
         ("POST", ["v1", "templates:build"]) => Route::BuildTemplate,
         ("GET", ["v1", "sandboxes", id]) => Route::GetSandbox((*id).to_string()),
         ("DELETE", ["v1", "sandboxes", id]) => Route::DeleteSandbox((*id).to_string()),
@@ -560,7 +581,28 @@ fn handle_conn(
         },
     };
     let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref());
+    // M3 W7 审计（FR-7.3）：鉴权模式下记录变更操作（append-only）。审计失败不阻断响应。
+    if auth.require {
+        if let Some(op) = route.required_op() {
+            if op != crate::auth::Op::Read {
+                let actor = project.as_deref().unwrap_or("-");
+                let target = route.sandbox_id().unwrap_or("-");
+                let _ = crate::audit::record(auth.store.as_ref(), actor, route.audit_action(), target, code);
+            }
+        }
+    }
     write_response(&mut stream, code, ctype, &resp)
+}
+
+/// 错误 → HTTP 状态：QUOTA_EXCEEDED→429、UNSUPPORTED_BY_BACKEND→409、其余→400。
+fn quota_status(e: &str) -> u16 {
+    if e.starts_with(crate::quota::QUOTA_EXCEEDED) {
+        429
+    } else if e.starts_with(UNSUPPORTED_BY_BACKEND) {
+        409
+    } else {
+        400
+    }
 }
 
 fn dispatch(
@@ -582,7 +624,7 @@ fn dispatch(
         },
         Route::CreateSandbox => match create_sandbox(body, shared, template_root, project) {
             Ok(v) => (201, json, v),
-            Err(e) => (400, json, err_json(&e)),
+            Err(e) => (quota_status(&e), json, err_json(&e)),
         },
         Route::ListSandboxes => match shared.lock().unwrap().list_meta_for(project) {
             Ok(metas) => (200, json, format!("[{}]", metas.join(",")).into_bytes()),
@@ -635,10 +677,9 @@ fn dispatch(
                 Err(e) => (404, json, err_json(&e)),
             }
         }
-        Route::Fork(id) => match fork_sandbox(&id, body, shared) {
+        Route::Fork(id) => match fork_sandbox(&id, body, shared, project) {
             Ok(v) => (201, json, v),
-            Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => (409, json, err_json(&e)),
-            Err(e) => (400, json, err_json(&e)),
+            Err(e) => (quota_status(&e), json, err_json(&e)),
         },
         Route::Expose(id) => match expose_port(&id, body, shared, exposes) {
             Ok(v) => (201, json, v),
@@ -676,6 +717,10 @@ fn dispatch(
             Err(e) => (500, json, err_json(&e)),
         },
         Route::ListBackends => (200, json, list_backends(shared)),
+        Route::AuditLog => match shared.lock().unwrap().list_audit(project) {
+            Ok(entries) => (200, json, format!("[{}]", entries.join(",")).into_bytes()),
+            Err(e) => (500, json, err_json(&e)),
+        },
         Route::BuildTemplate => (
             501,
             json,
@@ -744,9 +789,11 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path, project: O
 
     // 建走恢复（~130ms），全程持锁——单机 MVP 串行（如实标注）。
     let mut o = shared.lock().unwrap();
+    // M3 W7 配额（FR-7.2）：create 前置检查——投影用量超项目限额即 QUOTA_EXCEEDED（先于建 VM）。
+    o.check_quota(project, spec.vcpus, spec.mem_mib)?;
     let dir = resolve_template(&o, template_root, name)?;
     let out = o.create_in(&dir, &spec)?;
-    // M3 W6 多租户：鉴权模式下给沙箱打项目归属（跨项目访问被拒 + list 过滤）。
+    // M3 W6 多租户：鉴权模式下给沙箱打项目归属（跨项目访问被拒 + list 过滤 + 配额累计）。
     if let Some(p) = project {
         o.tag_project(&out.id, p)?;
     }
@@ -892,14 +939,20 @@ fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Resu
 
 /// fork（M2-Q5）：从（已 pause 的）父沙箱派生新实例，reinit 得独立身份。ttl/idle 可选（缺省 300）；
 /// 后端继承父（经 orch 内部路由），无需 template。返回新 sandbox JSON（含 forked_from）。
-fn fork_sandbox(id: &str, body: &[u8], shared: &Shared) -> Result<Vec<u8>, String> {
+fn fork_sandbox(id: &str, body: &[u8], shared: &Shared, project: Option<&str>) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(if body.is_empty() { b"{}" } else { body })
         .map_err(|e| format!("请求体非 JSON: {e}"))?;
     let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
     let idle = v.get("idle").and_then(|x| x.as_i64()).unwrap_or(ttl);
     let spec = SandboxSpec { ttl_secs: ttl, idle_secs: idle, ..Default::default() };
     let mut o = shared.lock().unwrap();
+    // M3 W7 配额（FR-7.2）：fork 前置检查（fork 也占并发/资源额度，ADR-25）。
+    o.check_quota(project, spec.vcpus, spec.mem_mib)?;
     let out = o.fork(id, &spec)?;
+    // 子沙箱继承父项目归属（配额累计 + 跨项目隔离）。
+    if let Some(p) = project {
+        o.tag_project(&out.id, p)?;
+    }
     let forked = out.forked_from.as_deref().unwrap_or("");
     Ok(format!(
         r#"{{"id":"{}","state":"running","machine_id":"{}","forked_from":"{forked}","total_ms":{},"copy_ms":{}}}"#,
