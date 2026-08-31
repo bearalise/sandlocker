@@ -94,9 +94,10 @@ Debian 12 也可以，但历史上需要 `kernel.unprivileged_userns_clone=1`，
 make 4.2.1），userns 默认开（没有 24.04 那个 AppArmor 限制），`mkfs.xfs` 也已默认 `reflink=1`
 （xfsprogs ≥5.1 起）。两点差异：
 
-- **GCC 9.4 建 6.6 guest 内核有不确定性**。`build-kernel.sh` 默认拉 6.6.y，Linux 6.6 的最低要求
-  是 GCC 5.1，9.4 名义上够、实践上大概率能过，但未经验证。好在这是**跑基准前的前置步骤**，
-  失败会立刻暴露、不浪费后续租机时间——上机第一件事就跑 `scripts/build-kernel.sh`。挂了有两条兜底：
+- **GCC 9.4 建 6.6 guest 内核：已实测通过**（2026-08-31，Inspur SA5212M5 / 96C / Ubuntu 20.04，
+  Linux 6.6.155，1m31s wall）。此前只能说「名义上够（6.6 最低要求 GCC 5.1）、大概率能过」，
+  现在是确认的。仍建议上机第一件事就跑 `scripts/build-kernel.sh`——它是跑基准前的前置步骤，
+  万一换了内核系列出问题也能早暴露、不浪费后续租机时间。两条兜底备用：
 
   ```bash
   # A. 换 GCC 10（20.04 仓库里有 10.5.0）
@@ -140,9 +141,22 @@ cd /srv/bench && git clone https://github.com/bearalise/sandlocker && cd sandloc
 `scripts/bench/check-env.sh` 会**实测一次** reflink（真做一次 `cp --reflink=always`，
 而不是看文件系统名），不支持时给出 WARN 并说明后果。
 
+### 国内网络：三个下载点会慢
+
+`build-rootfs.sh` 已内置阿里云/清华/中科大的 Alpine 镜像，但另外三处没有。都是「**文件已存在
+就跳过下载**」，所以投喂即可：
+
+| 下载点 | 现象 | 办法 |
+| --- | --- | --- |
+| rustup + crates.io | 装 rustup 慢；`cargo build` 拉百余 crate 更慢 | `RUSTUP_DIST_SERVER=https://rsproxy.cn` + `~/.cargo/config.toml` 换 sparse 源 |
+| Firecracker 二进制 | release 资源在 `objects.githubusercontent.com`，与 API 不同域，常慢 | 经 GitHub 代理下到 `build/firecracker/firecracker-<V>-x86_64.tgz`，再 `scripts/fetch-firecracker.sh <V>`；或本地下好 scp（才十几 MB） |
+| 内核源码 ~145MB | `cdn.kernel.org` 慢 | 先用脚本同款逻辑解析出版本号，从清华/中科大 `kernel/v6.x/` 下到 `build/kernel/linux-<V>.tar.xz`，再跑 `build-kernel.sh` |
+
+版本解析那步只拉目录列表，很小很快，不用管。
+
 ### 内核
 
-发行版自带即可（22.04 是 5.15）。KVM / device-mapper thin（ADR-23）/ nftables / netns /
+发行版自带即可（22.04 是 5.15，20.04 是 5.4）。KVM / device-mapper thin（ADR-23）/ nftables / netns /
 XFS reflink 都在其中。**不要**为了追新去换内核——guest 内核由 `scripts/build-kernel.sh`
 自己构建，与宿主内核版本无关。
 
