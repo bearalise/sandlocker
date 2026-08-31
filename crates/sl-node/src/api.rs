@@ -182,6 +182,12 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         println!("[sandlocker] 多租户鉴权已开启（--require-auth）：所有 /v1 请求需 API Key + 作用域");
     }
 
+    // M3 W8 可观测：结构化日志转发 sink（--log-sink）。
+    crate::logsink::init(cfg.log_sink.clone());
+    if let Some(sink) = &cfg.log_sink {
+        println!("[sandlocker] 结构化日志转发已开启：sink={sink}");
+    }
+
     // M3 W2/W4（M3-Q2）：leader 选举门控。
     //   - 单机 SQLite（无 --etcd）：ADR-17「单机无选主」→ 恒 leader（零回归）。
     //   - 集群 etcd（--etcd）：**激活** `sl_store::election`——多副本竞争，仅 leader 跑 reaper/回收，
@@ -254,6 +260,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
             if let Ok(reaped) = o.tick(now) {
                 for id in reaped {
                     drop_exposes(&reaper_ex, &id);
+                    crate::metrics::metrics().record_destroy(); // M3 W8：idle/TTL 回收计入
                 }
             }
             // M3 W3：回收失联节点（心跳 lease 过期→node 键消失）名下的孤儿沙箱（护栏不碰自己的）。
@@ -261,6 +268,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                 if !orphans.is_empty() {
                     for id in &orphans {
                         drop_exposes(&reaper_ex, id);
+                        crate::metrics::metrics().record_destroy();
                     }
                     println!("[sandlocker] 回收失联节点的孤儿沙箱: {orphans:?}");
                 }
@@ -462,6 +470,7 @@ enum Route {
     BuildTemplate,
     ListBackends,
     AuditLog,
+    Metrics,
     NotFound,
 }
 
@@ -476,7 +485,8 @@ impl Route {
             Route::CreateSandbox | Route::DeleteSandbox(_) | Route::Keepalive(_) | Route::Pause(_)
             | Route::Resume(_) | Route::Fork(_) | Route::Ticket(_) | Route::Expose(_)
             | Route::Unexpose(_, _) | Route::Exec(_) | Route::PutFile(_, _) => Op::Write,
-            Route::NotFound => return None,
+            // /metrics 免鉴权（Prometheus 抓取，仅聚合数，无租户数据）；NotFound 走 404。
+            Route::Metrics | Route::NotFound => return None,
         })
     }
 
@@ -522,6 +532,7 @@ fn parse_route(method: &str, path: &str) -> Route {
         ("GET", ["v1", "templates"]) => Route::ListTemplates,
         ("GET", ["v1", "backends"]) => Route::ListBackends,
         ("GET", ["v1", "audit"]) => Route::AuditLog,
+        ("GET", ["metrics"]) => Route::Metrics,
         ("POST", ["v1", "templates:build"]) => Route::BuildTemplate,
         ("GET", ["v1", "sandboxes", id]) => Route::GetSandbox((*id).to_string()),
         ("DELETE", ["v1", "sandboxes", id]) => Route::DeleteSandbox((*id).to_string()),
@@ -581,6 +592,10 @@ fn handle_conn(
         },
     };
     let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref());
+    // M3 W8 可观测：记 API 请求量/错误（/metrics 抓取本身不计入，避免自噪声）。
+    if !matches!(route, Route::Metrics) {
+        crate::metrics::metrics().record_api(code);
+    }
     // M3 W7 审计（FR-7.3）：鉴权模式下记录变更操作（append-only）。审计失败不阻断响应。
     if auth.require {
         if let Some(op) = route.required_op() {
@@ -640,6 +655,12 @@ fn dispatch(
             match r {
                 Ok(_) => {
                     drop_exposes(exposes, &id); // 拆掉该沙箱的暴露监听器，防悬挂
+                    crate::metrics::metrics().record_destroy(); // M3 W8 可观测
+                    crate::logsink::emit(format!(
+                        r#"{{"event":"sandbox_destroy","id":"{}","project":"{}"}}"#,
+                        id,
+                        project.unwrap_or("-")
+                    ));
                     (204, json, Vec::new())
                 }
                 Err(_) => (404, json, err_json("未知沙箱")),
@@ -721,6 +742,11 @@ fn dispatch(
             Ok(entries) => (200, json, format!("[{}]", entries.join(",")).into_bytes()),
             Err(e) => (500, json, err_json(&e)),
         },
+        Route::Metrics => (
+            200,
+            "text/plain; version=0.0.4; charset=utf-8",
+            crate::metrics::metrics().render().into_bytes(),
+        ),
         Route::BuildTemplate => (
             501,
             json,
@@ -793,6 +819,12 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path, project: O
     o.check_quota(project, spec.vcpus, spec.mem_mib)?;
     let dir = resolve_template(&o, template_root, name)?;
     let out = o.create_in(&dir, &spec)?;
+    // M3 W8 可观测：创建延迟 + 池命中入指标；结构化事件转发 sink（带分段时序=创建链路 span 分解）。
+    crate::metrics::metrics().record_create(out.total_ms, out.pool_hit || out.hot_hit);
+    crate::logsink::emit(format!(
+        r#"{{"event":"sandbox_create","id":"{}","project":"{}","total_ms":{},"copy_ms":{},"load_ms":{},"resume_ms":{},"pool_hit":{}}}"#,
+        out.id, project.unwrap_or("-"), out.total_ms, out.copy_ms, out.load_ms, out.resume_ms, out.pool_hit || out.hot_hit
+    ));
     // M3 W6 多租户：鉴权模式下给沙箱打项目归属（跨项目访问被拒 + list 过滤 + 配额累计）。
     if let Some(p) = project {
         o.tag_project(&out.id, p)?;
@@ -949,6 +981,7 @@ fn fork_sandbox(id: &str, body: &[u8], shared: &Shared, project: Option<&str>) -
     // M3 W7 配额（FR-7.2）：fork 前置检查（fork 也占并发/资源额度，ADR-25）。
     o.check_quota(project, spec.vcpus, spec.mem_mib)?;
     let out = o.fork(id, &spec)?;
+    crate::metrics::metrics().record_create(out.total_ms, out.pool_hit || out.hot_hit);
     // 子沙箱继承父项目归属（配额累计 + 跨项目隔离）。
     if let Some(p) = project {
         o.tag_project(&out.id, p)?;
@@ -1045,7 +1078,9 @@ fn exec_in(id: &str, body: &[u8], shared: &Shared) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("请求体非 JSON: {e}"))?;
     let cmd = v.get("cmd").and_then(|x| x.as_str()).ok_or("缺 cmd 字段")?;
     let target = shared.lock().unwrap().exec_target(id).ok_or("未知沙箱或已回收")?;
+    let t0 = std::time::Instant::now();
     let (code, out, err) = target.exec(cmd)?;
+    crate::metrics::metrics().record_exec(t0.elapsed().as_millis()); // M3 W8 可观测
     Ok(serde_json::json!({"exit_code": code, "stdout": out, "stderr": err}).to_string().into_bytes())
 }
 
