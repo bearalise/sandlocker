@@ -46,6 +46,7 @@ mod orch;
 mod pool;
 // W8：长驻守护 + 手写极简 REST server（--serve）——HTTP API + orchestrator + reaper 全进程内。
 mod api;
+mod auth;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -232,6 +233,18 @@ struct Config {
     /// --gw-cluster-reconcile：M3 W5 网关拆副本对账——共享 secret 使 A 签发 B 可验（无状态验签）+
     /// 一次性跨副本（B 用过 A 再用即拒）+ 篡改/过期拒。默认 SQLite 两句柄；--etcd 则真 etcd。随后退出。
     gw_cluster_reconcile: bool,
+    /// --require-auth：M3 W6 多租户鉴权（FR-7.1）——`--serve` 开启后每 /v1 请求需 API Key + 作用域。
+    require_auth: bool,
+    /// --apikey-create：创建 API Key（配 --org/--project/--scope）；用 --store/--etcd 指定的 store。
+    /// 打印明文 token（仅此一次），随后退出。
+    apikey_create: bool,
+    /// --org / --project / --scope：--apikey-create 参数。scope ∈ readonly|readwrite|build。
+    org: Option<String>,
+    project: Option<String>,
+    scope: Option<String>,
+    /// --auth-reconcile：M3-Q4 鉴权对账——有效 key 放行 / 无或错 key 拒 / 作用域越权拒 / 跨项目隔离。
+    /// 默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
+    auth_reconcile: bool,
 }
 
 fn main() {
@@ -433,6 +446,30 @@ fn main() {
             Ok(()) => println!("[election] M3-Q2 election-reconcile PASS"),
             Err(e) => {
                 eprintln!("[election] M3-Q2 election-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --apikey-create：创建 API Key（--org/--project/--scope），打印明文 token 后退出。
+    if cfg.apikey_create {
+        match run_apikey_create(&cfg) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[apikey] 创建失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --auth-reconcile：M3-Q4 鉴权对账（有效放行 / 无或错拒 / 越权拒 / 跨项目隔离）。
+    if cfg.auth_reconcile {
+        match run_auth_reconcile(&cfg) {
+            Ok(()) => println!("[auth] M3-Q4 auth-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[auth] M3-Q4 auth-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2247,6 +2284,12 @@ fn clone_paths(cfg: &Config) -> Config {
         node_reclaim_reconcile: false,
         cluster_reconcile: false,
         gw_cluster_reconcile: false,
+        require_auth: false,
+        apikey_create: false,
+        org: None,
+        project: None,
+        scope: None,
+        auth_reconcile: false,
 }
 }
 
@@ -2417,6 +2460,118 @@ fn run_election_reconcile(cfg: &Config) -> Result<(), String> {
     let _ = std::fs::remove_file(format!("{p}-shm"));
     r?;
     println!("[election] SqliteStore(file) 双竞选者：单 leader + resign failover + 无双主 PASS");
+    Ok(())
+}
+
+/// 打开 daemon 用的持久 store：`--etcd` → EtcdStore（cluster feature）；否则 SQLite（--store 或默认路径）。
+fn open_store_for(cfg: &Config) -> Result<Box<dyn sl_store::Store>, String> {
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            return Ok(Box::new(sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?));
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+    let path = cfg
+        .store
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("build/templates/sl.db"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let p = path.to_str().ok_or("store 路径非 UTF-8")?;
+    Ok(Box::new(sl_store::SqliteStore::open(p).map_err(|e| e.to_string())?))
+}
+
+/// M3 W6：创建 API Key（--org/--project/--scope），打印明文 token（仅此一次）。
+fn run_apikey_create(cfg: &Config) -> Result<(), String> {
+    use crate::auth::{create_key, Scope};
+    let org = cfg.org.as_deref().ok_or("--apikey-create 需 --org <组织>")?;
+    let project = cfg.project.as_deref().ok_or("--apikey-create 需 --project <项目>")?;
+    let scope_s = cfg.scope.as_deref().unwrap_or("readwrite");
+    let scope = Scope::from_str(scope_s).ok_or("--scope 取值 readonly|readwrite|build")?;
+    let store = open_store_for(cfg)?;
+    let token = create_key(store.as_ref(), org, project, scope)?;
+    println!("API Key 已创建（token 仅此一次显示，请妥善保存）：");
+    println!("  org={org}  project={project}  scope={scope_s}");
+    println!("  token={token}");
+    println!("用法：curl -H 'Authorization: Bearer {token}' http://<daemon-addr>/v1/sandboxes");
+    Ok(())
+}
+
+/// M3-Q4 鉴权对账：key 有效性 + 作用域层级（只读/读写/构建）+ 项目归属，后端无关同一套。
+fn run_auth_reconcile(cfg: &Config) -> Result<(), String> {
+    use crate::auth::{create_key, lookup, Op, Scope};
+    use sl_store::{SqliteStore, Store};
+
+    fn asserts(store: &dyn Store) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        for kv in store.list("apikey/").map_err(|e| e.to_string())? {
+            let _ = store.delete(&kv.key);
+        }
+        let ro = create_key(store, "acme", "projA", Scope::ReadOnly).map_err(|e| e.to_string())?;
+        let rw = create_key(store, "acme", "projA", Scope::ReadWrite).map_err(|e| e.to_string())?;
+        let bd = create_key(store, "acme", "projA", Scope::Build).map_err(|e| e.to_string())?;
+        let rwb = create_key(store, "acme", "projB", Scope::ReadWrite).map_err(|e| e.to_string())?;
+
+        // 有效 / 无效 key。
+        want!(lookup(store, &ro).map_err(|e| e.to_string())?.is_some(), "有效 key 应查到");
+        want!(lookup(store, "bad-token").map_err(|e| e.to_string())?.is_none(), "无效 key 应无记录");
+
+        // 作用域层级：readonly 不能写；readwrite 能写不能构建；build 全能。
+        let ro_r = lookup(store, &ro).map_err(|e| e.to_string())?.unwrap();
+        want!(ro_r.scope.allows(Op::Read) && !ro_r.scope.allows(Op::Write), "readonly 应只读");
+        let rw_r = lookup(store, &rw).map_err(|e| e.to_string())?.unwrap();
+        want!(rw_r.scope.allows(Op::Write) && !rw_r.scope.allows(Op::Build), "readwrite 不应允许 build");
+        let bd_r = lookup(store, &bd).map_err(|e| e.to_string())?.unwrap();
+        want!(bd_r.scope.allows(Op::Build) && bd_r.scope.allows(Op::Write), "build 应全能");
+
+        // 项目隔离（记录层面）：不同项目的 key 项目字段不同。
+        let rwb_r = lookup(store, &rwb).map_err(|e| e.to_string())?.unwrap();
+        want!(rw_r.project == "projA" && rwb_r.project == "projB", "项目归属应各自独立");
+        want!(rw_r.project != rwb_r.project, "跨项目 key 项目应不同");
+
+        for kv in store.list("apikey/").map_err(|e| e.to_string())? {
+            let _ = store.delete(&kv.key);
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let store = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(&store)?;
+            println!("[auth] EtcdStore({ep}) 鉴权：key 有效性 + 作用域层级 + 项目隔离 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--auth-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-auth-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let store = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(&store)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[auth] SqliteStore(file) 鉴权：key 有效性 + 作用域层级 + 项目隔离 PASS");
     Ok(())
 }
 
@@ -2764,6 +2919,12 @@ fn parse_args() -> Config {
         node_reclaim_reconcile: false,
         cluster_reconcile: false,
         gw_cluster_reconcile: false,
+        require_auth: false,
+        apikey_create: false,
+        org: None,
+        project: None,
+        scope: None,
+        auth_reconcile: false,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2828,6 +2989,12 @@ fn parse_args() -> Config {
             "--node-reclaim-reconcile" => cfg.node_reclaim_reconcile = true,
             "--cluster-reconcile" => cfg.cluster_reconcile = true,
             "--gw-cluster-reconcile" => cfg.gw_cluster_reconcile = true,
+            "--require-auth" => cfg.require_auth = true,
+            "--apikey-create" => cfg.apikey_create = true,
+            "--org" => cfg.org = Some(take()),
+            "--project" => cfg.project = Some(take()),
+            "--scope" => cfg.scope = Some(take()),
+            "--auth-reconcile" => cfg.auth_reconcile = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

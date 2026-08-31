@@ -420,14 +420,48 @@ impl<'a> Orch<'a> {
         self.backends[meta.backend].log_path(id)
     }
 
-    /// 列出所有沙箱 meta JSON（每项已是 store 里落的 JSON 对象串）。供 `GET /v1/sandboxes`。
-    pub fn list_meta(&self) -> Result<Vec<String>, String> {
+    /// 按项目过滤列 meta（M3 W6 多租户）：`project=Some(p)` 只返回归属 p 的沙箱；`None` 返回全部。
+    /// 供 `GET /v1/sandboxes`（鉴权模式按调用者 project 过滤，否则 None 全量）。
+    pub fn list_meta_for(&self, project: Option<&str>) -> Result<Vec<String>, String> {
         let kvs = self.store.list("sandbox/").map_err(|e| e.to_string())?;
+        // 先建 id→project 映射（来自 sandbox/<id>/project 键）。
+        let mut proj: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for kv in &kvs {
+            if let Some(id) = kv.key.strip_prefix("sandbox/").and_then(|s| s.strip_suffix("/project")) {
+                proj.insert(id.to_string(), String::from_utf8_lossy(&kv.value).into_owned());
+            }
+        }
         Ok(kvs
             .into_iter()
             .filter(|kv| kv.key.ends_with("/meta"))
+            .filter(|kv| {
+                let want = match project {
+                    None => return true, // 不过滤
+                    Some(p) => p,
+                };
+                let id = kv.key.strip_prefix("sandbox/").and_then(|s| s.strip_suffix("/meta")).unwrap_or("");
+                proj.get(id).map(|p| p == want).unwrap_or(false) // 无归属键 → 鉴权模式下不可见
+            })
             .map(|kv| String::from_utf8_lossy(&kv.value).into_owned())
             .collect())
+    }
+
+    /// 给沙箱打项目归属键 `sandbox/<id>/project`（同其 lease → 随回收一并删）。M3 W6 多租户。
+    pub fn tag_project(&mut self, id: &str, project: &str) -> Result<(), String> {
+        let lease = self.live.get(id).map(|m| m.lease);
+        self.store
+            .put(&format!("sandbox/{id}/project"), project.as_bytes(), lease)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 读沙箱项目归属（None=无归属键）。供 dispatch 跨项目访问门控。
+    pub fn sandbox_project(&self, id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .store
+            .get(&format!("sandbox/{id}/project"))
+            .map_err(|e| e.to_string())?
+            .map(|kv| String::from_utf8_lossy(&kv.value).into_owned()))
     }
 
     /// 单沙箱 meta JSON（不存在返回 None）。供 `GET /v1/sandboxes/{id}`。

@@ -37,6 +37,44 @@ type Shared = Arc<Mutex<Orch<'static>>>;
 /// 数据面网关（ADR-22）：控制面签发 + 网关验签共用（单机进程内）。
 type SharedGw = Arc<Gateway>;
 
+/// 鉴权上下文（M3 W6 多租户，FR-7.1）：`require=false`（默认/单机）→ 不鉴权（M2 行为，零回归）；
+/// `require=true`（`--require-auth`）→ 每请求校验 API Key + 作用域 + 跨项目门控。`store` 为独立句柄。
+pub struct AuthCtx {
+    require: bool,
+    store: Box<dyn Store>,
+}
+type SharedAuth = Arc<AuthCtx>;
+
+/// 鉴权 + 授权判定。成功返回调用者 project（`None`=未开启鉴权）；失败返回 `(状态码, 错误体)`。
+/// 跨项目门控：sandbox-id 路由须该沙箱归属 == 调用者 project（无归属键→鉴权模式下不可见）。
+fn authorize(
+    auth: &SharedAuth,
+    shared: &Shared,
+    op: crate::auth::Op,
+    sid: Option<&str>,
+    key: Option<&str>,
+) -> Result<Option<String>, (u16, Vec<u8>)> {
+    if !auth.require {
+        return Ok(None);
+    }
+    let key = key.ok_or((401, err_json("缺 API Key（Authorization: Bearer <token> 或 X-API-Key）")))?;
+    let rec = crate::auth::lookup(auth.store.as_ref(), key)
+        .map_err(|e| (500, err_json(&e)))?
+        .ok_or((401, err_json("API Key 无效")))?;
+    if !rec.scope.allows(op) {
+        return Err((403, err_json(&format!("作用域不足：{} 不允许该操作", rec.scope.as_str()))));
+    }
+    if let Some(id) = sid {
+        let proj = shared.lock().unwrap().sandbox_project(id).map_err(|e| (500, err_json(&e)))?;
+        match proj {
+            Some(p) if p == rec.project => {}
+            Some(_) => return Err((403, err_json("跨项目访问被拒"))),
+            None => return Err((404, err_json("未知沙箱"))),
+        }
+    }
+    Ok(Some(rec.project))
+}
+
 /// 端口暴露（L4 透传）共享态：sid→guest_port→监听器句柄 + 对外 bind 放行开关。
 /// 打包进一个 Arc 避免在 handle_conn/dispatch/reaper 到处加参数。
 struct ExposeState {
@@ -133,6 +171,16 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         registry: Mutex::new(HashMap::new()),
         allow_public: cfg.expose_allow_public,
     });
+
+    // M3 W6 多租户鉴权（FR-7.1）：--require-auth 开启后每请求校验 API Key + 作用域 + 跨项目门控。
+    // 默认关闭（M2 行为，零回归）。用独立 store 句柄（与 Orch 解耦，鉴权只读 apikey/*）。
+    let auth: SharedAuth = Arc::new(AuthCtx {
+        require: cfg.require_auth,
+        store: open_store(cfg, db_str)?,
+    });
+    if cfg.require_auth {
+        println!("[sandlocker] 多租户鉴权已开启（--require-auth）：所有 /v1 请求需 API Key + 作用域");
+    }
 
     // M3 W2/W4（M3-Q2）：leader 选举门控。
     //   - 单机 SQLite（无 --etcd）：ADR-17「单机无选主」→ 恒 leader（零回归）。
@@ -269,8 +317,9 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                 let sh = Arc::clone(&shared);
                 let g = Arc::clone(&gw);
                 let e = Arc::clone(&exposes);
+                let a = Arc::clone(&auth);
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(stream, &sh, troot, &g, &e) {
+                    if let Err(e) = handle_conn(stream, &sh, troot, &g, &e, &a) {
                         eprintln!("[sandlocker] 连接处理错误: {e}");
                     }
                 });
@@ -284,7 +333,26 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
 // ————————————————————— HTTP 请求解析 / 响应封装（手写，照 fcapi.rs）—————————————————————
 
 /// 读一个请求：解析请求行 `(method, path)` + 按 `Content-Length` 精确读 body。
-fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), String> {
+/// 从 header 段取 API Key：优先 `Authorization: Bearer <t>`，其次 `X-API-Key: <t>`。
+fn extract_api_key(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    for line in text.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("authorization") {
+                if let Some(t) = v.trim().strip_prefix("Bearer ").or_else(|| v.trim().strip_prefix("bearer ")) {
+                    return Some(t.trim().to_string());
+                }
+            }
+            if k.eq_ignore_ascii_case("x-api-key") {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn read_request(stream: &mut TcpStream) -> Result<(String, String, Option<String>, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let head_end = loop {
@@ -302,6 +370,7 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), Str
     };
     let head = &buf[..head_end];
     let (method, path) = parse_request_line(head)?;
+    let api_key = extract_api_key(head);
     let want = head_end + 4 + content_length(head);
     while buf.len() < want {
         let n = stream.read(&mut chunk).map_err(|e| format!("读请求体失败: {e}"))?;
@@ -311,7 +380,7 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), Str
         buf.extend_from_slice(&chunk[..n]);
     }
     let body = buf[head_end + 4..].to_vec();
-    Ok((method, path, body))
+    Ok((method, path, api_key, body))
 }
 
 fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
@@ -395,6 +464,33 @@ enum Route {
     NotFound,
 }
 
+impl Route {
+    /// 本路由所需的操作类别（M3 W6 鉴权）；NotFound 无需鉴权（走 404）。
+    fn required_op(&self) -> Option<crate::auth::Op> {
+        use crate::auth::Op;
+        Some(match self {
+            Route::ListSandboxes | Route::GetSandbox(_) | Route::Logs(_) | Route::ListExposes(_)
+            | Route::GetFile(_, _) | Route::ListTemplates | Route::ListBackends => Op::Read,
+            Route::BuildTemplate => Op::Build,
+            Route::CreateSandbox | Route::DeleteSandbox(_) | Route::Keepalive(_) | Route::Pause(_)
+            | Route::Resume(_) | Route::Fork(_) | Route::Ticket(_) | Route::Expose(_)
+            | Route::Unexpose(_, _) | Route::Exec(_) | Route::PutFile(_, _) => Op::Write,
+            Route::NotFound => return None,
+        })
+    }
+
+    /// 携带沙箱 id 的路由 → Some(id)（供跨项目访问门控）；无 id 路由 → None。
+    fn sandbox_id(&self) -> Option<&str> {
+        match self {
+            Route::GetSandbox(id) | Route::DeleteSandbox(id) | Route::Keepalive(id) | Route::Pause(id)
+            | Route::Resume(id) | Route::Fork(id) | Route::Ticket(id) | Route::Expose(id)
+            | Route::Unexpose(id, _) | Route::ListExposes(id) | Route::Exec(id) | Route::Logs(id)
+            | Route::PutFile(id, _) | Route::GetFile(id, _) => Some(id),
+            _ => None,
+        }
+    }
+}
+
 /// 纯路由：`(method, path)` → `Route`。path 去 query；`/files/` 后整段（含 `/`）作文件路径。
 fn parse_route(method: &str, path: &str) -> Route {
     let path = path.split('?').next().unwrap_or(path);
@@ -442,13 +538,28 @@ fn handle_conn(
     template_root: &Path,
     gw: &SharedGw,
     exposes: &Exposes,
+    auth: &SharedAuth,
 ) -> Result<(), String> {
-    let (method, path, body) = read_request(&mut stream)?;
+    let json = "application/json";
+    let (method, path, api_key, body) = read_request(&mut stream)?;
     // 流式 exec：需劫持本连接（NDJSON 边收边发、无 Content-Length），不进 dispatch/write_response 一次性路径。
     if let Some(id) = parse_exec_stream(&method, &path) {
-        return exec_stream_hijack(stream, &id, &body, shared);
+        // exec stream = 对沙箱的 Write 操作，同样过鉴权 + 跨项目门控。
+        match authorize(auth, shared, crate::auth::Op::Write, Some(&id), api_key.as_deref()) {
+            Ok(_) => return exec_stream_hijack(stream, &id, &body, shared),
+            Err((code, b)) => return write_response(&mut stream, code, json, &b),
+        }
     }
-    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes);
+    // 鉴权 + 授权（NotFound 无需鉴权，走 404）。
+    let route = parse_route(&method, &path);
+    let project = match route.required_op() {
+        None => None,
+        Some(op) => match authorize(auth, shared, op, route.sandbox_id(), api_key.as_deref()) {
+            Ok(p) => p,
+            Err((code, b)) => return write_response(&mut stream, code, json, &b),
+        },
+    };
+    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref());
     write_response(&mut stream, code, ctype, &resp)
 }
 
@@ -460,6 +571,7 @@ fn dispatch(
     template_root: &Path,
     gw: &SharedGw,
     exposes: &Exposes,
+    project: Option<&str>,
 ) -> (u16, &'static str, Vec<u8>) {
     let route = parse_route(method, path);
     let json = "application/json";
@@ -468,11 +580,11 @@ fn dispatch(
             Ok(v) => (200, json, v),
             Err(e) => (400, json, err_json(&e)),
         },
-        Route::CreateSandbox => match create_sandbox(body, shared, template_root) {
+        Route::CreateSandbox => match create_sandbox(body, shared, template_root, project) {
             Ok(v) => (201, json, v),
             Err(e) => (400, json, err_json(&e)),
         },
-        Route::ListSandboxes => match shared.lock().unwrap().list_meta() {
+        Route::ListSandboxes => match shared.lock().unwrap().list_meta_for(project) {
             Ok(metas) => (200, json, format!("[{}]", metas.join(",")).into_bytes()),
             Err(e) => (500, json, err_json(&e)),
         },
@@ -586,7 +698,7 @@ fn resolve_template(orch: &Orch, template_root: &Path, name: &str) -> Result<Pat
     Ok(dir)
 }
 
-fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<Vec<u8>, String> {
+fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path, project: Option<&str>) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("请求体非 JSON: {e}"))?;
     let name = v.get("template").and_then(|x| x.as_str()).ok_or("缺 template 字段")?;
     let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
@@ -634,6 +746,10 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path) -> Result<
     let mut o = shared.lock().unwrap();
     let dir = resolve_template(&o, template_root, name)?;
     let out = o.create_in(&dir, &spec)?;
+    // M3 W6 多租户：鉴权模式下给沙箱打项目归属（跨项目访问被拒 + list 过滤）。
+    if let Some(p) = project {
+        o.tag_project(&out.id, p)?;
+    }
     Ok(format!(
         r#"{{"id":"{}","state":"running","machine_id":"{}","template":"{}","total_ms":{},"copy_ms":{},"api_ready_ms":{},"load_ms":{},"resume_ms":{},"pool_hit":{},"hot_hit":{}}}"#,
         out.id, out.machine_id, name, out.total_ms, out.copy_ms, out.api_ready_ms, out.load_ms, out.resume_ms, out.pool_hit, out.hot_hit
@@ -721,7 +837,8 @@ fn list_exposes(id: &str, exposes: &Exposes) -> Vec<u8> {
 /// 数据面网关连接（M2-Q6）：验签一次性 ticket → 路由到 exec/file/logs/端口反代。端口反代把 guest
 /// HTTP 响应**原样**写回外部客户端；其余走 write_response。验签失败 403。
 fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Result<(), String> {
-    let (method, path, body) = read_request(&mut stream)?;
+    // 网关连接靠 ticket 验签授权（非 API Key），忽略 header 里的 api_key。
+    let (method, path, _api_key, body) = read_request(&mut stream)?;
     let json = "application/json";
     let q = parse_query(&path);
     let ticket = match gw.verify(&q, now_unix()) {
