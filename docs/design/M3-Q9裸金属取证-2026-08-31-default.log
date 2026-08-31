@@ -1,0 +1,518 @@
+== 机器规格 ==
+cpu_cores                64
+mem_total_gb             122
+kernel                   5.4.0-216-generic
+arch                     x86_64
+== 前置检查 ==
+kvm                      OK (/dev/kvm 可写)
+firecracker              OK (Firecracker v1.16.1)
+guest_kernel             OK (vmlinux-6.6.155)
+reflink                  OK（fs=xfs，create 走 CoW 秒拷）
+环境检查通过
+[bench] 宿主=bare-metal cpus=64 mem=122G
+[bench] 运行 bench-clone-entropy ...
+[clone-entropy] 重建 rootfs（纳入新 sl-envd reinit 例程）...
+[rootfs] 准备 staging 目录 ...
+[rootfs] 解 Alpine minirootfs（3.20.3）到 staging ...
+[rootfs] busybox 基座就绪（busybox+/bin/sh 可用）
+[rootfs] 放入 sl-envd -> /sbin/sl-envd
+[rootfs] 免 sudo 造 ext4（mke2fs -d，size=128M）...
+[rootfs] 完成: /srv/bench/sandlocker/build/rootfs/rootfs.ext4 (25M)
+[sl-node] 快照 create：API 启动（无网络）→ 就绪 → Paused → snapshot/create
+[sl-node] 快照就绪：/srv/bench/sandlocker/build/run/snap-clone-entropy（vmstate/mem/rootfs.ext4/expect），快照点 uptime≈2.28s
+[bench] bench-clone-entropy 完成
+[bench] 运行 bench-coldstart ...
+[coldstart] 1/10 total=403ms pre_kernel=193ms guest_boot=210ms
+[coldstart] 2/10 total=403ms pre_kernel=193ms guest_boot=210ms
+[coldstart] 3/10 total=402ms pre_kernel=192ms guest_boot=210ms
+[coldstart] 4/10 total=403ms pre_kernel=183ms guest_boot=220ms
+[coldstart] 5/10 total=403ms pre_kernel=193ms guest_boot=210ms
+[coldstart] 6/10 total=405ms pre_kernel=185ms guest_boot=220ms
+[coldstart] 7/10 total=403ms pre_kernel=193ms guest_boot=210ms
+[coldstart] 8/10 total=402ms pre_kernel=192ms guest_boot=210ms
+[coldstart] 9/10 total=403ms pre_kernel=193ms guest_boot=210ms
+[coldstart] 10/10 total=402ms pre_kernel=192ms guest_boot=210ms
+[coldstart] N=10 P50=403ms P99=405ms min=402 max=405
+[bench] bench-coldstart 完成
+[bench] 运行 bench-density ...
+[density] 起始 MemAvailable=123912MB，上限 MAX=400，内存地板=512MB
+[density] 实例 #1 就绪，MemAvailable=123850MB（累计用 62MB）
+[density] 实例 #2 就绪，MemAvailable=123787MB（累计用 125MB）
+[density] 实例 #3 就绪，MemAvailable=123724MB（累计用 188MB）
+[density] 实例 #4 就绪，MemAvailable=123660MB（累计用 252MB）
+[density] 实例 #5 就绪，MemAvailable=123599MB（累计用 313MB）
+[density] 实例 #6 就绪，MemAvailable=123534MB（累计用 378MB）
+[density] 实例 #7 就绪，MemAvailable=123468MB（累计用 444MB）
+[density] 实例 #8 就绪，MemAvailable=123403MB（累计用 509MB）
+[density] 实例 #9 就绪，MemAvailable=123338MB（累计用 574MB）
+[density] 实例 #10 就绪，MemAvailable=123269MB（累计用 643MB）
+[density] 实例 #11 就绪，MemAvailable=123203MB（累计用 709MB）
+[density] 实例 #12 就绪，MemAvailable=123138MB（累计用 774MB）
+[density] 实例 #13 就绪，MemAvailable=123071MB（累计用 841MB）
+[density] 实例 #14 就绪，MemAvailable=123006MB（累计用 906MB）
+[density] 实例 #15 就绪，MemAvailable=122938MB（累计用 974MB）
+[density] 实例 #16 就绪，MemAvailable=122874MB（累计用 1038MB）
+[density] 实例 #17 就绪，MemAvailable=122808MB（累计用 1104MB）
+[density] 实例 #18 就绪，MemAvailable=122741MB（累计用 1171MB）
+[density] 实例 #19 就绪，MemAvailable=122675MB（累计用 1237MB）
+[density] 实例 #20 就绪，MemAvailable=122608MB（累计用 1304MB）
+[density] 实例 #21 就绪，MemAvailable=122541MB（累计用 1371MB）
+[density] 实例 #22 就绪，MemAvailable=122476MB（累计用 1436MB）
+[density] 实例 #23 就绪，MemAvailable=122408MB（累计用 1504MB）
+[density] 实例 #24 就绪，MemAvailable=122343MB（累计用 1569MB）
+[density] 实例 #25 就绪，MemAvailable=122278MB（累计用 1634MB）
+[density] 实例 #26 就绪，MemAvailable=122211MB（累计用 1701MB）
+[density] 实例 #27 就绪，MemAvailable=122145MB（累计用 1767MB）
+[density] 实例 #28 就绪，MemAvailable=122079MB（累计用 1833MB）
+[density] 实例 #29 就绪，MemAvailable=122011MB（累计用 1901MB）
+[density] 实例 #30 就绪，MemAvailable=121946MB（累计用 1966MB）
+[density] 实例 #31 就绪，MemAvailable=121867MB（累计用 2045MB）
+[density] 实例 #32 就绪，MemAvailable=121793MB（累计用 2119MB）
+[density] 实例 #33 就绪，MemAvailable=121730MB（累计用 2182MB）
+[density] 实例 #34 就绪，MemAvailable=121666MB（累计用 2246MB）
+[density] 实例 #35 就绪，MemAvailable=121601MB（累计用 2311MB）
+[density] 实例 #36 就绪，MemAvailable=121532MB（累计用 2380MB）
+[density] 实例 #37 就绪，MemAvailable=121466MB（累计用 2446MB）
+[density] 实例 #38 就绪，MemAvailable=121405MB（累计用 2507MB）
+[density] 实例 #39 就绪，MemAvailable=121338MB（累计用 2574MB）
+[density] 实例 #40 就绪，MemAvailable=121273MB（累计用 2639MB）
+[density] 实例 #41 就绪，MemAvailable=121206MB（累计用 2706MB）
+[density] 实例 #42 就绪，MemAvailable=121140MB（累计用 2772MB）
+[density] 实例 #43 就绪，MemAvailable=121077MB（累计用 2835MB）
+[density] 实例 #44 就绪，MemAvailable=121011MB（累计用 2901MB）
+[density] 实例 #45 就绪，MemAvailable=120946MB（累计用 2966MB）
+[density] 实例 #46 就绪，MemAvailable=120879MB（累计用 3033MB）
+[density] 实例 #47 就绪，MemAvailable=120811MB（累计用 3101MB）
+[density] 实例 #48 就绪，MemAvailable=120744MB（累计用 3168MB）
+[density] 实例 #49 就绪，MemAvailable=120681MB（累计用 3231MB）
+[density] 实例 #50 就绪，MemAvailable=120614MB（累计用 3298MB）
+[density] 实例 #51 就绪，MemAvailable=120549MB（累计用 3363MB）
+[density] 实例 #52 就绪，MemAvailable=120482MB（累计用 3430MB）
+[density] 实例 #53 就绪，MemAvailable=120413MB（累计用 3499MB）
+[density] 实例 #54 就绪，MemAvailable=120347MB（累计用 3565MB）
+[density] 实例 #55 就绪，MemAvailable=120284MB（累计用 3628MB）
+[density] 实例 #56 就绪，MemAvailable=120216MB（累计用 3696MB）
+[density] 实例 #57 就绪，MemAvailable=120149MB（累计用 3763MB）
+[density] 实例 #58 就绪，MemAvailable=120083MB（累计用 3829MB）
+[density] 实例 #59 就绪，MemAvailable=120014MB（累计用 3898MB）
+[density] 实例 #60 就绪，MemAvailable=119948MB（累计用 3964MB）
+[density] 实例 #61 就绪，MemAvailable=119881MB（累计用 4031MB）
+[density] 实例 #62 就绪，MemAvailable=119814MB（累计用 4098MB）
+[density] 实例 #63 就绪，MemAvailable=119748MB（累计用 4164MB）
+[density] 实例 #64 就绪，MemAvailable=119682MB（累计用 4230MB）
+[density] 实例 #65 就绪，MemAvailable=119615MB（累计用 4297MB）
+[density] 实例 #66 就绪，MemAvailable=119547MB（累计用 4365MB）
+[density] 实例 #67 就绪，MemAvailable=119482MB（累计用 4430MB）
+[density] 实例 #68 就绪，MemAvailable=119417MB（累计用 4495MB）
+[density] 实例 #69 就绪，MemAvailable=119351MB（累计用 4561MB）
+[density] 实例 #70 就绪，MemAvailable=119287MB（累计用 4625MB）
+[density] 实例 #71 就绪，MemAvailable=119221MB（累计用 4691MB）
+[density] 实例 #72 就绪，MemAvailable=119152MB（累计用 4760MB）
+[density] 实例 #73 就绪，MemAvailable=119085MB（累计用 4827MB）
+[density] 实例 #74 就绪，MemAvailable=119019MB（累计用 4893MB）
+[density] 实例 #75 就绪，MemAvailable=118954MB（累计用 4958MB）
+[density] 实例 #76 就绪，MemAvailable=118888MB（累计用 5024MB）
+[density] 实例 #77 就绪，MemAvailable=118820MB（累计用 5092MB）
+[density] 实例 #78 就绪，MemAvailable=118755MB（累计用 5157MB）
+[density] 实例 #79 就绪，MemAvailable=118687MB（累计用 5225MB）
+[density] 实例 #80 就绪，MemAvailable=118622MB（累计用 5290MB）
+[density] 实例 #81 就绪，MemAvailable=118578MB（累计用 5334MB）
+[density] 实例 #82 就绪，MemAvailable=118512MB（累计用 5400MB）
+[density] 实例 #83 就绪，MemAvailable=118446MB（累计用 5466MB）
+[density] 实例 #84 就绪，MemAvailable=118381MB（累计用 5531MB）
+[density] 实例 #85 就绪，MemAvailable=118314MB（累计用 5598MB）
+[density] 实例 #86 就绪，MemAvailable=118248MB（累计用 5664MB）
+[density] 实例 #87 就绪，MemAvailable=118181MB（累计用 5731MB）
+[density] 实例 #88 就绪，MemAvailable=118114MB（累计用 5798MB）
+[density] 实例 #89 就绪，MemAvailable=118047MB（累计用 5865MB）
+[density] 实例 #90 就绪，MemAvailable=117973MB（累计用 5939MB）
+[density] 实例 #91 就绪，MemAvailable=117897MB（累计用 6015MB）
+[density] 实例 #92 就绪，MemAvailable=117836MB（累计用 6076MB）
+[density] 实例 #93 就绪，MemAvailable=117771MB（累计用 6141MB）
+[density] 实例 #94 就绪，MemAvailable=117707MB（累计用 6205MB）
+[density] 实例 #95 就绪，MemAvailable=117639MB（累计用 6273MB）
+[density] 实例 #96 就绪，MemAvailable=117570MB（累计用 6342MB）
+[density] 实例 #97 就绪，MemAvailable=117504MB（累计用 6408MB）
+[density] 实例 #98 就绪，MemAvailable=117435MB（累计用 6477MB）
+[density] 实例 #99 就绪，MemAvailable=117370MB（累计用 6542MB）
+[density] 实例 #100 就绪，MemAvailable=117304MB（累计用 6608MB）
+[density] 实例 #101 就绪，MemAvailable=117235MB（累计用 6677MB）
+[density] 实例 #102 就绪，MemAvailable=117171MB（累计用 6741MB）
+[density] 实例 #103 就绪，MemAvailable=117108MB（累计用 6804MB）
+[density] 实例 #104 就绪，MemAvailable=117044MB（累计用 6868MB）
+[density] 实例 #105 就绪，MemAvailable=116978MB（累计用 6934MB）
+[density] 实例 #106 就绪，MemAvailable=116909MB（累计用 7003MB）
+[density] 实例 #107 就绪，MemAvailable=116846MB（累计用 7066MB）
+[density] 实例 #108 就绪，MemAvailable=116777MB（累计用 7135MB）
+[density] 实例 #109 就绪，MemAvailable=116713MB（累计用 7199MB）
+[density] 实例 #110 就绪，MemAvailable=116647MB（累计用 7265MB）
+[density] 实例 #111 就绪，MemAvailable=116580MB（累计用 7332MB）
+[density] 实例 #112 就绪，MemAvailable=116514MB（累计用 7398MB）
+[density] 实例 #113 就绪，MemAvailable=116449MB（累计用 7463MB）
+[density] 实例 #114 就绪，MemAvailable=116386MB（累计用 7526MB）
+[density] 实例 #115 就绪，MemAvailable=116319MB（累计用 7593MB）
+[density] 实例 #116 就绪，MemAvailable=116252MB（累计用 7660MB）
+[density] 实例 #117 就绪，MemAvailable=116187MB（累计用 7725MB）
+[density] 实例 #118 就绪，MemAvailable=116121MB（累计用 7791MB）
+[density] 实例 #119 就绪，MemAvailable=116054MB（累计用 7858MB）
+[density] 实例 #120 就绪，MemAvailable=116050MB（累计用 7862MB）
+[density] 实例 #121 就绪，MemAvailable=116048MB（累计用 7864MB）
+[density] 实例 #122 就绪，MemAvailable=116046MB（累计用 7866MB）
+[density] 实例 #123 就绪，MemAvailable=116046MB（累计用 7866MB）
+[density] 实例 #124 就绪，MemAvailable=116042MB（累计用 7870MB）
+[density] 实例 #125 就绪，MemAvailable=116039MB（累计用 7873MB）
+[density] 实例 #126 就绪，MemAvailable=116039MB（累计用 7873MB）
+[density] 实例 #127 就绪，MemAvailable=116038MB（累计用 7874MB）
+[density] 实例 #128 就绪，MemAvailable=116038MB（累计用 7874MB）
+[density] 实例 #129 就绪，MemAvailable=116036MB（累计用 7876MB）
+[density] 实例 #130 就绪，MemAvailable=116034MB（累计用 7878MB）
+[density] 实例 #131 就绪，MemAvailable=116032MB（累计用 7880MB）
+[density] 实例 #132 就绪，MemAvailable=116034MB（累计用 7878MB）
+[density] 实例 #133 就绪，MemAvailable=116034MB（累计用 7878MB）
+[density] 实例 #134 就绪，MemAvailable=116031MB（累计用 7881MB）
+[density] 实例 #135 就绪，MemAvailable=116031MB（累计用 7881MB）
+[density] 实例 #136 就绪，MemAvailable=116030MB（累计用 7882MB）
+[density] 实例 #137 就绪，MemAvailable=116030MB（累计用 7882MB）
+[density] 实例 #138 就绪，MemAvailable=116028MB（累计用 7884MB）
+[density] 实例 #139 就绪，MemAvailable=116028MB（累计用 7884MB）
+[density] 实例 #140 就绪，MemAvailable=116028MB（累计用 7884MB）
+[density] 实例 #141 就绪，MemAvailable=116030MB（累计用 7882MB）
+[density] 实例 #142 就绪，MemAvailable=116028MB（累计用 7884MB）
+[density] 实例 #143 就绪，MemAvailable=116027MB（累计用 7885MB）
+[density] 实例 #144 就绪，MemAvailable=116027MB（累计用 7885MB）
+[density] 实例 #145 就绪，MemAvailable=116026MB（累计用 7886MB）
+[density] 实例 #146 就绪，MemAvailable=116027MB（累计用 7885MB）
+[density] 实例 #147 就绪，MemAvailable=116028MB（累计用 7884MB）
+[density] 实例 #148 就绪，MemAvailable=116026MB（累计用 7886MB）
+[density] 实例 #149 就绪，MemAvailable=116024MB（累计用 7888MB）
+[density] 实例 #150 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #151 就绪，MemAvailable=116010MB（累计用 7902MB）
+[density] 实例 #152 就绪，MemAvailable=116012MB（累计用 7900MB）
+[density] 实例 #153 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #154 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #155 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #156 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #157 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #158 就绪，MemAvailable=116012MB（累计用 7900MB）
+[density] 实例 #159 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #160 就绪，MemAvailable=116015MB（累计用 7897MB）
+[density] 实例 #161 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #162 就绪，MemAvailable=116012MB（累计用 7900MB）
+[density] 实例 #163 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #164 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #165 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #166 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #167 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #168 就绪，MemAvailable=116010MB（累计用 7902MB）
+[density] 实例 #169 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #170 就绪，MemAvailable=116008MB（累计用 7904MB）
+[density] 实例 #171 就绪，MemAvailable=116007MB（累计用 7905MB）
+[density] 实例 #172 就绪，MemAvailable=116007MB（累计用 7905MB）
+[density] 实例 #173 就绪，MemAvailable=116007MB（累计用 7905MB）
+[density] 实例 #174 就绪，MemAvailable=116007MB（累计用 7905MB）
+[density] 实例 #175 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #176 就绪，MemAvailable=116007MB（累计用 7905MB）
+[density] 实例 #177 就绪，MemAvailable=116010MB（累计用 7902MB）
+[density] 实例 #178 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #179 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #180 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #181 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #182 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #183 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #184 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #185 就绪，MemAvailable=116015MB（累计用 7897MB）
+[density] 实例 #186 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #187 就绪，MemAvailable=116013MB（累计用 7899MB）
+[density] 实例 #188 就绪，MemAvailable=116012MB（累计用 7900MB）
+[density] 实例 #189 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #190 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #191 就绪，MemAvailable=116016MB（累计用 7896MB）
+[density] 实例 #192 就绪，MemAvailable=116016MB（累计用 7896MB）
+[density] 实例 #193 就绪，MemAvailable=116016MB（累计用 7896MB）
+[density] 实例 #194 就绪，MemAvailable=116016MB（累计用 7896MB）
+[density] 实例 #195 就绪，MemAvailable=116017MB（累计用 7895MB）
+[density] 实例 #196 就绪，MemAvailable=116015MB（累计用 7897MB）
+[density] 实例 #197 就绪，MemAvailable=116016MB（累计用 7896MB）
+[density] 实例 #198 就绪，MemAvailable=116015MB（累计用 7897MB）
+[density] 实例 #199 就绪，MemAvailable=116015MB（累计用 7897MB）
+[density] 实例 #200 就绪，MemAvailable=116012MB（累计用 7900MB）
+[density] 实例 #201 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #202 就绪，MemAvailable=116014MB（累计用 7898MB）
+[density] 实例 #203 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #204 就绪，MemAvailable=116011MB（累计用 7901MB）
+[density] 实例 #205 就绪，MemAvailable=116012MB（累计用 7900MB）
+[density] 实例 #206 就绪，MemAvailable=116010MB（累计用 7902MB）
+[density] 实例 #207 就绪，MemAvailable=116010MB（累计用 7902MB）
+[density] 实例 #208 就绪，MemAvailable=116010MB（累计用 7902MB）
+[density] 实例 #209 就绪，MemAvailable=116008MB（累计用 7904MB）
+[density] 实例 #210 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #211 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #212 就绪，MemAvailable=116008MB（累计用 7904MB）
+[density] 实例 #213 就绪，MemAvailable=116007MB（累计用 7905MB）
+[density] 实例 #214 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #215 就绪，MemAvailable=116008MB（累计用 7904MB）
+[density] 实例 #216 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #217 就绪，MemAvailable=116008MB（累计用 7904MB）
+[density] 实例 #218 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #219 就绪，MemAvailable=116005MB（累计用 7907MB）
+[density] 实例 #220 就绪，MemAvailable=116004MB（累计用 7908MB）
+[density] 实例 #221 就绪，MemAvailable=116002MB（累计用 7910MB）
+[density] 实例 #222 就绪，MemAvailable=116003MB（累计用 7909MB）
+[density] 实例 #223 就绪，MemAvailable=115997MB（累计用 7915MB）
+[density] 实例 #224 就绪，MemAvailable=115996MB（累计用 7916MB）
+[density] 实例 #225 就绪，MemAvailable=115996MB（累计用 7916MB）
+[density] 实例 #226 就绪，MemAvailable=115995MB（累计用 7917MB）
+[density] 实例 #227 就绪，MemAvailable=115994MB（累计用 7918MB）
+[density] 实例 #228 就绪，MemAvailable=115994MB（累计用 7918MB）
+[density] 实例 #229 就绪，MemAvailable=115994MB（累计用 7918MB）
+[density] 实例 #230 就绪，MemAvailable=115995MB（累计用 7917MB）
+[density] 实例 #231 就绪，MemAvailable=115992MB（累计用 7920MB）
+[density] 实例 #232 就绪，MemAvailable=115991MB（累计用 7921MB）
+[density] 实例 #233 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #234 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #235 就绪，MemAvailable=115989MB（累计用 7923MB）
+[density] 实例 #236 就绪，MemAvailable=115990MB（累计用 7922MB）
+[density] 实例 #237 就绪，MemAvailable=115990MB（累计用 7922MB）
+[density] 实例 #238 就绪，MemAvailable=115989MB（累计用 7923MB）
+[density] 实例 #239 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #240 就绪，MemAvailable=115989MB（累计用 7923MB）
+[density] 实例 #241 就绪，MemAvailable=115986MB（累计用 7926MB）
+[density] 实例 #242 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #243 就绪，MemAvailable=115987MB（累计用 7925MB）
+[density] 实例 #244 就绪，MemAvailable=115986MB（累计用 7926MB）
+[density] 实例 #245 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #246 就绪，MemAvailable=115986MB（累计用 7926MB）
+[density] 实例 #247 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #248 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #249 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #250 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #251 就绪，MemAvailable=115988MB（累计用 7924MB）
+[density] 实例 #252 就绪，MemAvailable=115985MB（累计用 7927MB）
+[density] 实例 #253 就绪，MemAvailable=115985MB（累计用 7927MB）
+[density] 实例 #254 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #255 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #256 就绪，MemAvailable=115984MB（累计用 7928MB）
+[density] 实例 #257 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #258 就绪，MemAvailable=115984MB（累计用 7928MB）
+[density] 实例 #259 就绪，MemAvailable=115987MB（累计用 7925MB）
+[density] 实例 #260 就绪，MemAvailable=115984MB（累计用 7928MB）
+[density] 实例 #261 就绪，MemAvailable=115985MB（累计用 7927MB）
+[density] 实例 #262 就绪，MemAvailable=115984MB（累计用 7928MB）
+[density] 实例 #263 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #264 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #265 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #266 就绪，MemAvailable=115983MB（累计用 7929MB）
+[density] 实例 #267 就绪，MemAvailable=115984MB（累计用 7928MB）
+[density] 实例 #268 就绪，MemAvailable=115984MB（累计用 7928MB）
+[density] 实例 #269 就绪，MemAvailable=115979MB（累计用 7933MB）
+[density] 实例 #270 就绪，MemAvailable=115980MB（累计用 7932MB）
+[density] 实例 #271 就绪，MemAvailable=115980MB（累计用 7932MB）
+[density] 实例 #272 就绪，MemAvailable=115979MB（累计用 7933MB）
+[density] 实例 #273 就绪，MemAvailable=115979MB（累计用 7933MB）
+[density] 实例 #274 就绪，MemAvailable=115979MB（累计用 7933MB）
+[density] 实例 #275 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #276 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #277 就绪，MemAvailable=115979MB（累计用 7933MB）
+[density] 实例 #278 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #279 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #280 就绪，MemAvailable=115978MB（累计用 7934MB）
+[density] 实例 #281 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #282 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #283 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #284 就绪，MemAvailable=115978MB（累计用 7934MB）
+[density] 实例 #285 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #286 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #287 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #288 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #289 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #290 就绪，MemAvailable=115969MB（累计用 7943MB）
+[density] 实例 #291 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #292 就绪，MemAvailable=115969MB（累计用 7943MB）
+[density] 实例 #293 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #294 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #295 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #296 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #297 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #298 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #299 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #300 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #301 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #302 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #303 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #304 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #305 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #306 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #307 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #308 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #309 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #310 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #311 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #312 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #313 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #314 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #315 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #316 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #317 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #318 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #319 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #320 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #321 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #322 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #323 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #324 就绪，MemAvailable=115973MB（累计用 7939MB）
+[density] 实例 #325 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #326 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #327 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #328 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #329 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #330 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #331 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #332 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #333 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #334 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #335 就绪，MemAvailable=115968MB（累计用 7944MB）
+[density] 实例 #336 就绪，MemAvailable=115967MB（累计用 7945MB）
+[density] 实例 #337 就绪，MemAvailable=115965MB（累计用 7947MB）
+[density] 实例 #338 就绪，MemAvailable=115966MB（累计用 7946MB）
+[density] 实例 #339 就绪，MemAvailable=115966MB（累计用 7946MB）
+[density] 实例 #340 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #341 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #342 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #343 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #344 就绪，MemAvailable=115972MB（累计用 7940MB）
+[density] 实例 #345 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #346 就绪，MemAvailable=115969MB（累计用 7943MB）
+[density] 实例 #347 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #348 就绪，MemAvailable=115969MB（累计用 7943MB）
+[density] 实例 #349 就绪，MemAvailable=115969MB（累计用 7943MB）
+[density] 实例 #350 就绪，MemAvailable=115968MB（累计用 7944MB）
+[density] 实例 #351 就绪，MemAvailable=115966MB（累计用 7946MB）
+[density] 实例 #352 就绪，MemAvailable=116005MB（累计用 7907MB）
+[density] 实例 #353 就绪，MemAvailable=116005MB（累计用 7907MB）
+[density] 实例 #354 就绪，MemAvailable=116009MB（累计用 7903MB）
+[density] 实例 #355 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #356 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #357 就绪，MemAvailable=116006MB（累计用 7906MB）
+[density] 实例 #358 就绪，MemAvailable=116004MB（累计用 7908MB）
+[density] 实例 #359 就绪，MemAvailable=115999MB（累计用 7913MB）
+[density] 实例 #360 就绪，MemAvailable=115998MB（累计用 7914MB）
+[density] 实例 #361 就绪，MemAvailable=115969MB（累计用 7943MB）
+[density] 实例 #362 就绪，MemAvailable=115974MB（累计用 7938MB）
+[density] 实例 #363 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #364 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #365 就绪，MemAvailable=115976MB（累计用 7936MB）
+[density] 实例 #366 就绪，MemAvailable=115980MB（累计用 7932MB）
+[density] 实例 #367 就绪，MemAvailable=115977MB（累计用 7935MB）
+[density] 实例 #368 就绪，MemAvailable=115975MB（累计用 7937MB）
+[density] 实例 #369 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #370 就绪，MemAvailable=115971MB（累计用 7941MB）
+[density] 实例 #371 就绪，MemAvailable=115970MB（累计用 7942MB）
+[density] 实例 #372 就绪，MemAvailable=115967MB（累计用 7945MB）
+[density] 实例 #373 就绪，MemAvailable=115959MB（累计用 7953MB）
+[density] 实例 #374 就绪，MemAvailable=115959MB（累计用 7953MB）
+[density] 实例 #375 就绪，MemAvailable=115960MB（累计用 7952MB）
+[density] 实例 #376 就绪，MemAvailable=115960MB（累计用 7952MB）
+[density] 实例 #377 就绪，MemAvailable=115960MB（累计用 7952MB）
+[density] 实例 #378 就绪，MemAvailable=115960MB（累计用 7952MB）
+[density] 实例 #379 就绪，MemAvailable=115962MB（累计用 7950MB）
+[density] 实例 #380 就绪，MemAvailable=115960MB（累计用 7952MB）
+[density] 实例 #381 就绪，MemAvailable=115961MB（累计用 7951MB）
+[density] 实例 #382 就绪，MemAvailable=115961MB（累计用 7951MB）
+[density] 实例 #383 就绪，MemAvailable=115959MB（累计用 7953MB）
+[density] 实例 #384 就绪，MemAvailable=115958MB（累计用 7954MB）
+[density] 实例 #385 就绪，MemAvailable=115955MB（累计用 7957MB）
+[density] 实例 #386 就绪，MemAvailable=115957MB（累计用 7955MB）
+[density] 实例 #387 就绪，MemAvailable=115947MB（累计用 7965MB）
+[density] 实例 #388 就绪，MemAvailable=115946MB（累计用 7966MB）
+[density] 实例 #389 就绪，MemAvailable=115950MB（累计用 7962MB）
+[density] 实例 #390 就绪，MemAvailable=115947MB（累计用 7965MB）
+[density] 实例 #391 就绪，MemAvailable=115945MB（累计用 7967MB）
+[density] 实例 #392 就绪，MemAvailable=115946MB（累计用 7966MB）
+[density] 实例 #393 就绪，MemAvailable=115946MB（累计用 7966MB）
+[density] 实例 #394 就绪，MemAvailable=115945MB（累计用 7967MB）
+[density] 实例 #395 就绪，MemAvailable=115947MB（累计用 7965MB）
+[density] 实例 #396 就绪，MemAvailable=115946MB（累计用 7966MB）
+[density] 实例 #397 就绪，MemAvailable=115945MB（累计用 7967MB）
+[density] 实例 #398 就绪，MemAvailable=115925MB（累计用 7987MB）
+[density] 实例 #399 就绪，MemAvailable=115924MB（累计用 7988MB）
+[density] 实例 #400 就绪，MemAvailable=115926MB（累计用 7986MB）
+[density] 峰值 400 实例，停因=reached-max，均摊 ~19MB/实例
+[density] 等待 400 实例自清理（hold=120s）...
+[density] 自清理后 firecracker 残留=0
+[bench] bench-density 完成
+[bench] 运行 bench-exec-overhead ...
+[exec-overhead] 构建预烘焙模板 examples/hello.sandlocker.toml ...
+[build] 生成新签名密钥 /home/ubuntu/.sandlocker/signing.key（公钥 448e3c446706377af06b89c33e25d98ef09019b66843b982cbcf5df4c682e0d4）
+[bench] bench-exec-overhead 完成
+[bench] 运行 bench-net-timing ...
+[net-timing] 模式=rootless-structural（margin 须>0=false）
+[net-timing] 烘焙快照 → /srv/bench/sandlocker/build/run/snap-net-timing
+[sl-node] 快照 create：API 启动（无网络）→ 就绪 → Paused → snapshot/create
+[sl-node] 快照就绪：/srv/bench/sandlocker/build/run/snap-net-timing（vmstate/mem/rootfs.ext4/expect），快照点 uptime≈2.27s
+[net-timing] 轮 1/6：policy_before_resume=true margin=0µs
+[net-timing] 轮 2/6：policy_before_resume=true margin=0µs
+[net-timing] 轮 3/6：policy_before_resume=true margin=0µs
+[net-timing] 轮 4/6：policy_before_resume=true margin=0µs
+[net-timing] 轮 5/6：policy_before_resume=true margin=0µs
+[net-timing] 轮 6/6：policy_before_resume=true margin=0µs
+[bench] bench-net-timing 完成
+[bench] 运行 bench-pool ...
+[pool] 构建预烘焙模板 examples/hello.sandlocker.toml ...
+[pool] build: {"metric":"template_build","name":"hello","version":"a10453673acb","content_digest":"0d240190b3c4fd4c4f4e28ba4c0d6027712d3cc1d7f1351d180bb044776322bc","signed":true,"build_network":"deny","run_steps":3,"pass":true}
+[bench] bench-pool 完成
+[bench] 运行 bench-reaper ...
+[reaper] forks=500 残留僵尸=0
+[bench] bench-reaper 完成
+[bench] 运行 bench-restore-create ...
+[restore-create] 构建预烘焙模板 examples/hello.sandlocker.toml ...
+[restore-create] build: {"metric":"template_build","name":"hello","version":"4897c1c708dd","content_digest":"3c17683225884094ae06011165c719d39f89d986dd3658bbfbc3cf8b498fb4a5","signed":true,"build_network":"deny","run_steps":3,"pass":true}
+[bench] bench-restore-create 完成
+[bench] 运行 bench-teardown ...
+[sl-node] 启动 microVM（独立 netns + tap sltap0，rootless，API 启动）
+[sl-node] guest sl-envd 就绪，耗时 ~402ms（含冷 boot，非 SLO 口径）
+[sl-node] ── 冷路径分段（Q3，单次冷启动，非 SLO 口径）──
+[sl-node]   总计(spawn→envd ready, host):      402 ms
+[sl-node]   ├─ pre-kernel(host: unshare/tap/FC 加载内核前): ~182 ms
+[sl-node]   └─ guest boot→envd ready(guest 单调钟):         ~220 ms
+[sl-node]   guest dmesg 参考（VM 早期时钟偏高）: 挂载 rootfs @255ms, init @258ms
+[sl-node] 命令退出码: 0
+[sl-node]   轮 1/5: 无残留 ✓
+[sl-node] 启动 microVM（独立 netns + tap sltap0，rootless，API 启动）
+[sl-node] guest sl-envd 就绪，耗时 ~403ms（含冷 boot，非 SLO 口径）
+[sl-node] ── 冷路径分段（Q3，单次冷启动，非 SLO 口径）──
+[sl-node]   总计(spawn→envd ready, host):      403 ms
+[sl-node]   ├─ pre-kernel(host: unshare/tap/FC 加载内核前): ~193 ms
+[sl-node]   └─ guest boot→envd ready(guest 单调钟):         ~210 ms
+[sl-node]   guest dmesg 参考（VM 早期时钟偏高）: 挂载 rootfs @254ms, init @257ms
+[sl-node] 命令退出码: 0
+[sl-node]   轮 2/5: 无残留 ✓
+[sl-node] 启动 microVM（独立 netns + tap sltap0，rootless，API 启动）
+[sl-node] guest sl-envd 就绪，耗时 ~403ms（含冷 boot，非 SLO 口径）
+[sl-node] ── 冷路径分段（Q3，单次冷启动，非 SLO 口径）──
+[sl-node]   总计(spawn→envd ready, host):      403 ms
+[sl-node]   ├─ pre-kernel(host: unshare/tap/FC 加载内核前): ~193 ms
+[sl-node]   └─ guest boot→envd ready(guest 单调钟):         ~210 ms
+[sl-node]   guest dmesg 参考（VM 早期时钟偏高）: 挂载 rootfs @254ms, init @257ms
+[sl-node] 命令退出码: 0
+[sl-node]   轮 3/5: 无残留 ✓
+[sl-node] 启动 microVM（独立 netns + tap sltap0，rootless，API 启动）
+[sl-node] guest sl-envd 就绪，耗时 ~402ms（含冷 boot，非 SLO 口径）
+[sl-node] ── 冷路径分段（Q3，单次冷启动，非 SLO 口径）──
+[sl-node]   总计(spawn→envd ready, host):      402 ms
+[sl-node]   ├─ pre-kernel(host: unshare/tap/FC 加载内核前): ~192 ms
+[sl-node]   └─ guest boot→envd ready(guest 单调钟):         ~210 ms
+[sl-node]   guest dmesg 参考（VM 早期时钟偏高）: 挂载 rootfs @252ms, init @255ms
+[sl-node] 命令退出码: 0
+[sl-node]   轮 4/5: 无残留 ✓
+[sl-node] 启动 microVM（独立 netns + tap sltap0，rootless，API 启动）
+[sl-node] guest sl-envd 就绪，耗时 ~403ms（含冷 boot，非 SLO 口径）
+[sl-node] ── 冷路径分段（Q3，单次冷启动，非 SLO 口径）──
+[sl-node]   总计(spawn→envd ready, host):      403 ms
+[sl-node]   ├─ pre-kernel(host: unshare/tap/FC 加载内核前): ~193 ms
+[sl-node]   └─ guest boot→envd ready(guest 单调钟):         ~210 ms
+[sl-node] 命令退出码: 0
+[sl-node]   轮 5/5: 无残留 ✓
+[sl-node] W4 对账 PASS：5 轮 create/destroy 后无残留（进程/tap/socket）
+[teardown] 5 轮无残留
+[bench] bench-teardown 完成
+[bench] 结果: /srv/bench/sandlocker/build/bench/results.jsonl
