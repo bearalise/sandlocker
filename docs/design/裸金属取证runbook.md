@@ -90,6 +90,28 @@
 
 Debian 12 也可以，但历史上需要 `kernel.unprivileged_userns_clone=1`，同样见 §5.1。
 
+**只有 Ubuntu 20.04 可选时：能用**，apt 依赖全齐（实测：gcc 9.4 / xfsprogs 5.3 / nftables 0.9.3 /
+make 4.2.1），userns 默认开（没有 24.04 那个 AppArmor 限制），`mkfs.xfs` 也已默认 `reflink=1`
+（xfsprogs ≥5.1 起）。两点差异：
+
+- **GCC 9.4 建 6.6 guest 内核有不确定性**。`build-kernel.sh` 默认拉 6.6.y，Linux 6.6 的最低要求
+  是 GCC 5.1，9.4 名义上够、实践上大概率能过，但未经验证。好在这是**跑基准前的前置步骤**，
+  失败会立刻暴露、不浪费后续租机时间——上机第一件事就跑 `scripts/build-kernel.sh`。挂了有两条兜底：
+
+  ```bash
+  # A. 换 GCC 10（20.04 仓库里有 10.5.0）
+  sudo apt-get install -y gcc-10
+  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100
+  # B. 换更老的内核系列（脚本第一个参数即主版本）
+  scripts/build-kernel.sh 6.1
+  ```
+
+- **cgroup v1 默认，不是阻塞项**。`cgroup_v2()` 只是探测：检测到 v2 才给 jailer 传
+  `--cgroup-version 2`，否则走 v1，优雅降级。想切 v2 可在 GRUB 顺手加
+  `systemd.unified_cgroup_hierarchy=1`（反正要改 GRUB 加 `mem=128G maxcpus=64`）。
+
+20.04 标准支持已于 2025-04 结束——临时基准机可接受，别拿它当长期节点。
+
 开机后先自测一句，出 `OK` 再往下：
 
 ```bash
