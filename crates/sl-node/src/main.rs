@@ -229,6 +229,9 @@ struct Config {
     /// --cluster-reconcile：M3 W4 集群合龙对账——跨副本共享态（A 写 B 见）+ 失联回收跨副本同步。
     /// 默认 SQLite 两句柄；--etcd 则对真 etcd 跑（真跨副本）。随后退出。
     cluster_reconcile: bool,
+    /// --gw-cluster-reconcile：M3 W5 网关拆副本对账——共享 secret 使 A 签发 B 可验（无状态验签）+
+    /// 一次性跨副本（B 用过 A 再用即拒）+ 篡改/过期拒。默认 SQLite 两句柄；--etcd 则真 etcd。随后退出。
+    gw_cluster_reconcile: bool,
 }
 
 fn main() {
@@ -430,6 +433,18 @@ fn main() {
             Ok(()) => println!("[election] M3-Q2 election-reconcile PASS"),
             Err(e) => {
                 eprintln!("[election] M3-Q2 election-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --gw-cluster-reconcile：M3 W5 网关拆副本对账（共享 secret 无状态验签 + 一次性跨副本）。
+    if cfg.gw_cluster_reconcile {
+        match run_gw_cluster_reconcile(&cfg) {
+            Ok(()) => println!("[gw-cluster] M3 W5 gw-cluster-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[gw-cluster] M3 W5 gw-cluster-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2231,6 +2246,7 @@ fn clone_paths(cfg: &Config) -> Config {
         election_reconcile: false,
         node_reclaim_reconcile: false,
         cluster_reconcile: false,
+        gw_cluster_reconcile: false,
 }
 }
 
@@ -2401,6 +2417,91 @@ fn run_election_reconcile(cfg: &Config) -> Result<(), String> {
     let _ = std::fs::remove_file(format!("{p}-shm"));
     r?;
     println!("[election] SqliteStore(file) 双竞选者：单 leader + resign failover + 无双主 PASS");
+    Ok(())
+}
+
+/// M3 W5 网关拆副本对账：共享 secret 使 A 签发 B 可验（无状态验签）+ 一次性跨副本 + 篡改/过期拒。
+fn run_gw_cluster_reconcile(cfg: &Config) -> Result<(), String> {
+    use crate::gateway::{parse_query, Action, Gateway};
+    use sl_store::{SqliteStore, Store};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+
+    // 两副本共享同一后端：各建一个 Gateway（new_shared 从 store 收敛同一 secret）。
+    fn asserts(sa: Box<dyn Store>, sb: Box<dyn Store>, cleaner: &dyn Store, now: i64) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        // 起点干净：清 gw_secret + 残留 nonce。
+        let _ = cleaner.delete("cluster/gw_secret");
+        for kv in cleaner.list("gw/nonce/").map_err(|e| e.to_string())? {
+            let _ = cleaner.delete(&kv.key);
+        }
+
+        let gwa = Gateway::new_shared("http://gw".into(), sa)?;
+        let gwb = Gateway::new_shared("http://gw".into(), sb)?;
+
+        // A 签发 → B 无状态验签通过（跨副本，共享 secret）。
+        let url = gwa.mint("sb1", Action::Exec, 0, 60, now);
+        let q = parse_query(&url);
+        gwb.verify(&q, now).map_err(|e| format!("B 应能验 A 签发的 ticket: {e}"))?;
+
+        // 一次性跨副本：B 已用 → A 再用即拒（nonce 经 store 消费）。
+        want!(gwa.verify(&q, now).is_err(), "跨副本重用应被拒（一次性）");
+        want!(gwb.verify(&q, now).is_err(), "同副本重用应被拒（一次性）");
+
+        // 篡改 sig → 拒。
+        let mut q2 = parse_query(&gwa.mint("sb2", Action::Exec, 0, 60, now));
+        q2.insert("sig".into(), "deadbeef".into());
+        want!(gwb.verify(&q2, now).is_err(), "篡改 sig 应被拒");
+
+        // 过期 → 拒。
+        let q3 = parse_query(&gwa.mint("sb3", Action::Exec, 0, 1, now));
+        want!(gwb.verify(&q3, now + 10).is_err(), "过期 ticket 应被拒");
+
+        // 收尾清理。
+        let _ = cleaner.delete("cluster/gw_secret");
+        for kv in cleaner.list("gw/nonce/").map_err(|e| e.to_string())? {
+            let _ = cleaner.delete(&kv.key);
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let a = Box::new(sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?);
+            let b = Box::new(sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?);
+            let cleaner = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(a, b, &cleaner, now)?;
+            println!("[gw-cluster] EtcdStore({ep}) 跨副本：A 签 B 验 + 一次性跨副本 + 篡改/过期拒 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--gw-cluster-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-gwcluster-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let a = Box::new(SqliteStore::open(&p).map_err(|e| e.to_string())?);
+        let b = Box::new(SqliteStore::open(&p).map_err(|e| e.to_string())?);
+        let cleaner = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(a, b, &cleaner, now)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[gw-cluster] SqliteStore(file) 两句柄：A 签 B 验 + 一次性跨副本 + 篡改/过期拒 PASS");
     Ok(())
 }
 
@@ -2662,6 +2763,7 @@ fn parse_args() -> Config {
         election_reconcile: false,
         node_reclaim_reconcile: false,
         cluster_reconcile: false,
+        gw_cluster_reconcile: false,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2725,6 +2827,7 @@ fn parse_args() -> Config {
             "--election-reconcile" => cfg.election_reconcile = true,
             "--node-reclaim-reconcile" => cfg.node_reclaim_reconcile = true,
             "--cluster-reconcile" => cfg.cluster_reconcile = true,
+            "--gw-cluster-reconcile" => cfg.gw_cluster_reconcile = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

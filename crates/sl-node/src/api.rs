@@ -222,7 +222,13 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
 
     // M2 W10 数据面网关（ADR-22）：独立监听（默认 127.0.0.1:7879），与控制面同进程共享 orch + secret。
     let gw_addr = cfg.gw_addr.clone().unwrap_or_else(|| "127.0.0.1:7879".to_string());
-    let gw: SharedGw = Arc::new(Gateway::new_random(format!("http://{gw_addr}")));
+    // M3 W5：集群模式网关走**共享 secret + store 一次性 nonce**（任一副本验任一副本签发的 ticket、
+    // 一次性跨副本；ADR-22）；单机沿用进程内随机 secret（零回归）。
+    let gw: SharedGw = if etcd_mode {
+        Arc::new(Gateway::new_shared(format!("http://{gw_addr}"), open_store(cfg, db_str)?)?)
+    } else {
+        Arc::new(Gateway::new_random(format!("http://{gw_addr}")))
+    };
     {
         let gw_l = Arc::clone(&gw);
         let sh_l = Arc::clone(&shared);
