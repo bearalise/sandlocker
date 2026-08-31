@@ -46,7 +46,7 @@ FS_TYPE="$(stat -f -c %T "$REPO_ROOT" 2>/dev/null || echo unknown)"
 RL_DIR="$REPO_ROOT/build/.reflink-probe"
 mkdir -p "$RL_DIR" 2>/dev/null || true
 if printf 'x' > "$RL_DIR/a" 2>/dev/null && cp --reflink=always "$RL_DIR/a" "$RL_DIR/b" 2>/dev/null; then
-  report "reflink" "OK（fs=$FS_TYPE，create 走 CoW 秒拷）"
+  report "reflink" "OK（fs=${FS_TYPE}，create 走 CoW 秒拷）"
 else
   report "reflink" "WARN: fs=$FS_TYPE 不支持 reflink → 每次 create 全量拷 rootfs，创建分位会被抬高"
   echo "  └ 取 SLO 取证时请把工作目录放到 XFS(reflink=1) 或 Btrfs 上；ext4 不支持 reflink。" >&2

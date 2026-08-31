@@ -10,6 +10,7 @@
 - [M2 technical plan](design/M2技术计划.md)
 - [M3 technical plan](design/M3技术计划.md)
 - [Bare-metal SLO runbook](design/裸金属取证runbook.md)
+- [M3-Q9 bare-metal evidence (2026-08-31)](design/M3-Q9裸金属取证-2026-08-31.md)
 - [Backend compatibility matrix](design/后端兼容矩阵.md)
 - [Port exposure (外部访问 VM 内服务)](design/端口暴露.md)
 - [Guest kernel strategy](design/内核跟进策略.md)

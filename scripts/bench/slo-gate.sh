@@ -131,9 +131,32 @@ if [ "${SLO_DENSITY_HOST_OK:-0}" != "1" ]; then
   fi
 fi
 
+# 密度数字的**成色**：`stop_reason` 与均摊内存决定这个数能不能按字面读。
+#
+# - `reached-max`：撞的是 DENSITY_MAX 参数，不是真实天花板 → 这个数是**下界**，上限未探到。
+# - 均摊内存 << 配置内存：Firecracker 内存惰性缺页，空闲实例根本没碰过自己那份 RAM，
+#   于是密度被懒加载放大。PRD §8.1 脚注明说这份收益「**不作为 SLO 承诺**」。
+#
+# 两种情况都不改变「达没达门线」，但都必须显示出来——否则一个光秃秃的 PASS 会被当成
+# 「200 个真实负载各吃 512MiB 也扛得住」，而证据其实只支持「N 个空闲实例共用少量内存」。
+density_note() { # $1=spec
+  local sp="$1" note=""
+  local stop; stop="$(grep "\"metric\":\"density\"" "$FILE" 2>/dev/null | grep -F "\"spec\":\"$sp\"" | tail -1 \
+    | grep -oE '"stop_reason":"[a-z-]*"' | cut -d'"' -f4)"
+  local per; per="$(field density per_vm_mb_est "\"spec\":\"$sp\"")"
+  local cfg; cfg="$(field density mem_mib "\"spec\":\"$sp\"")"
+  [ "$stop" = "reached-max" ] && note="下界·未探到上限"
+  if [ -n "$per" ] && [ -n "$cfg" ] && [ "$cfg" -gt 0 ] && [ "$per" -lt $(( cfg / 4 )) ]; then
+    note="${note:+${note}·}空闲实例(均摊${per}M«配置${cfg}M)"
+  fi
+  echo "$note"
+}
+
 if [ "$DENSITY_HOST_OK" = "1" ]; then
   row "密度 @ 默认规格 2c/512M"  "$(field density max_instances '"spec":"default"')" "${DENSITY_DEFAULT}" ge "台"
+  _n="$(density_note default)"; [ -n "$_n" ] && printf '%34s %s\n' "" "└ $_n"
   row "密度 @ micro 规格 128M"   "$(field density max_instances '"spec":"micro"')"   "${DENSITY_MICRO}"   ge "台"
+  _n="$(density_note micro)"; [ -n "$_n" ] && printf '%34s %s\n' "" "└ $_n"
 else
   _d="$(field density max_instances '"spec":"default"')"
   _m="$(field density max_instances '"spec":"micro"')"
