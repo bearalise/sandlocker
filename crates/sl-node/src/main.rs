@@ -214,9 +214,15 @@ struct Config {
     /// 后端无关契约套件；若同时给 --etcd 且以 `--features cluster` 构建，则对 EtcdStore 再跑同一套。
     /// 随后退出。免 root（纯元数据）。
     store_contract: bool,
-    /// --etcd <endpoint>：etcd v3 gateway 地址（如 http://127.0.0.1:2379）。仅 --store-contract 用；
-    /// 需以 `--features cluster` 构建，否则报错提示重建。
+    /// --etcd <endpoint>：etcd v3 gateway 地址（如 http://127.0.0.1:2379）。--store-contract /
+    /// --cluster-init / --election-reconcile 用；需以 `--features cluster` 构建，否则报错提示重建。
     etcd: Option<String>,
+    /// --cluster-init：M3 W2 一次性迁移（ADR-17）——把 `--store <sqlite>` 全量键搬到 `--etcd <ep>`。
+    /// 停机迁移事件（文档明示）；需 `--features cluster`。随后退出。
+    cluster_init: bool,
+    /// --election-reconcile：M3-Q2 选主对账——双竞选者证单 leader + resign failover + 无双主。
+    /// 默认对 SQLite 临时文件跑；给 --etcd 且 cluster 构建则对真 etcd 跑同一套。随后退出。
+    election_reconcile: bool,
 }
 
 fn main() {
@@ -406,6 +412,30 @@ fn main() {
             Ok(()) => println!("[store] M3-Q1 store-contract PASS"),
             Err(e) => {
                 eprintln!("[store] M3-Q1 store-contract FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --election-reconcile：M3-Q2 选主对账（双竞选者 → 单 leader + resign failover + 无双主）。
+    if cfg.election_reconcile {
+        match run_election_reconcile(&cfg) {
+            Ok(()) => println!("[election] M3-Q2 election-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[election] M3-Q2 election-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --cluster-init：M3 W2 SQLite→etcd 一次性迁移（ADR-17，停机事件）。
+    if cfg.cluster_init {
+        match run_cluster_init(&cfg) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[cluster-init] FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2167,6 +2197,8 @@ fn clone_paths(cfg: &Config) -> Config {
         expose_allow_public: false,
         store_contract: false,
         etcd: None,
+        cluster_init: false,
+        election_reconcile: false,
     }
 }
 
@@ -2275,6 +2307,90 @@ fn run_store_contract(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// M3-Q2 选主对账：双竞选者跑「单 leader + 续租 + resign failover + 无双主」，两后端同一套。
+fn run_election_reconcile(cfg: &Config) -> Result<(), String> {
+    use sl_store::election::Election;
+    use sl_store::SqliteStore;
+
+    // 断言脚本（对任意 Store 后端成立）。
+    fn asserts(a: &mut Election, b: &mut Election) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        want!(a.try_campaign().map_err(|e| e.to_string())?, "A 应当选");
+        want!(!b.try_campaign().map_err(|e| e.to_string())?, "B 应落败（A 持有）");
+        want!(a.is_leader() && !b.is_leader(), "任一时刻至多一个 leader");
+        want!(a.try_campaign().map_err(|e| e.to_string())?, "A 续租应仍为 leader");
+        want!(!b.try_campaign().map_err(|e| e.to_string())?, "B 仍应落败");
+        a.resign().map_err(|e| e.to_string())?;
+        want!(!a.is_leader(), "A resign 后应非 leader");
+        want!(b.try_campaign().map_err(|e| e.to_string())?, "A 让位后 B 应夺主");
+        want!(!a.try_campaign().map_err(|e| e.to_string())?, "此时 A 应落败（B 持有）");
+        want!(b.is_leader() && !a.is_leader(), "至多一个 leader（换 B）");
+        b.resign().map_err(|e| e.to_string())?; // 清理
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            use sl_store::etcd::EtcdStore;
+            use sl_store::{election::LEADER_KEY, Store};
+            // 起点干净：清掉可能残留的 leader 键。
+            let cleaner = EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            let _ = cleaner.delete(LEADER_KEY);
+            let mut a = Election::new(Box::new(EtcdStore::connect(ep).map_err(|e| e.to_string())?), "node-a", 30);
+            let mut b = Election::new(Box::new(EtcdStore::connect(ep).map_err(|e| e.to_string())?), "node-b", 30);
+            asserts(&mut a, &mut b)?;
+            println!("[election] EtcdStore({ep}) 双竞选者：单 leader + resign failover + 无双主 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--election-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    // 默认：SQLite 文件（两句柄共享同一文件 → 可测双竞选者）。
+    let path = std::env::temp_dir().join(format!("sl-election-reconcile-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let mut a = Election::new(Box::new(SqliteStore::open(&p).map_err(|e| e.to_string())?), "node-a", 30);
+        let mut b = Election::new(Box::new(SqliteStore::open(&p).map_err(|e| e.to_string())?), "node-b", 30);
+        asserts(&mut a, &mut b)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[election] SqliteStore(file) 双竞选者：单 leader + resign failover + 无双主 PASS");
+    Ok(())
+}
+
+/// M3 W2 `cluster init`：把 `--store <sqlite>` 全量键一次性迁移到 `--etcd <ep>`（ADR-17）。
+#[cfg(feature = "cluster")]
+fn run_cluster_init(cfg: &Config) -> Result<(), String> {
+    use sl_store::{migrate_all, SqliteStore};
+    let src_path = cfg.store.as_ref().ok_or("--cluster-init 需 --store <sqlite 路径>")?;
+    let ep = cfg.etcd.as_ref().ok_or("--cluster-init 需 --etcd <endpoint>")?;
+    let src = SqliteStore::open(src_path.to_str().ok_or("store 路径非 UTF-8")?).map_err(|e| e.to_string())?;
+    let dst = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+    let n = migrate_all(&src, &dst).map_err(|e| e.to_string())?;
+    println!("[cluster-init] 迁移完成：{n} 键  SQLite({}) → etcd({ep})", src_path.display());
+    println!("[cluster-init] 注意：这是停机迁移事件（ADR-17）——迁移期间不应有在跑沙箱或并发写入。");
+    Ok(())
+}
+
+#[cfg(not(feature = "cluster"))]
+fn run_cluster_init(_cfg: &Config) -> Result<(), String> {
+    Err("--cluster-init 需以 `--features cluster` 构建 sl-node（当前未启用该特性）".into())
+}
+
 fn parse_args() -> Config {
     let mut cfg = Config {
         kernel: PathBuf::from("build/kernel/vmlinux"),
@@ -2330,6 +2446,8 @@ fn parse_args() -> Config {
         expose_allow_public: false,
         store_contract: false,
         etcd: None,
+        cluster_init: false,
+        election_reconcile: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -2389,6 +2507,8 @@ fn parse_args() -> Config {
             "--expose-allow-public" => cfg.expose_allow_public = true,
             "--store-contract" => cfg.store_contract = true,
             "--etcd" => cfg.etcd = Some(take()),
+            "--cluster-init" => cfg.cluster_init = true,
+            "--election-reconcile" => cfg.election_reconcile = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

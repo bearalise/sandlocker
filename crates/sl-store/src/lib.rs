@@ -20,6 +20,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// 后端无关的 store 契约套件（M3-Q1）：SqliteStore 与 EtcdStore 跑同一套断言。
 pub mod contract;
 
+/// 后端无关的 leader 选举（M3-Q2）：orchestrator active-standby，建在 CAS+lease 之上。
+pub mod election;
+
 /// EtcdStore（集群模式，M3 W1）：over etcd v3 gRPC-gateway 的 sync ureq+JSON 实现。
 /// `cluster` feature 门控——单机构建不拉入任何 HTTP/TLS 依赖（守 M2 D5 精简依赖哲学）。
 #[cfg(feature = "cluster")]
@@ -118,6 +121,20 @@ pub trait Store: Send + Sync {
     fn watch(&self, prefix: &str) -> Receiver<Event>;
     /// 压实：删除 revision <= below 的 events 日志行（有界化，防无限增长）。
     fn compact(&self, below: Revision) -> Result<usize>;
+}
+
+/// 一次性全量迁移：把 `src` 的全部键复制到 `dst`（M3 W2，`cluster init` SQLite→etcd 用）。
+///
+/// 后端无关（两侧都只用 `Store` trait）。语义：**leaseless 复制持久态**——迁移是**停机事件**
+/// （文档明示），此刻不应有在跑沙箱的易失租约键；键按 store 有序遍历、逐个 `put`（无租约）。
+/// 返回迁移的键数。dst 已存在的同名键将被覆盖。
+pub fn migrate_all(src: &dyn Store, dst: &dyn Store) -> Result<usize> {
+    let kvs = src.list("")?;
+    let n = kvs.len();
+    for kv in kvs {
+        dst.put(&kv.key, &kv.value, None)?;
+    }
+    Ok(n)
 }
 
 struct Watcher {
@@ -502,6 +519,23 @@ mod tests {
     fn sqlite_passes_store_contract() {
         let s = store();
         crate::contract::run_all(&s).expect("SqliteStore 应通过 store 契约");
+    }
+
+    /// M3 W2：migrate_all 全量复制持久态（cluster init SQLite→etcd 的后端无关内核）。
+    #[test]
+    fn migrate_all_copies_every_key() {
+        let src = store();
+        src.put("sandbox/a/meta", b"m1", None).unwrap();
+        src.put("sandbox/b/meta", b"m2", None).unwrap();
+        src.put("template/x/latest", b"v9", None).unwrap();
+        let dst = store();
+        let n = crate::migrate_all(&src, &dst).unwrap();
+        assert_eq!(n, 3, "应迁移 3 键");
+        assert_eq!(dst.get("sandbox/a/meta").unwrap().unwrap().value, b"m1");
+        assert_eq!(dst.get("sandbox/b/meta").unwrap().unwrap().value, b"m2");
+        assert_eq!(dst.get("template/x/latest").unwrap().unwrap().value, b"v9");
+        // 迁移是 leaseless（停机事件复制持久态）
+        assert!(dst.get("sandbox/a/meta").unwrap().unwrap().lease.is_none());
     }
 
     #[test]
