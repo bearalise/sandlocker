@@ -267,6 +267,17 @@ struct Config {
     /// 「按归属路由 / 无会话粘滞 / 一次性跨副本 / 未接入节点 503 / 全双工流式 / mTLS 拒无证书」。
     /// 默认 SQLite 临时文件；--etcd 则对真 etcd 跑同一套。随后退出。
     gw_dataplane_reconcile: bool,
+    /// --exec-bench <模板目录>：§8.1「exec 启动开销 ≤20ms」实测——单实例上串行跑 N 次
+    /// `exec("true")` 端到端往返，出 `{"metric":"exec_overhead",...}`。随后退出。免 root。
+    exec_bench: Option<PathBuf>,
+    /// --vcpus N / --mem-mib N：`run` 路径 microVM 规格（默认 1 vCPU / 128MiB，即历史写死值，零回归）。
+    ///
+    /// 加这两个旋钮是为了 **M3-Q9 的口径正确性**：密度 SLO（PRD §8.1）分两档——「≥200 @ 默认规格
+    /// 2vCPU/512MiB」与「≥500 @ micro 128MiB」。在此之前 `run` 把 machine-config 写死为 1/128，
+    /// 于是密度基准量的其实是 micro 档，却被当作默认档 gate——内存差 4 倍，会得出偏乐观且贴错
+    /// 标签的结论。现在两档各自可测。
+    vcpus: u32,
+    mem_mib: u32,
     /// --snap-kms-key <文件>：M3 W9（ADR-15）快照信封加密的**根密钥**（32 字节，权限 0600）。
     /// 给了才启用加密——显式开关，不静默生效（加密改变快照落盘格式，与既有明文快照不兼容）。
     snap_kms_key: Option<PathBuf>,
@@ -389,6 +400,18 @@ pub fn cli_main() {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("[orch] Q2 bench FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --exec-bench：§8.1「exec 启动开销 ≤20ms」实测（此前该行无任何测量）。
+    if let Some(tpl) = cfg.exec_bench.clone() {
+        match orch::exec_bench(&cfg, &tpl) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[exec-bench] FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2032,7 +2055,12 @@ fn configure_via_api(cfg: &Config, api_host: &Path, child: &mut Child) -> Result
     };
     let boot_args = boot_args();
 
-    api.put("/machine-config", r#"{"vcpu_count":1,"mem_size_mib":128}"#)?;
+    // 规格来自 --vcpus/--mem-mib（默认 1/128 = 历史写死值，零回归）。密度基准据此分「默认档 /
+    // micro 档」两次跑，才对得上 §8.1 的两行密度口径。
+    api.put(
+        "/machine-config",
+        &format!(r#"{{"vcpu_count":{},"mem_size_mib":{}}}"#, cfg.vcpus, cfg.mem_mib),
+    )?;
     api.put(
         "/boot-source",
         &format!(r#"{{"kernel_image_path":"{kernel_v}","boot_args":"{boot_args}"}}"#),
@@ -2406,6 +2434,9 @@ fn clone_paths(cfg: &Config) -> Config {
         abi_contract: None,
         q5_reconcile: None,
         gw_addr: None,
+        exec_bench: None,
+        vcpus: 1,
+        mem_mib: 128,
         snap_kms_key: None,
         snap_kms_init: None,
         snapcrypt_reconcile: false,
@@ -3647,6 +3678,9 @@ fn parse_args() -> Config {
         abi_contract: None,
         q5_reconcile: None,
         gw_addr: None,
+        exec_bench: None,
+        vcpus: 1,
+        mem_mib: 128,
         snap_kms_key: None,
         snap_kms_init: None,
         snapcrypt_reconcile: false,
@@ -3736,6 +3770,9 @@ fn parse_args() -> Config {
             "--abi-contract" => cfg.abi_contract = Some(PathBuf::from(take())),
             "--q5-reconcile" => cfg.q5_reconcile = Some(PathBuf::from(take())),
             "--gw-addr" => cfg.gw_addr = Some(take()),
+            "--exec-bench" => cfg.exec_bench = Some(PathBuf::from(take())),
+            "--vcpus" => cfg.vcpus = take().parse().unwrap_or(1),
+            "--mem-mib" => cfg.mem_mib = take().parse().unwrap_or(128),
             "--snap-kms-key" => cfg.snap_kms_key = Some(PathBuf::from(take())),
             "--snap-kms-init" => cfg.snap_kms_init = Some(PathBuf::from(take())),
             "--snapcrypt-reconcile" => cfg.snapcrypt_reconcile = true,

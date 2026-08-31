@@ -1825,6 +1825,53 @@ pub fn exec_stream_reconcile(cfg: &Config, template: &Path) -> Result<(), String
     Ok(())
 }
 
+// ————————————————————— exec 启动开销（§8.1）—————————————————————
+
+/// §8.1「exec 启动开销 ≤ 20ms」的实测——**在此之前这一行没有任何测量**，裸金属取证会直接缺一格。
+///
+/// 口径：一个已就绪的沙箱上，`exec("true")` 的**端到端往返**（host 连 vsock → 下发 → guest
+/// `/bin/sh -c true` → 回读结果）。取 `true` 是为了把 guest 内命令自身的耗时压到近零，
+/// 剩下的就是通道 + agent 的固定开销，也正是 §8.1 那一行想约束的东西。
+///
+/// 单实例、串行 N 次、首次丢弃（首次含 vsock 首连与 page-cache 冷）。
+pub fn exec_bench(cfg: &Config, template: &Path) -> Result<(), String> {
+    let cycles = if cfg.cycles > 0 { cfg.cycles } else { 50 };
+    let run_root = cfg.workdir.join("exec-bench");
+    let _ = std::fs::remove_dir_all(&run_root);
+    let store = SqliteStore::open_in_memory().map_err(|e| e.to_string())?;
+    let mut orch = Orch::new(cfg, template, &run_root, Box::new(store))?;
+
+    let spec = SandboxSpec { idle_secs: 3600, ttl_secs: 3600, ..Default::default() };
+    let o = orch.create(&spec)?;
+    let target = orch.exec_target(&o.id).ok_or("创建后取不到 exec 目标")?;
+
+    let mut samples = Vec::new();
+    for i in 0..cycles {
+        let t0 = Instant::now();
+        let (code, _out, _err) = target.exec("true")?;
+        let ms = t0.elapsed().as_millis();
+        if code != 0 {
+            orch.destroy(&o.id)?;
+            return Err(format!("exec-bench: `true` 退出码 {code}（第 {i} 次）"));
+        }
+        if i > 0 {
+            samples.push(ms); // 首次含 vsock 首连，丢弃
+        }
+    }
+    orch.destroy(&o.id)?;
+
+    let n = samples.len();
+    let p50 = percentile(&mut samples, 50);
+    let p99 = percentile(&mut samples, 99);
+    // 只报数不硬门：达标与否由 scripts/bench/slo-gate.sh 统一按 §8.1 判（口径集中一处）。
+    if cfg.json {
+        println!(r#"{{"metric":"exec_overhead","n":{n},"p50_ms":{p50},"p99_ms":{p99}}}"#);
+    } else {
+        println!("[exec-bench] n={n} P50={p50}ms P99={p99}ms（§8.1 口径 ≤20ms）");
+    }
+    Ok(())
+}
+
 // ————————————————————— Q2 创建时延 —————————————————————
 
 /// Q2：预烘焙快照 → 创建走恢复路径，进程内循环 create→destroy × N（首个丢弃作 warm-up，

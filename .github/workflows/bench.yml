@@ -673,17 +673,38 @@ jobs:
         run: scripts/fetch-firecracker.sh
       - name: 构建 guest 内核
         run: scripts/build-kernel.sh
-      - name: 运行全部基准（含密度，BENCH_DENSITY 开启）
-        # 64C/128G 裸金属才有可比密度数据（计划 §8.1）；默认规格实例数 DENSITY_MAX 调高。
-        # 裸金属才 hard-gate 硬出口①与 M2-Q10（托管 runner 慢/共享，bench-light 只 gate 回归）：
-        #   POOL_P50_BUDGET_MS=100 —— 池命中 P50 ≤100ms 硬达标（bench-pool.sh 经 sl-node 读 env）。
-        #   DENSITY_MIN=200        —— M2-Q10 ≥200@默认规格 密度目标 gate（bench-density.sh 尾部）。
+      # §8.1 的密度是**两行**，规格不同、口径不同，必须分两趟跑：
+      #   默认规格 2vCPU/512MiB → ≥200 台
+      #   micro 规格 1vCPU/128MiB → ≥500 台
+      # 历史上 `sl-node run` 把 machine-config 写死 1/128，于是这一趟量的其实是 micro 档却按
+      # 默认档 gate（内存差 4 倍，结论偏乐观且贴错标签）。--vcpus/--mem-mib 落地后两档各自可测。
+      - name: 全量基准 ① 默认规格密度（2vCPU/512MiB，≥200）
         env:
           BENCH_DENSITY: "1"
-          DENSITY_MAX: "600"
+          DENSITY_SPEC_LABEL: "default"
+          DENSITY_VCPUS: "2"
+          DENSITY_MEM_MIB: "512"
+          DENSITY_MAX: "400"
           DENSITY_MIN: "200"
           POOL_P50_BUDGET_MS: "100"
         run: scripts/bench/run-all.sh
+      - name: 全量基准 ② micro 规格密度（1vCPU/128MiB，≥500）
+        env:
+          BENCH_DENSITY: "1"
+          DENSITY_SPEC_LABEL: "micro"
+          DENSITY_VCPUS: "1"
+          DENSITY_MEM_MIB: "128"
+          DENSITY_MAX: "900"
+          DENSITY_MIN: "500"
+          BENCH_ONLY: "density"
+        run: scripts/bench/run-all.sh
+      # 收工判定：把 JSONL 判成一个结论。**严格档**——§8.1 任一行缺测即失败，
+      # 因为 M3-Q9 的判据是「产出 SLO 口径」，缺一格就是没产出。机器是按小时租的，
+      # 不能收工才发现表里有窟窿。
+      - name: SLO 判定（PRD §8.1，严格档）
+        env:
+          SLO_STRICT: "1"
+        run: scripts/bench/slo-gate.sh build/bench/results.jsonl
       - name: 上传基准结果
         if: always()
         uses: actions/upload-artifact@v4
