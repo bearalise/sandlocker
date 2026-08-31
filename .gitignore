@@ -16,6 +16,9 @@ node_modules/
 *.img
 *.ext4
 *.log
+# 例外：裸金属取证的运行日志是**证据**，不是构建产物——机器毁掉就再也拿不到（见
+# docs/design/M3-Q9裸金属取证-*.md）。
+!docs/design/*取证*.log
 
 # 本地免 sudo 构建工具链（scripts/build-kernel.sh 回退用）
 /.toolchain/

@@ -45,11 +45,11 @@ ETCD_ARGS=()
 LABEL="${ETCD_EP:-SQLite}"
 
 echo
-echo "== ① 明文传输：全套数据面断言（$LABEL）"
+echo "== ① 明文传输：全套数据面断言（${LABEL}）"
 "$BIN" --gw-dataplane-reconcile --gw-insecure "${ETCD_ARGS[@]}"
 
 echo
-echo "== ② mTLS 传输：同一套断言跑在 mTLS 之上 + 明文连接被拒（$LABEL）"
+echo "== ② mTLS 传输：同一套断言跑在 mTLS 之上 + 明文连接被拒（${LABEL}）"
 # 对账把网关与节点跑在同一进程里，故这**一张**证书要同时充当服务端与客户端身份：
 # 取 SAN=sandlocker-gw 的那张（gen_cert 已给它 serverAuth+clientAuth 双 EKU），
 # 客户端侧的 --gw-tls-name 才对得上服务端出示的名字。
@@ -103,4 +103,4 @@ fi
 echo "  合法客户端证书 → 握手成功 ✓（拒绝确因缺证书）"
 
 echo
-echo "[verify-gw-dataplane] M3 W5 余项 PASS（$LABEL：明文 + mTLS + 强制客户端证书）"
+echo "[verify-gw-dataplane] M3 W5 余项 PASS（${LABEL}：明文 + mTLS + 强制客户端证书）"

@@ -40,10 +40,28 @@ if [ ! -x "$ENVD_BIN" ]; then
   exit 1
 fi
 
-# --- 校验 sl-envd 为静态链接（动态链接在 guest 内无 loader 会直接失败）---
-if command -v file >/dev/null && file "$ENVD_BIN" | grep -q "dynamically linked"; then
-  echo "[rootfs] 错误: sl-envd 是动态链接，guest 内无法运行；确认用 musl target 构建" >&2
-  exit 1
+# --- 校验 sl-envd 不依赖动态加载器（guest 内无 loader，需要就直接起不来）---
+#
+# 判据是 **PT_INTERP 段是否存在**，不是 `file` 的措辞。Rust 的 musl target 产出的是
+# **static-pie**：它是 PIE、但自包含、无 INTERP，guest 里能跑。而 `file` < 5.39
+# （Ubuntu 20.04 自带 5.38）不认识 static-pie，会把它误报成 "dynamically linked"——
+# 早先用 `file | grep "dynamically linked"` 判断，在 20.04 上会把完全正常的二进制拒掉。
+if command -v readelf >/dev/null 2>&1; then
+  if readelf -l "$ENVD_BIN" 2>/dev/null | grep -q 'INTERP'; then
+    echo "[rootfs] 错误: sl-envd 需要动态加载器（有 PT_INTERP 段），guest 内无 loader 无法运行" >&2
+    echo "[rootfs] 确认用 musl target 构建: cargo build -p sl-envd --release --target x86_64-unknown-linux-musl" >&2
+    exit 1
+  fi
+elif command -v file >/dev/null 2>&1; then
+  # 无 readelf 时退回 file，但要认得 static-pie（老版本 file 会误报，故先匹配肯定式）
+  ENVD_FILE="$(file "$ENVD_BIN")"
+  case "$ENVD_FILE" in
+    *"static-pie linked"*|*"statically linked"*) : ;;
+    *"dynamically linked"*)
+      echo "[rootfs] 错误: sl-envd 是动态链接，guest 内无法运行；确认用 musl target 构建" >&2
+      echo "[rootfs] 提示: 若本机 file < 5.39，static-pie 会被误报——装 binutils 让脚本走 readelf 判据" >&2
+      exit 1 ;;
+  esac
 fi
 
 echo "[rootfs] 准备 staging 目录 ..."

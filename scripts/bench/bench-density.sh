@@ -37,7 +37,7 @@ mem_avail_mb() { awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; }
 
 pids=(); points=""; max_ok=0; stop_reason="reached-max"
 mem0=$(mem_avail_mb)
-echo "[density] 起始 MemAvailable=${mem0}MB，上限 MAX=$MAX，内存地板=${MEM_FLOOR_MB}MB" >&2
+echo "[density] 起始 MemAvailable=${mem0}MB，上限 MAX=${MAX}，内存地板=${MEM_FLOOR_MB}MB" >&2
 
 for i in $(seq 1 "$MAX"); do
   avail=$(mem_avail_mb)
@@ -71,7 +71,7 @@ done
 
 used_total=$(( mem0 - $(mem_avail_mb) ))
 per_vm=0; [ "$max_ok" -gt 0 ] && per_vm=$(( used_total / max_ok ))
-echo "[density] 峰值 $max_ok 实例，停因=$stop_reason，均摊 ~${per_vm}MB/实例" >&2
+echo "[density] 峰值 $max_ok 实例，停因=${stop_reason}，均摊 ~${per_vm}MB/实例" >&2
 
 # 等所有实例保活到期自清理（干净销毁走 sl-node 既有 teardown）
 echo "[density] 等待 $max_ok 实例自清理（hold=${HOLD}s）..." >&2
@@ -91,6 +91,6 @@ printf '{"metric":"density","spec":"%s","vcpus":%d,"mem_mib":%d,"max_instances":
   "$SPEC_LABEL" "$VCPUS" "$MEM_MIB" "$max_ok" "$stop_reason" "$mem0" "$used_total" "$per_vm" "$resid" "$DENSITY_MIN" "$points"
 
 if [ "$DENSITY_MIN" -gt 0 ] && [ "$max_ok" -lt "$DENSITY_MIN" ]; then
-  echo "[density] M3-Q9 未达标（$SPEC_LABEL 档）：峰值 $max_ok < DENSITY_MIN=$DENSITY_MIN（停因=$stop_reason）" >&2
+  echo "[density] M3-Q9 未达标（$SPEC_LABEL 档）：峰值 $max_ok < DENSITY_MIN=${DENSITY_MIN}（停因=${stop_reason}）" >&2
   exit 1
 fi

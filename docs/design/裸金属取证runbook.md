@@ -34,15 +34,138 @@
 
 - **真裸金属 / 真 KVM，不能是嵌套虚拟化。** 嵌套虚拟化下 Firecracker 的冷启动与恢复数字对
   §8.1 毫无参考价值——这是整件事的前提，选型时第一个确认项。开机后先跑 §3 的自检。
-- **≥64 核 / ≥128 GiB 内存**（§8.1 密度口径就是按 64C/128G 节点写的）。低于此规格的数字
-  不能直接对口径，只能做方法学验证。
-- **本地 NVMe**。存储栈用 reflink/CoW（ADR-23），网络盘会把 copy 段的分位彻底带偏。
+
+  > **易踩的坑：把云厂商的「云服务器」当成裸金属。** 腾讯云 **CVM 是虚拟机**产品，其物理服务器
+  > 叫**黑石（CBM）**；阿里云对应的是**神龙/弹性裸金属**；AWS 要选 `*.metal` 实例族而非普通 EC2。
+  > 标准云 VM 多数根本不向 guest 暴露 VMX/SVM，`/dev/kvm` 压根不存在，基准会整批 skip；
+  > 即便某机型支持嵌套，分位也不能当 §8.1 的绝对口径。
+  >
+  > **工具侧已经把这条钉死**：`run-all.sh` 把宿主类型（`host_kind`）写进结果的**每一行**，
+  > `slo-gate.sh` 严格档对非 `bare-metal` 直接**拒收并退 3**。两份 JSONL 除了这个标记长得
+  > 一模一样，不钉住就迟早有人拿虚拟机数据当出口证据。`host_kind` 采**必须有正面证据才判
+  > bare-metal**的策略（容器 / systemd-detect-virt / hypervisor flag / DMI 厂商串逐级判定），
+  > 判不出就是 `unknown`，严格档同样拒收。
+  >
+  > **只能用云 VM 时**走计划 §4 D4 的**逃生口**：去掉 `SLO_STRICT` 跑，产出**方法学 + 相对分位**，
+  > 绝对 SLO 标「待补」并做 go/no-go 上报——**不作为计划，只作兜底**。
+- **规格要对得上参考机型 64C/128G**——§8.1 的密度口径写的就是「64C/128G 节点」，**参考机型是
+  判据的一部分，不是背景说明**。
+
+  > **比参考机型小**：数字不能直接对口径，只能做方法学验证。
+  >
+  > **比参考机型大**（例如只能买到 96C/384G）：**密度两行不能直接用**。密度是内存约束
+  > （`bench-density.sh` 的停因通常是 `mem-floor`），机器越大门线越容易跨过——384G 上
+  > 200×512MiB 只占 26%、500×128MiB 只占 16%，必然 PASS，但**证明不了 64C/128G 节点上成立**。
+  > 这与「micro 档冒充默认档」是同一类错误：数字对，理由错。
+  >
+  > **正确做法**：加内核启动参数重启，把机器**真的**约束成参考机型，再跑密度：
+  >
+  > ```
+  > mem=128G maxcpus=64
+  > ```
+  >
+  > 这样产出的数字直接对得上 §8.1，不需要任何折算或辩解。有余力可以再不约束跑一遍密度，
+  > 记录该机器的真实容量上限**备查**（不作为取证）。
+  >
+  > **延迟四行不受影响**（池命中 P50 / 冷启动 P99 / 恢复 P50 / exec 开销）——那是每次操作的
+  > 延迟，不是容量约束，大机器上跑完全有效。
+  >
+  > `slo-gate.sh` 会校核宿主规格：超出参考机型 20% 容差时，密度两行判为**不认**，严格档失败。
+  > 确有理由在大机器上认这两行时须显式 `SLO_DENSITY_HOST_OK=1`，并在出口评审写明理由。
+- **本地 NVMe**，且**文件系统必须支持 reflink**（见下节）。网络盘会把 copy 段的分位彻底带偏。
 - **按小时计费**（D4 的 opex 前提）。按月起租的产品要算清最短计费周期。
+
+## 1.5 操作系统与文件系统
+
+### 发行版：**Ubuntu 22.04 LTS**（别选 24.04）
+
+理由有两条，都很具体：
+
+- **apt 依赖与文档/CI 逐条对得上**——`bench.yml` 跑在 `ubuntu-latest`，部署指南 §1.1 的包名
+  也是 Debian 系。换 RHEL 系要自己映射一遍包名，租机时间不该花在这上面。
+- **24.04 默认拦非特权 user namespace**（`kernel.apparmor_restrict_unprivileged_userns=1`，
+  Ubuntu 23.10 起）。本项目的网络与私有 rootfs 全走 rootless `unshare --map-root-user`，
+  被拦住就直接跑不起来。虽然一条 sysctl 能关（部署指南 §5.1 有表），但没必要给自己埋雷。
+  **22.04 没有这个限制。**
+
+Debian 12 也可以，但历史上需要 `kernel.unprivileged_userns_clone=1`，同样见 §5.1。
+
+**只有 Ubuntu 20.04 可选时：能用**，apt 依赖全齐（实测：gcc 9.4 / xfsprogs 5.3 / nftables 0.9.3 /
+make 4.2.1），userns 默认开（没有 24.04 那个 AppArmor 限制），`mkfs.xfs` 也已默认 `reflink=1`
+（xfsprogs ≥5.1 起）。两点差异：
+
+- **GCC 9.4 建 6.6 guest 内核：已实测通过**（2026-08-31，Inspur SA5212M5 / 96C / Ubuntu 20.04，
+  Linux 6.6.155，1m31s wall）。此前只能说「名义上够（6.6 最低要求 GCC 5.1）、大概率能过」，
+  现在是确认的。仍建议上机第一件事就跑 `scripts/build-kernel.sh`——它是跑基准前的前置步骤，
+  万一换了内核系列出问题也能早暴露、不浪费后续租机时间。两条兜底备用：
+
+  ```bash
+  # A. 换 GCC 10（20.04 仓库里有 10.5.0）
+  sudo apt-get install -y gcc-10
+  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100
+  # B. 换更老的内核系列（脚本第一个参数即主版本）
+  scripts/build-kernel.sh 6.1
+  ```
+
+- **cgroup v1 默认，不是阻塞项**。`cgroup_v2()` 只是探测：检测到 v2 才给 jailer 传
+  `--cgroup-version 2`，否则走 v1，优雅降级。想切 v2 可在 GRUB 顺手加
+  `systemd.unified_cgroup_hierarchy=1`（反正要改 GRUB 加 `mem=128G maxcpus=64`）。
+
+20.04 标准支持已于 2025-04 结束——临时基准机可接受，别拿它当长期节点。
+
+开机后先自测一句，出 `OK` 再往下：
+
+```bash
+unshare --user --map-root-user true && echo OK || echo BLOCKED
+```
+
+### 文件系统：**XFS（reflink=1）或 Btrfs —— 不能是 ext4**
+
+这一条会**静默**把创建分位带偏，务必当回事。
+
+创建热路径每次都要拷一份私有 rootfs，走的是 `cp --reflink=auto`（`orch.rs` 的 `cp_reflink`）。
+**ext4 不支持 reflink**，`--reflink=auto` 会**静默回退成全量拷贝**——密度爬坡起 200~500 个实例
+就是 200~500 次全量拷贝。后果：`restore_create` 的 `copy` 分段与创建 P50 被显著抬高、密度爬坡
+被拖慢，**而且全程没有任何报错**，事后看 JSONL 完全看不出是文件系统的锅。
+
+Ubuntu 默认给你 ext4，所以要**手动把 NVMe 格成 XFS** 并挂到工作目录：
+
+```bash
+sudo mkfs.xfs -f /dev/nvme0n1          # mkfs.xfs 现默认 reflink=1
+sudo mkdir -p /srv/bench && sudo mount /dev/nvme0n1 /srv/bench
+sudo chown "$USER" /srv/bench
+xfs_info /srv/bench | grep reflink     # 须为 reflink=1
+cd /srv/bench && git clone https://github.com/bearalise/sandlocker && cd sandlocker
+```
+
+`scripts/bench/check-env.sh` 会**实测一次** reflink（真做一次 `cp --reflink=always`，
+而不是看文件系统名），不支持时给出 WARN 并说明后果。
+
+### 国内网络：三个下载点会慢
+
+`build-rootfs.sh` 已内置阿里云/清华/中科大的 Alpine 镜像，但另外三处没有。都是「**文件已存在
+就跳过下载**」，所以投喂即可：
+
+| 下载点 | 现象 | 办法 |
+| --- | --- | --- |
+| rustup + crates.io | 装 rustup 慢；`cargo build` 拉百余 crate 更慢 | `RUSTUP_DIST_SERVER=https://rsproxy.cn` + `~/.cargo/config.toml` 换 sparse 源 |
+| Firecracker 二进制 | release 资源在 `objects.githubusercontent.com`，与 API 不同域，常慢 | 经 GitHub 代理下到 `build/firecracker/firecracker-<V>-x86_64.tgz`，再 `scripts/fetch-firecracker.sh <V>`；或本地下好 scp（才十几 MB） |
+| 内核源码 ~145MB | `cdn.kernel.org` 慢 | 先用脚本同款逻辑解析出版本号，从清华/中科大 `kernel/v6.x/` 下到 `build/kernel/linux-<V>.tar.xz`，再跑 `build-kernel.sh` |
+
+版本解析那步只拉目录列表，很小很快，不用管。
+
+### 内核
+
+发行版自带即可（22.04 是 5.15，20.04 是 5.4）。KVM / device-mapper thin（ADR-23）/ nftables / netns /
+XFS reflink 都在其中。**不要**为了追新去换内核——guest 内核由 `scripts/build-kernel.sh`
+自己构建，与宿主内核版本无关。
 
 **候选**（具体规格/价格以当下官网为准，此处不列数字以免过期）：
 
 | 供应商 | 备注 |
 | --- | --- |
+| 腾讯云**黑石 CBM** | 物理服务器。**不是 CVM**——CVM 是虚拟机，不满足硬要求 |
+| 阿里云**弹性裸金属（神龙）** | 物理服务器 |
 | Equinix Metal | 真裸金属、按小时，常用于此类基准 |
 | AWS `*.metal`（如 `m5.metal` / `c5.metal`） | 按小时，裸金属实例族；注意区分普通 EC2（嵌套） |
 | OVH / Hetzner 独服 | 更便宜，但常按月起租，算清最短周期 |
@@ -77,12 +200,19 @@ ls -l /dev/kvm && grep -c -E 'vmx|svm' /proc/cpuinfo
 # 嵌套虚拟化的判别：裸金属上 hypervisor flag 应当**不存在**
 grep -q hypervisor /proc/cpuinfo && echo "⚠️ 检测到 hypervisor flag——很可能不是裸金属，停下确认" || echo "OK：无 hypervisor flag"
 
-# ② 规格对得上口径？
+# ② 规格对得上口径？（要 ≥64C / ≥128G）
 nproc && free -g
 
-# ③ 仓库自带的环境检查
+# ③ 非特权 userns 是否可用（24.04 默认被拦；本项目 rootless 路径依赖它）
+unshare --user --map-root-user true && echo OK || echo BLOCKED
+
+# ④ 仓库自带的环境检查（含 reflink 实测——ext4 会静默回退全拷，抬高创建分位）
 git clone https://github.com/bearalise/sandlocker && cd sandlocker
 scripts/bench/check-env.sh
+
+# ⑤ 让工具自己判一次——这是 slo-gate.sh 严格档用的**同一个函数**，
+#    它说 bare-metal 才作数（说 unknown / virtualized / container 都会被拒收）。
+( . scripts/bench/_common.sh; echo "host_kind=$(host_kind)" )
 ```
 
 ---
