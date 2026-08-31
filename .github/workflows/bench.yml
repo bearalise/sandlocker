@@ -9,11 +9,14 @@
 name: bench
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-  schedule:
-    - cron: '23 2 * * 1'   # 每周一 02:23 UTC（密度回归，runner 在册时才有效）
+  # ⏸ CI 暂停（2026-08-31）：仅保留手动触发。想跑 CI 时到 Actions 页 → bench → "Run workflow"
+  # 手动 dispatch，或本地跑对账（--store-contract/--election-reconcile/--cluster-reconcile 等）。
+  # 恢复自动触发：取消下面 pull_request/push/schedule 的注释即可。
+  # pull_request:
+  # push:
+  #   branches: [main]
+  # schedule:
+  #   - cron: '23 2 * * 1'   # 每周一 02:23 UTC（密度回归，runner 在册时才有效）
   workflow_dispatch:
 
 jobs:
