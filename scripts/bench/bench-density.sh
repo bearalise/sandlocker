@@ -20,6 +20,12 @@ if ! bench_prep; then
   exit 0
 fi
 
+# 规格（§8.1 密度分两档，M3-Q9 判据）：默认档 2vCPU/512MiB gate ≥200；micro 档 1vCPU/128MiB gate ≥500。
+# 在 --vcpus/--mem-mib 之前，`sl-node run` 把 machine-config 写死 1/128——那时量的其实是 micro 档，
+# 却被当作默认档 gate（内存差 4 倍）。现在规格随实测一并记进 JSON，结论不会再贴错标签。
+VCPUS="${DENSITY_VCPUS:-1}"
+MEM_MIB="${DENSITY_MEM_MIB:-128}"
+SPEC_LABEL="${DENSITY_SPEC_LABEL:-micro}"
 HOLD="${DENSITY_HOLD:-120}"          # 每实例保活秒数（须覆盖整个爬坡+测量窗口）
 MAX="${DENSITY_MAX:-256}"            # 硬上限（裸金属调高；小机由内存地板先触发）
 MEM_FLOOR_MB="${DENSITY_MEM_FLOOR_MB:-512}"  # 可用内存低于此值即停，避免打爆宿主
@@ -40,7 +46,7 @@ for i in $(seq 1 "$MAX"); do
   fi
 
   wd="$DDIR/i$i"; mkdir -p "$wd"
-  ( "$SL_NODE" run --workdir "$wd" --hold-secs "$HOLD" > "$wd/log" 2>&1 ) &
+  ( "$SL_NODE" run --workdir "$wd" --hold-secs "$HOLD" --vcpus "$VCPUS" --mem-mib "$MEM_MIB" > "$wd/log" 2>&1 ) &
   pids+=("$!")
 
   # 等该实例 HELD（就绪）或失败
@@ -75,15 +81,16 @@ wait || true
 resid=$(count_proc firecracker)
 echo "[density] 自清理后 firecracker 残留=$resid" >&2
 
-# M2-Q10 目标 gate（可选，缺省关）：DENSITY_MIN>0 且峰值实例 < DENSITY_MIN → 退非 0。
-# 裸金属 dispatch（bench-density job）设 DENSITY_MIN=200（≥200@默认规格，计划 §5/§8.1）方硬达标；
-# 托管/开发机不设 BENCH_DENSITY → 本脚本整体 skip，此 gate 天然不触发（无裸金属 runner 前为待补）。
+# 目标 gate（可选，缺省关）：DENSITY_MIN>0 且峰值实例 < DENSITY_MIN → 退非 0。
+# 裸金属 dispatch（bench-density job）按档设：默认档 200、micro 档 500（§8.1 / M3-Q9）。
+# 托管/开发机不设 BENCH_DENSITY → 本脚本整体 skip，此 gate 天然不触发。
 DENSITY_MIN="${DENSITY_MIN:-0}"
 
-printf '{"metric":"density","max_instances":%d,"stop_reason":"%s","mem_start_mb":%d,"used_total_mb":%d,"per_vm_mb_est":%d,"residue":%d,"density_min":%d,"curve":[%s]}\n' \
-  "$max_ok" "$stop_reason" "$mem0" "$used_total" "$per_vm" "$resid" "$DENSITY_MIN" "$points"
+# spec/vcpus/mem_mib 一并入 JSON：密度数字**必须**带着它是哪一档才有意义（见文件头说明）。
+printf '{"metric":"density","spec":"%s","vcpus":%d,"mem_mib":%d,"max_instances":%d,"stop_reason":"%s","mem_start_mb":%d,"used_total_mb":%d,"per_vm_mb_est":%d,"residue":%d,"density_min":%d,"curve":[%s]}\n' \
+  "$SPEC_LABEL" "$VCPUS" "$MEM_MIB" "$max_ok" "$stop_reason" "$mem0" "$used_total" "$per_vm" "$resid" "$DENSITY_MIN" "$points"
 
 if [ "$DENSITY_MIN" -gt 0 ] && [ "$max_ok" -lt "$DENSITY_MIN" ]; then
-  echo "[density] M2-Q10 未达标：峰值 $max_ok < DENSITY_MIN=$DENSITY_MIN（停因=$stop_reason）" >&2
+  echo "[density] M3-Q9 未达标（$SPEC_LABEL 档）：峰值 $max_ok < DENSITY_MIN=$DENSITY_MIN（停因=$stop_reason）" >&2
   exit 1
 fi
