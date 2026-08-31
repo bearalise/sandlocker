@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
@@ -14,11 +15,13 @@ use crate::backend::{BackendCreate, Capabilities, Capability, ExecTarget, Sandbo
 use crate::fcapi::FcApi;
 use crate::netlive::{self, LiveNet};
 use crate::orch::{cp_reflink, prepare_instance_dir, NetworkMode, SandboxSpec};
+use crate::snapcrypt::{self, SnapKey};
 use crate::pool::{HotPool, HotSlot, WarmPool};
 use crate::{
-    abspath, cold_boot_egress, hex, host_random, kill_group, restore_activate, restore_core, Config, LoadOutcome,
-    RestoreCtx,
+    abspath, cold_boot_egress, connect_guest, hex, host_random, kill_group, restore_activate, restore_core, Config,
+    LoadOutcome, RestoreCtx,
 };
+use sl_proto::{read_msg, write_msg, Request, Response};
 
 /// 后端独占的在册实例：FC 进程 + 实例目录 + 原始模板 + ADR-12 克隆身份 + 暂停态标记。
 struct FcInst {
@@ -43,11 +46,13 @@ pub struct FcBackend<'a> {
     live: HashMap<String, FcInst>,
     pool: Option<WarmPool>,
     hot: Option<HotPool>,
+    /// M3 W9（ADR-15）：本次快照操作的密钥材料。`None` = 未启用加密，快照明文落盘（M2 行为，零回归）。
+    snap_key: Option<Arc<SnapKey>>,
 }
 
 impl<'a> FcBackend<'a> {
     pub fn new(cfg: &'a Config, run_root: PathBuf) -> Self {
-        Self { cfg, run_root, live: HashMap::new(), pool: None, hot: None }
+        Self { cfg, run_root, live: HashMap::new(), pool: None, hot: None, snap_key: None }
     }
 
     /// 温池命中判定：请求模板 == 温池模板（均 canonical）且弹到热槽即返回槽；否则 None（走冷路径）。
@@ -262,6 +267,12 @@ impl SandboxBackend for FcBackend<'_> {
             if let Some(net) = &inst.net {
                 net.down();
             }
+            // M3 W9：加密开启时，销毁前先抹掉解出来的明文快照（`remove_dir_all` 只是 unlink，
+            // 块内容还在）。未启用加密时跳过——对 512MiB 量级文件逐个覆写会直接压垮销毁吞吐。
+            if self.snap_key.is_some() {
+                let _ = snapcrypt::shred(&inst.dir.join("vmstate"));
+                let _ = snapcrypt::shred(&inst.dir.join("mem"));
+            }
             let _ = std::fs::remove_dir_all(&inst.dir);
         }
     }
@@ -315,6 +326,10 @@ impl SandboxBackend for FcBackend<'_> {
     /// pause（FR-1.4）：断实例 vmstate/mem 硬链（防写穿模板）→ `PATCH Paused` → `PUT /snapshot/create Full`
     /// 落 `dir/`（自包含内存快照）→ 停 VM。guest 现存 `/tmp/sl-snap-marker`（建模板时播种）随快照捕获，
     /// resume/fork 仍据**模板 expect** 校验一致性。幂等（已 paused 直接返 Ok）。
+    fn set_snapshot_key(&mut self, key: Option<Arc<SnapKey>>) {
+        self.snap_key = key;
+    }
+
     fn pause(&mut self, id: &str) -> Result<(), String> {
         let (dir, already) = {
             let i = self.live.get(id).ok_or_else(|| format!("未知沙箱 {id}"))?;
@@ -323,11 +338,21 @@ impl SandboxBackend for FcBackend<'_> {
         if already {
             return Ok(());
         }
+        let api = FcApi::new(dir.join("api.sock"));
+        // M3 W9（ADR-15）：**在冻结之前**让 guest 擦掉自己的会话密钥——pause 落盘的是整份 guest
+        // 内存，密钥若还在，快照里就带着钥匙，外面再怎么加密也白搭。resume/fork 必经 reinit，
+        // 那里本就会换发新会话密钥，故无损。best-effort：擦不掉不阻断 pause（见 sl-envd run_wipe_keys）。
+        if self.snap_key.is_some() {
+            if let Some(ExecTarget::Vsock(vsock)) = self.exec_target(id) {
+                if let Err(e) = wipe_guest_keys(&vsock) {
+                    eprintln!("[sl-node][WARN] pause {id}: guest 擦密钥失败: {e}（继续）");
+                }
+            }
+        }
         // 断硬链：dir/vmstate、dir/mem 是 create 时从模板硬链来的；snapshot/create 会覆写，先 unlink
         // 令 FC 建独立文件——否则写穿共享 inode 会脏模板。
         let _ = std::fs::remove_file(dir.join("vmstate"));
         let _ = std::fs::remove_file(dir.join("mem"));
-        let api = FcApi::new(dir.join("api.sock"));
         api.patch("/vm", r#"{"state":"Paused"}"#)?;
         api.put_long(
             "/snapshot/create",
@@ -337,6 +362,23 @@ impl SandboxBackend for FcBackend<'_> {
                 dir.join("mem").display()
             ),
         )?;
+        // M3 W9：FC 只会写明文（它不认识密文，也没有插存储层的口子），所以加密是**落盘后**的一步：
+        // 加密 → fsync → 抹明文。顺序不能反，掉电时宁可留明文也不能两头皆空。
+        if let Some(k) = self.snap_key.clone() {
+            if let Err(e) = seal_snapshot(&dir, &k) {
+                // **fail closed**：密封不了就绝不留明文的 guest 内存在盘上。抹掉半成品，
+                // 把 VM 放回运行态（沙箱不丢，只是这次 pause 失败），错误如实上报。
+                let _ = snapcrypt::shred(&dir.join("vmstate"));
+                let _ = snapcrypt::shred(&dir.join("mem"));
+                let _ = snapcrypt::shred(&dir.join("vmstate.enc"));
+                let _ = snapcrypt::shred(&dir.join("mem.enc"));
+                if api.patch("/vm", r#"{"state":"Resumed"}"#).is_err() {
+                    let i = self.live.get_mut(id).unwrap();
+                    kill_group(&mut i.child); // 连放回运行态都失败 → 只能杀，绝不留半死不活的 VM
+                }
+                return Err(format!("pause {id}: 快照密封失败，已抹除明文并回滚: {e}"));
+            }
+        }
         let i = self.live.get_mut(id).unwrap();
         kill_group(&mut i.child);
         i.paused = true;
@@ -353,6 +395,11 @@ impl SandboxBackend for FcBackend<'_> {
         if !paused {
             return Err(format!("resume: 沙箱 {id} 未暂停"));
         }
+        // M3 W9：FC 只能 load 明文（`mem` 还要全程 mmap），故恢复前先解出明文。
+        // 任一块 AEAD 校验失败即在此中止——被篡改的快照绝不会走到 FC 面前。
+        if let Some(k) = self.snap_key.clone() {
+            unseal_snapshot(&dir, &k)?;
+        }
         let ctx = RestoreCtx {
             template_dir: &template,
             instance_dir: &dir,
@@ -366,6 +413,12 @@ impl SandboxBackend for FcBackend<'_> {
             Err(e) => return Err(format!("resume 失败: {e}")),
         };
         let mid = o.machine_id.clone();
+        // 恢复成功 → 密文快照已被消费（实例回到运行态，内存以明文 mmap 在跑）。删掉它，
+        // 免得盘上留一份**过期**的加密内存镜像；下次 pause 会重新密封。
+        if self.snap_key.is_some() {
+            let _ = std::fs::remove_file(dir.join("vmstate.enc"));
+            let _ = std::fs::remove_file(dir.join("mem.enc"));
+        }
         let i = self.live.get_mut(id).unwrap();
         i.child = child;
         i.machine_id = mid.clone();
@@ -388,8 +441,18 @@ impl SandboxBackend for FcBackend<'_> {
         host_random(&mut idb);
         let new_id = hex(&idb);
         let new_dir = self.run_root.join(&new_id);
-        // 拷父 paused 快照（vmstate/mem 硬链 + rootfs reflink）到新实例目录。
-        let copy_ms = prepare_instance_dir(&parent_dir, &new_dir)?;
+        // 拷父 paused 快照到新实例目录。加密开启时父目录里只有密文（明文在 pause 时已抹除），
+        // 故改拷 `.enc` 再解到子目录——父的密文原封不动（fork 不消费父快照，父仍是 paused）。
+        let copy_ms = match self.snap_key.clone() {
+            None => prepare_instance_dir(&parent_dir, &new_dir)?,
+            Some(k) => {
+                let ms = prepare_instance_dir_sealed(&parent_dir, &new_dir)?;
+                unseal_snapshot(&new_dir, &k).inspect_err(|_| {
+                    let _ = std::fs::remove_dir_all(&new_dir);
+                })?;
+                ms
+            }
+        };
         let new_dir = abspath(&new_dir)?;
         let ctx = RestoreCtx {
             template_dir: &template,
@@ -411,5 +474,65 @@ impl SandboxBackend for FcBackend<'_> {
         };
         let total_ms = copy_ms.saturating_add(o.total_ms);
         Ok(self.register_inst(new_id, new_dir, template, child, o, copy_ms, total_ms, false, false))
+    }
+}
+
+// ————————————————————— 快照密封 / 解封（M3 W9，ADR-15）—————————————————————
+
+/// 密封实例目录里的明文快照：`vmstate|mem` → `vmstate.enc|mem.enc`，随后抹除明文。
+///
+/// 两个文件各自独立成一个 `SLSNAP1` 容器、各自一把 DEK——`vmstate` 只有几十 KB 而 `mem` 是
+/// 512MiB 量级，混在一个容器里会让「只解 vmstate」也得付 mem 的代价。
+pub(crate) fn seal_snapshot(dir: &Path, k: &SnapKey) -> Result<(), String> {
+    for name in ["vmstate", "mem"] {
+        let plain = dir.join(name);
+        let enc = dir.join(format!("{name}.enc"));
+        snapcrypt::encrypt_file(&plain, &enc, &k.kek, &k.kek_id)?;
+        // 先 encrypt（内部 fsync）再抹明文——顺序保证任一时刻至少有一份完整数据。
+        snapcrypt::shred(&plain)?;
+    }
+    Ok(())
+}
+
+/// 解封：`vmstate.enc|mem.enc` → `vmstate|mem`。任一块 AEAD 失败即整体失败，且不留半成品。
+pub(crate) fn unseal_snapshot(dir: &Path, k: &SnapKey) -> Result<(), String> {
+    for name in ["vmstate", "mem"] {
+        let enc = dir.join(format!("{name}.enc"));
+        if !enc.exists() {
+            return Err(format!("加密快照 {} 不存在（快照是否用别的密钥密封？）", enc.display()));
+        }
+        snapcrypt::decrypt_file(&enc, &dir.join(name), &k.kek)?;
+    }
+    Ok(())
+}
+
+/// fork 用：拷父实例目录的 **密文** 快照（+ rootfs reflink）到新目录。
+/// 与 `prepare_instance_dir` 同形，只是搬的是 `.enc`——父的 paused 快照不被消费。
+fn prepare_instance_dir_sealed(parent: &Path, dir: &Path) -> Result<u128, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("建实例目录失败 {}: {e}", dir.display()))?;
+    let t0 = std::time::Instant::now();
+    cp_reflink(&parent.join("rootfs.ext4"), &dir.join("rootfs.ext4"))?;
+    let copy_ms = t0.elapsed().as_millis();
+    for name in ["vmstate.enc", "mem.enc"] {
+        let (src, dst) = (parent.join(name), dir.join(name));
+        let _ = std::fs::remove_file(&dst);
+        // 硬链即可：密文只读，双方都不会写它（各自 pause 时先 unlink 再重建）。
+        if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst)
+                .map(|_| ())
+                .map_err(|e| format!("拷贝 {} 失败: {e}", src.display()))?;
+        }
+    }
+    Ok(copy_ms)
+}
+
+/// pause 前请 guest 擦掉自己的会话密钥（`Request::WipeKeys`，ADR-15）。
+fn wipe_guest_keys(vsock: &Path) -> Result<(), String> {
+    let mut s = connect_guest(vsock)?;
+    write_msg(&mut s, &Request::WipeKeys).map_err(|e| format!("发 WipeKeys 失败: {e}"))?;
+    match read_msg::<_, Response>(&mut s).map_err(|e| format!("读 WipeKeys ack 失败: {e}"))? {
+        Response::Ok => Ok(()),
+        Response::Error { message } => Err(format!("guest 擦密钥失败: {message}")),
+        other => Err(format!("WipeKeys ack 异常: {other:?}")),
     }
 }

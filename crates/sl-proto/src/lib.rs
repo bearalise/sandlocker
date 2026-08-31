@@ -40,6 +40,17 @@ pub enum Request {
     /// W11（M2-Q7 交互式 PTY）：guest `forkpty` 起 shell（初始窗口 cols×rows）。回 [`Response::Ok`] 后：
     /// **host→guest** 走 PTY 输入帧（[`pty_stdin_frame`]/[`pty_resize_frame`]）；**guest→host** 为裸 PTY 输出。
     Pty { cols: u16, rows: u16 },
+    /// M3 W9（ADR-15）：**pause 之前**擦除 guest 侧自有密钥材料。
+    ///
+    /// pause 会把 guest 内存整份落盘——sl-envd 自己签发的会话密钥（`/etc/sl-session-key`）
+    /// 若还在，就会被快照捕获，加密再严也挡不住「快照本身就含着钥匙」。host 在
+    /// `PATCH /vm Paused` 之前下发本请求，guest 覆写并删掉该文件、清零内存副本。
+    ///
+    /// 无损：resume/fork 必经 [`Request::Reinit`]，那里本就会**换发**一把新会话密钥。
+    ///
+    /// 边界（必须明示）：这只擦 sl-envd **自己的**密钥材料，管不了用户进程持有的凭据——
+    /// pause 仍会捕获 guest 内存中当时存在的一切 secret（PRD §8.2）。
+    WipeKeys,
 }
 
 /// PTY 输入帧种类（host→guest，装进 [`write_frame`] 的 payload 首字节）。

@@ -252,6 +252,7 @@ fn dispatch(req: Request) -> Response {
         Request::Reinit { seed_hex, hostname, wall_time_ns } => {
             run_reinit(&seed_hex, &hostname, wall_time_ns)
         }
+        Request::WipeKeys => run_wipe_keys(),
         // Connect/Pty/ExecStream 由 handle_conn 特判（脱离 dispatch 的 req/resp 模型）；到此属逻辑错误。
         Request::Connect { .. } => Response::Error { message: "Connect 应由 handle_conn 处理".into() },
         Request::Pty { .. } => Response::Error { message: "Pty 应由 handle_conn 处理".into() },
@@ -581,6 +582,35 @@ fn run_reinit(seed_hex: &str, hostname: &str, wall_time_ns: u64) -> Response {
 
     log(&format!("reinit done: machine_id={machine_id}"));
     Response::Reinit { machine_id, rng_hex, session_key_hex }
+}
+
+/// M3 W9（ADR-15）：擦除 guest 侧自有密钥材料，host 在 pause 前下发。
+///
+/// 目前只有一份：reinit 签发的会话密钥 `/etc/sl-session-key`。先用零覆写再 unlink——
+/// 覆写是为了让「快照捕获到的那一页内存/那个块」不再含密钥，而不是指望在 CoW 文件系统上
+/// 真擦物理块（后者做不到，见 host 侧 snapcrypt.rs 的同名说明）。
+///
+/// best-effort：文件不存在也算成功（冷启动实例尚未 reinit 过）。失败只记日志不阻断 pause——
+/// 阻断的代价是沙箱卡在运行态，而收益只是少擦一份**下次 reinit 必然换发**的密钥。
+fn run_wipe_keys() -> Response {
+    const SESSION_KEY: &str = "/etc/sl-session-key";
+    match std::fs::metadata(SESSION_KEY) {
+        Ok(md) => {
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(SESSION_KEY) {
+                let zeros = vec![0u8; md.len() as usize];
+                if let Err(e) = f.write_all(&zeros) {
+                    log(&format!("wipe_keys: 覆写 {SESSION_KEY} 失败: {e}（继续）"));
+                }
+                let _ = f.sync_all();
+            }
+            if let Err(e) = std::fs::remove_file(SESSION_KEY) {
+                log(&format!("wipe_keys: 删除 {SESSION_KEY} 失败: {e}（继续）"));
+            }
+            log("wipe_keys: 会话密钥已擦除");
+        }
+        Err(_) => log("wipe_keys: 无会话密钥可擦（尚未 reinit）"),
+    }
+    Response::Ok
 }
 
 /// 填满 buf（getrandom；短读重试）。CRNG 恢复后已初始化，不阻塞。

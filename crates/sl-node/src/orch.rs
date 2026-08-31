@@ -18,6 +18,7 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -33,6 +34,7 @@ use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
 use crate::gvisorbackend::GvisorBackend;
 use crate::connect_guest;
 use crate::netlive;
+use crate::snapcrypt::{self, FileKms, Kms, SnapKey};
 use crate::{abspath, hex, Config};
 
 /// 沙箱规格（FR-1.1）。默认 2 vCPU / 512 MiB **记入元数据**；注意恢复路径的 VM 形态由快照烘焙
@@ -124,6 +126,8 @@ pub struct Orch<'a> {
     /// 本节点 id（集群模式，M3 W3）。Some 时创建沙箱写归属键 `sandbox/<id>/node`，供失联回收；
     /// None=单机（不写归属键、不参与回收，零行为变化）。
     node_id: Option<String>,
+    /// M3 W9（ADR-15）：快照加密的根密钥来源。`None` = 未启用，快照明文落盘（M2 行为，零回归）。
+    kms: Option<Arc<dyn Kms>>,
 }
 
 impl<'a> Orch<'a> {
@@ -139,7 +143,17 @@ impl<'a> Orch<'a> {
         if cfg.gvisor && GvisorBackend::probe(&cfg.gvisor_bin) {
             backends.push(Box::new(GvisorBackend::new(cfg.gvisor_bin.clone(), run_root.to_path_buf())));
         }
-        Ok(Self { store, backends, template, live: HashMap::new(), node_id: None })
+        // M3 W9（ADR-15）：给了 `--snap-kms-key` 才启用快照加密。**显式开关**，不静默生效——
+        // 加密改变快照落盘格式，既有明文快照与它不兼容，得由部署方决定何时切。
+        let kms: Option<Arc<dyn Kms>> = match &cfg.snap_kms_key {
+            Some(p) => {
+                let k = FileKms::open(p)?;
+                println!("[sandlocker] 快照加密已启用（ADR-15：KMS={}，AES-256-GCM 4MiB 分块）", k.id());
+                Some(Arc::new(k) as Arc<dyn Kms>)
+            }
+            None => None,
+        };
+        Ok(Self { store, backends, template, live: HashMap::new(), node_id: None, kms })
     }
 
     /// 设本节点 id（集群模式）：此后创建的沙箱写归属键 `sandbox/<id>/node`，供失联回收（M3 W3）。
@@ -302,6 +316,7 @@ impl<'a> Orch<'a> {
     pub fn pause(&mut self, id: &str) -> Result<(), String> {
         let idx = self.backend_of(id)?;
         self.require_cap(idx, Capability::PauseResume)?;
+        self.arm_snapshot_key(idx, id)?; // M3 W9：快照密封用的租户 KEK
         self.backends[idx].pause(id)?;
         let _ = self.store.put(&state_key(id), b"paused", self.lease_of(id));
         Ok(())
@@ -311,6 +326,7 @@ impl<'a> Orch<'a> {
     pub fn resume(&mut self, id: &str) -> Result<String, String> {
         let idx = self.backend_of(id)?;
         self.require_cap(idx, Capability::PauseResume)?;
+        self.arm_snapshot_key(idx, id)?; // M3 W9：解封用同一把租户 KEK
         let mid = self.backends[idx].resume(id)?;
         let _ = self.store.put(&state_key(id), b"running", self.lease_of(id));
         Ok(mid)
@@ -320,10 +336,56 @@ impl<'a> Orch<'a> {
     pub fn fork(&mut self, id: &str, spec: &SandboxSpec) -> Result<CreateOutcome, String> {
         let idx = self.backend_of(id)?;
         self.require_cap(idx, Capability::SnapshotFork)?;
+        self.arm_snapshot_key(idx, id)?; // M3 W9：子实例继承父项目 → 同一把 KEK
         let bc = self.backends[idx].fork(id)?;
         // fork 的恢复模板由后端内部持有（FcInst.template）；meta 用默认模板占位，forked_from 标父。
         let tpl = self.template.clone();
         self.register(bc, idx, spec, &tpl, Some(id.to_string()))
+    }
+
+    /// M3 W9（ADR-15）：取该沙箱所属项目的**租户 KEK**，供后端密封/解封快照。
+    ///
+    /// KEK 每项目一把、随机生成，以**被根密钥包裹的密文**存 `kek/<project>`——控制面里
+    /// 也没有明文密钥。首次用到时 CAS 建立（并发下首写者定，输者读回同一把，
+    /// 与 W5 的 `cluster/gw_secret` 同一手法）。
+    ///
+    /// 未鉴权模式下沙箱没有项目归属，归到 `default` 一把——单租户部署仍受静态加密保护。
+    /// 返回 `None` 表示未启用加密。
+    fn snap_key_for(&self, id: &str) -> Result<Option<Arc<SnapKey>>, String> {
+        let kms = match &self.kms {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let project = self.sandbox_project(id)?.unwrap_or_else(|| "default".to_string());
+        let key = format!("kek/{project}");
+        if let Some(kv) = self.store.get(&key).map_err(|e| e.to_string())? {
+            let kek = kms.unwrap_kek(&kv.value)?;
+            return Ok(Some(Arc::new(SnapKey { kek, kek_id: project })));
+        }
+        let fresh = snapcrypt::Key::random();
+        let wrapped = kms.wrap_kek(&fresh)?;
+        let r = self
+            .store
+            .compare_and_swap(&key, None, &wrapped, None)
+            .map_err(|e| e.to_string())?;
+        if r.succeeded {
+            return Ok(Some(Arc::new(SnapKey { kek: fresh, kek_id: project })));
+        }
+        // 输给并发的另一个副本 → 读回它写的那把（绝不能各用各的，否则对方封的快照我解不开）。
+        let kv = self
+            .store
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{key} CAS 失败后仍读不到"))?;
+        let kek = kms.unwrap_kek(&kv.value)?;
+        Ok(Some(Arc::new(SnapKey { kek, kek_id: project })))
+    }
+
+    /// 把该沙箱的快照密钥注入其归属后端（每次快照操作前调一次，见 `SandboxBackend::set_snapshot_key`）。
+    fn arm_snapshot_key(&mut self, idx: usize, id: &str) -> Result<(), String> {
+        let key = self.snap_key_for(id)?;
+        self.backends[idx].set_snapshot_key(key);
+        Ok(())
     }
 
     // —— 编排辅助 ——

@@ -735,6 +735,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "libc",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",
