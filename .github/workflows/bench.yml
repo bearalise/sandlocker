@@ -731,3 +731,5 @@ jobs:
         run: ./target/debug/sl-node --cluster-reconcile --etcd http://127.0.0.1:2379
       - name: M3 W5 网关拆副本对账（共享 secret 无状态验签 + 一次性跨副本 + 篡改/过期拒，真 etcd）
         run: ./target/debug/sl-node --gw-cluster-reconcile --etcd http://127.0.0.1:2379
+      - name: M3-Q4 鉴权对账（key 有效性 + 作用域层级 + 项目隔离，真 etcd）
+        run: ./target/debug/sl-node --auth-reconcile --etcd http://127.0.0.1:2379
