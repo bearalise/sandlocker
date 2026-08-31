@@ -35,6 +35,9 @@ pub enum Action {
     File,
     Logs,
     Port,
+    /// 流式 exec（NDJSON，M2 流式特性）。M3 W5 余项新增：跨节点时控制面副本据此签票、
+    /// 经网关把**未定长的增量响应**中继回客户端（中继全双工，故流不被缓冲住）。
+    Stream,
 }
 
 impl Action {
@@ -44,6 +47,7 @@ impl Action {
             Action::File => "file",
             Action::Logs => "logs",
             Action::Port => "port",
+            Action::Stream => "stream",
         }
     }
     pub fn from_str(s: &str) -> Option<Action> {
@@ -52,6 +56,7 @@ impl Action {
             "file" => Some(Action::File),
             "logs" => Some(Action::Logs),
             "port" => Some(Action::Port),
+            "stream" => Some(Action::Stream),
             _ => None,
         }
     }

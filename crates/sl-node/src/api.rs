@@ -28,7 +28,7 @@ use sl_proto::{parse_exec_output, read_frame, read_msg, write_msg, ExecOutput, R
 
 use crate::backend::{Capabilities, ExecTarget, UNSUPPORTED_BY_BACKEND};
 use crate::expose::{self, ExposeHandle};
-use crate::gateway::{parse_query, proxy_port_http, Action, Gateway};
+use crate::gateway::{parse_query, proxy_port_http, Action, Gateway, Ticket};
 use crate::orch::{NetworkMode, Orch, SandboxSpec};
 use crate::{connect_guest, Config};
 
@@ -280,10 +280,13 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     let gw_addr = cfg.gw_addr.clone().unwrap_or_else(|| "127.0.0.1:7879".to_string());
     // M3 W5：集群模式网关走**共享 secret + store 一次性 nonce**（任一副本验任一副本签发的 ticket、
     // 一次性跨副本；ADR-22）；单机沿用进程内随机 secret（零回归）。
+    // ticket 的外部基址：给了 `--gw-url`（独立 `sandlocker-gw`，M3 W5 余项）就签向它——
+    // 客户端据此直连网关，网关再中继到 owning 节点；否则签向本进程内网关（M2 行为）。
+    let gw_base = cfg.gw_url.clone().unwrap_or_else(|| format!("http://{gw_addr}"));
     let gw: SharedGw = if etcd_mode {
-        Arc::new(Gateway::new_shared(format!("http://{gw_addr}"), open_store(cfg, db_str)?)?)
+        Arc::new(Gateway::new_shared(gw_base, open_store(cfg, db_str)?)?)
     } else {
-        Arc::new(Gateway::new_random(format!("http://{gw_addr}")))
+        Arc::new(Gateway::new_random(gw_base))
     };
     {
         let gw_l = Arc::clone(&gw);
@@ -318,6 +321,42 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         run_root.display()
     );
 
+    // M3 W5 余项（ADR-22）：集群身份 + 网关基址。`--gw-url` 未给 = 单机，跨节点转发整条关掉（零回归）。
+    let rt: SharedRemote = Arc::new(Remote { node_id: node_id.clone(), gw_url: cfg.gw_url.clone() });
+
+    // M3 W5 余项：节点侧**主动外拨**代理——预拨若干持久连接停在独立网关上，供网关反向借用
+    // 服务本节点沙箱的数据面请求。**节点不因此监听任何入站端口**。
+    if let Some(gw_node) = &cfg.gw_node_endpoint {
+        let tls = cfg.gw_tls_opts()?;
+        if tls.is_none() {
+            eprintln!("[sandlocker][WARN] 数据面外拨未启用 mTLS（--gw-insecure）：仅限本机对账/开发");
+        }
+        let sh = Arc::clone(&shared);
+        crate::dataplane::start_node_agent(
+            crate::dataplane::AgentCfg {
+                gw_addr: gw_node.clone(),
+                node_id: node_id.clone(),
+                pool: cfg.gw_pool,
+                max_streams: cfg.gw_max_streams,
+                tls,
+            },
+            Arc::new(move |ticket, ch| {
+                let mut ch = ch;
+                // 网关已验签并下发 ticket；这里读它复刻的 HTTP 请求，走**与进程内网关同一段**分发。
+                match read_request(&mut ch) {
+                    Ok((method, path, _k, body)) => {
+                        if let Err(e) = serve_gw_ticket(&mut ch, &ticket, &method, &path, &body, &sh) {
+                            eprintln!("[sandlocker][gw-agent] 服务 {} 失败: {e}", ticket.sid);
+                        }
+                    }
+                    Err(e) => eprintln!("[sandlocker][gw-agent] 读中继请求失败: {e}"),
+                }
+                ch.0.shutdown_write();
+            }),
+        )?;
+        println!("[sandlocker] 数据面外拨就绪 → {gw_node}（node={node_id} pool={}，节点零入站）", cfg.gw_pool);
+    }
+
     let troot: &'static Path = Box::leak(template_root.into_boxed_path());
     for conn in listener.incoming() {
         match conn {
@@ -326,8 +365,9 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                 let g = Arc::clone(&gw);
                 let e = Arc::clone(&exposes);
                 let a = Arc::clone(&auth);
+                let r = Arc::clone(&rt);
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(stream, &sh, troot, &g, &e, &a) {
+                    if let Err(e) = handle_conn(stream, &sh, troot, &g, &e, &a, &r) {
                         eprintln!("[sandlocker] 连接处理错误: {e}");
                     }
                 });
@@ -360,7 +400,9 @@ fn extract_api_key(head: &[u8]) -> Option<String> {
     None
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<(String, String, Option<String>, Vec<u8>), String> {
+pub(crate) fn read_request<S: Read>(
+    stream: &mut S,
+) -> Result<(String, String, Option<String>, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let head_end = loop {
@@ -430,7 +472,7 @@ fn reason(code: u16) -> &'static str {
     }
 }
 
-fn write_response(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> Result<(), String> {
+pub(crate) fn write_response<S: Write>(stream: &mut S, code: u16, ctype: &str, body: &[u8]) -> Result<(), String> {
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         reason(code),
@@ -442,7 +484,7 @@ fn write_response(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -
 }
 
 /// JSON 错误体（application/json）。
-fn err_json(msg: &str) -> Vec<u8> {
+pub(crate) fn err_json(msg: &str) -> Vec<u8> {
     format!(r#"{{"error":"{}"}}"#, msg.replace('\\', "\\\\").replace('"', "\\\"")).into_bytes()
 }
 
@@ -562,6 +604,120 @@ fn parse_route(method: &str, path: &str) -> Route {
     }
 }
 
+// ————————————————————— 跨节点转发（M3 W5 余项，ADR-22 / M3-Q3）—————————————————————
+
+/// 该路由是否是**数据面**（可经网关转到 owning 节点）；是则给出 (ticket 动作, HTTP 方法, 附加 query)。
+///
+/// 只有这几类会跨节点转：它们最终都落到 guest 的 vsock/exec 通道上，而通道只在 owning 节点。
+/// 其余（生命周期/配额/审计/模板）是控制面，任一副本读同一 etcd 即可，无需转发。
+fn dataplane_route(route: &Route) -> Option<(Action, &'static str, String)> {
+    match route {
+        Route::Exec(_) => Some((Action::Exec, "POST", String::new())),
+        Route::Logs(_) => Some((Action::Logs, "GET", String::new())),
+        Route::GetFile(_, p) => Some((Action::File, "GET", format!("&p={p}"))),
+        Route::PutFile(_, p) => Some((Action::File, "PUT", format!("&p={p}"))),
+        _ => None,
+    }
+}
+
+/// 本副本的集群身份 + 网关基址。`gw_url=None`（单机）时一切按 M2 行为走，零回归。
+pub(crate) struct Remote {
+    /// 本节点 id（与 `node/<id>` 心跳键、`sandbox/<sid>/node` 归属键同值）。
+    pub node_id: String,
+    /// 独立网关面向客户端的基址（`http://host:port`，`--gw-url`）。
+    pub gw_url: Option<String>,
+}
+
+type SharedRemote = Arc<Remote>;
+
+/// 沙箱是否**不在本节点**：在本节点或归属未知 → None；在别的节点 → Some(owner)。
+///
+/// 判据取 `sandbox/<sid>/node`（M3 W3 写入的归属键）。归属键不存在（单机遗留/尚未写入）时
+/// 一律按本地处理——宁可回 404 也不把请求转给不确定的节点。
+fn remote_owner(shared: &Shared, rt: &Remote, id: &str) -> Option<String> {
+    if rt.gw_url.is_none() {
+        return None; // 单机：无网关可转，走本地路径（M2 行为）
+    }
+    let o = shared.lock().unwrap();
+    if o.exec_target(id).is_some() {
+        return None; // 就在本节点
+    }
+    let owner = o
+        .store_get(&sl_store::cluster::sandbox_node_key(id))
+        .ok()
+        .flatten()
+        .map(|v| String::from_utf8_lossy(&v).into_owned())?;
+    if owner == rt.node_id {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+/// 把一次数据面请求经**独立网关**转到 owning 节点，并把网关的响应**原样**回灌客户端。
+///
+/// 本副本与网关共享 ticket secret（`cluster/gw_secret`），故这里自签的一次性票网关可无状态验签
+/// ——控制面副本不需要知道目标节点在哪、也不持任何数据连接态（无粘滞）。
+///
+/// 响应逐块转发、不缓冲整体，故流式 exec 的 NDJSON 增量能实时到达客户端。
+/// 返回网关实际回的状态码，供本副本如实记指标（不能假定 200——网关可能 404/502/503）。
+fn forward_via_gw<S: Read + Write>(
+    client: &mut S,
+    rt: &Remote,
+    gw: &Gateway,
+    sid: &str,
+    action: Action,
+    port: u32,
+    method: &str,
+    extra_query: &str,
+    body: &[u8],
+) -> Result<u16, String> {
+    let base = rt.gw_url.as_deref().ok_or("未配置 --gw-url，无法跨节点转发")?;
+    let host_port = base.trim_start_matches("http://").trim_end_matches('/');
+    // mint 出的是 `{base}/gw/{path}?...`；这里只要路径+query 部分。
+    let url = gw.mint(sid, action, port, 60, now_unix());
+    let rel = url.split_once("/gw/").map(|(_, r)| format!("/gw/{r}")).ok_or("ticket URL 异常")?;
+    let target = format!("{rel}{extra_query}");
+
+    let mut up = TcpStream::connect(host_port).map_err(|e| format!("连网关 {host_port} 失败: {e}"))?;
+    up.set_nodelay(true).ok();
+    let head = format!(
+        "{method} {target} HTTP/1.1\r\nHost: sandlocker-gw\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    up.write_all(head.as_bytes()).map_err(|e| format!("写网关请求失败: {e}"))?;
+    up.write_all(body).map_err(|e| format!("写网关请求体失败: {e}"))?;
+    up.flush().ok();
+
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut code = 0u16;
+    let mut head = Vec::new();
+    loop {
+        match up.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // 只从**第一块**里嗅状态码（`HTTP/1.1 <code> ...`），不缓冲整体响应。
+                if code == 0 {
+                    head.extend_from_slice(&buf[..n.min(64)]);
+                    if let Some(c) = String::from_utf8_lossy(&head)
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|c| c.parse::<u16>().ok())
+                    {
+                        code = c;
+                    }
+                }
+                client.write_all(&buf[..n]).map_err(|e| format!("回灌客户端失败: {e}"))?;
+                client.flush().ok();
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("读网关响应失败: {e}")),
+        }
+    }
+    // 网关一字未回（连接被掐）→ 记 502，别谎报 200。
+    Ok(if code == 0 { 502 } else { code })
+}
+
 // ————————————————————— 分派 / handler —————————————————————
 
 fn handle_conn(
@@ -571,6 +727,7 @@ fn handle_conn(
     gw: &SharedGw,
     exposes: &Exposes,
     auth: &SharedAuth,
+    rt: &SharedRemote,
 ) -> Result<(), String> {
     let json = "application/json";
     let (method, path, api_key, body) = read_request(&mut stream)?;
@@ -578,7 +735,18 @@ fn handle_conn(
     if let Some(id) = parse_exec_stream(&method, &path) {
         // exec stream = 对沙箱的 Write 操作，同样过鉴权 + 跨项目门控。
         match authorize(auth, shared, crate::auth::Op::Write, Some(&id), api_key.as_deref()) {
-            Ok(_) => return exec_stream_hijack(stream, &id, &body, shared),
+            Ok(_) => {
+                // 沙箱在别的节点 → 经网关转（全双工中继，NDJSON 增量不被缓冲）。
+                return match remote_owner(shared, rt, &id) {
+                    Some(_) => {
+                        let code =
+                            forward_via_gw(&mut stream, rt, gw, &id, Action::Stream, 0, "POST", "", &body)?;
+                        crate::metrics::metrics().record_api(code);
+                        Ok(())
+                    }
+                    None => exec_stream_hijack(&mut stream, &id, &body, shared),
+                };
+            }
             Err((code, b)) => return write_response(&mut stream, code, json, &b),
         }
     }
@@ -591,6 +759,19 @@ fn handle_conn(
             Err((code, b)) => return write_response(&mut stream, code, json, &b),
         },
     };
+    // M3 W5 余项：**数据面**路由若指向别节点的沙箱，经独立网关转到 owning 节点。
+    // 控制面路由（pause/resume/fork/destroy/keepalive/expose）仍须在 owning 节点受理——
+    // 那是 W4 多节点调度的遗留缺口，见 docs/design/M3技术计划.md「W5 余项落地」。
+    if let Some(dp) = dataplane_route(&route) {
+        if let Some(id) = route.sandbox_id() {
+            if remote_owner(shared, rt, id).is_some() {
+                let (action, m, extra) = dp;
+                let code = forward_via_gw(&mut stream, rt, gw, id, action, 0, m, &extra, &body)?;
+                crate::metrics::metrics().record_api(code);
+                return Ok(());
+            }
+        }
+    }
     let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref());
     // M3 W8 可观测：记 API 请求量/错误（/metrics 抓取本身不计入，避免自噪声）。
     if !matches!(route, Route::Metrics) {
@@ -913,41 +1094,65 @@ fn list_exposes(id: &str, exposes: &Exposes) -> Vec<u8> {
     format!("[{}]", items.join(",")).into_bytes()
 }
 
-/// 数据面网关连接（M2-Q6）：验签一次性 ticket → 路由到 exec/file/logs/端口反代。端口反代把 guest
-/// HTTP 响应**原样**写回外部客户端；其余走 write_response。验签失败 403。
+/// 数据面网关连接（M2-Q6）：验签一次性 ticket → 交 [`serve_gw_ticket`] 分发。验签失败 403。
+///
+/// **进程内网关**（单机 `--serve` 自带的 `/gw/*` 监听）走这条；独立 `sandlocker-gw` 进程验签后
+/// 经数据面把已验签 ticket 下发到 owning 节点，节点侧**跳过验签**直接调 `serve_gw_ticket`
+/// （nonce 已被网关一次性消费，节点再验必失败；采信根据是 mTLS，见 dataplane.rs 模块头）。
 fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Result<(), String> {
     // 网关连接靠 ticket 验签授权（非 API Key），忽略 header 里的 api_key。
     let (method, path, _api_key, body) = read_request(&mut stream)?;
-    let json = "application/json";
     let q = parse_query(&path);
     let ticket = match gw.verify(&q, now_unix()) {
         Ok(t) => t,
-        Err(e) => return write_response(&mut stream, 403, json, &err_json(&format!("ticket 无效: {e}"))),
+        Err(e) => {
+            return write_response(&mut stream, 403, "application/json", &err_json(&format!("ticket 无效: {e}")))
+        }
     };
+    serve_gw_ticket(&mut stream, &ticket, &method, &path, &body, shared)
+}
+
+/// 按**已验签**的 ticket 就地服务一次数据面请求（沙箱须在本节点）。
+///
+/// 泛型 over `Read + Write`：既服务进程内网关的 `TcpStream`，也服务 `sandlocker-gw` 借用的那条
+/// 外拨连接（`dataplane::Chan`）——**同一套语义、同一段代码**，这正是 ADR-22「拆分零语义变更」。
+pub(crate) fn serve_gw_ticket<S: Read + Write>(
+    stream: &mut S,
+    ticket: &Ticket,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    shared: &Shared,
+) -> Result<(), String> {
+    let json = "application/json";
+    let q = parse_query(path);
     let base = path.split('?').next().unwrap_or("");
     match (base, ticket.action) {
-        ("/gw/exec", Action::Exec) => match exec_in(&ticket.sid, &body, shared) {
-            Ok(v) => write_response(&mut stream, 200, json, &v),
-            Err(e) => write_response(&mut stream, 500, json, &err_json(&e)),
+        ("/gw/exec", Action::Exec) => match exec_in(&ticket.sid, body, shared) {
+            Ok(v) => write_response(stream, 200, json, &v),
+            Err(e) => write_response(stream, 500, json, &err_json(&e)),
         },
         ("/gw/file", Action::File) => {
             let p = q.get("p").cloned().unwrap_or_default();
             if method == "PUT" {
-                match put_file(&ticket.sid, &p, &body, shared) {
-                    Ok(()) => write_response(&mut stream, 204, json, &[]),
-                    Err(e) => write_response(&mut stream, 500, json, &err_json(&e)),
+                match put_file(&ticket.sid, &p, body, shared) {
+                    Ok(()) => write_response(stream, 204, json, &[]),
+                    Err(e) => write_response(stream, 500, json, &err_json(&e)),
                 }
             } else {
                 match get_file(&ticket.sid, &p, shared) {
-                    Ok(b) => write_response(&mut stream, 200, "application/octet-stream", &b),
-                    Err(e) => write_response(&mut stream, 500, json, &err_json(&e)),
+                    Ok(b) => write_response(stream, 200, "application/octet-stream", &b),
+                    Err(e) => write_response(stream, 500, json, &err_json(&e)),
                 }
             }
         }
         ("/gw/logs", Action::Logs) => match read_logs(&ticket.sid, shared) {
-            Ok(b) => write_response(&mut stream, 200, "text/plain; charset=utf-8", &b),
-            Err(e) => write_response(&mut stream, 404, json, &err_json(&e)),
+            Ok(b) => write_response(stream, 200, "text/plain; charset=utf-8", &b),
+            Err(e) => write_response(stream, 404, json, &err_json(&e)),
         },
+        // 流式 exec（M3 W5 余项）：NDJSON 增量响应，无 Content-Length。经网关中继时依赖
+        // dataplane 的**全双工**搬运，故 guest 的每一块 stdout 都即时到客户端、不被缓冲住。
+        ("/gw/stream", Action::Stream) => exec_stream_hijack(stream, &ticket.sid, body, shared),
         ("/gw/p", Action::Port) => {
             let gpath = q.get("p").cloned().unwrap_or_default();
             // 端口反代仅 FC 后端（vsock）；取裸 vsock 路径（锁内），锁外做代理。
@@ -959,13 +1164,13 @@ fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Resu
                         stream.flush().ok();
                         Ok(())
                     }
-                    Err(e) => write_response(&mut stream, 502, json, &err_json(&e)),
+                    Err(e) => write_response(stream, 502, json, &err_json(&e)),
                 },
-                Some(_) => write_response(&mut stream, 400, json, &err_json("端口暴露仅 FC 后端（vsock）支持")),
-                None => write_response(&mut stream, 404, json, &err_json("未知沙箱或已回收")),
+                Some(_) => write_response(stream, 400, json, &err_json("端口暴露仅 FC 后端（vsock）支持")),
+                None => write_response(stream, 404, json, &err_json("未知沙箱或已回收")),
             }
         }
-        _ => write_response(&mut stream, 403, json, &err_json("ticket 动作与路径不符")),
+        _ => write_response(stream, 403, json, &err_json("ticket 动作与路径不符")),
     }
 }
 
@@ -1012,38 +1217,43 @@ fn parse_exec_stream(method: &str, path: &str) -> Option<String> {
 /// 事件逐行：`{"stream":"stdout"|"stderr","data":"<base64>"}` 逐块，末尾 `{"exit_code":N}`。仅 FC/vsock。
 /// 传输：`HTTP/1.1 200` + `Connection: close` + **无 Content-Length**（客户端读到连接关闭为止，可增量收）。
 /// 错误在写响应头之前用一次性 `write_response` 报（400/404/500/502）；头写出后只能中断连接。
-fn exec_stream_hijack(mut stream: TcpStream, id: &str, body: &[u8], shared: &Shared) -> Result<(), String> {
+fn exec_stream_hijack<S: Read + Write>(
+    stream: &mut S,
+    id: &str,
+    body: &[u8],
+    shared: &Shared,
+) -> Result<(), String> {
     let json = "application/json";
     let v: serde_json::Value = match serde_json::from_slice(if body.is_empty() { b"{}" } else { body }) {
         Ok(v) => v,
-        Err(e) => return write_response(&mut stream, 400, json, &err_json(&format!("请求体非 JSON: {e}"))),
+        Err(e) => return write_response(stream, 400, json, &err_json(&format!("请求体非 JSON: {e}"))),
     };
     let cmd = match v.get("cmd").and_then(|x| x.as_str()) {
         Some(c) => c.to_string(),
-        None => return write_response(&mut stream, 400, json, &err_json("缺 cmd 字段")),
+        None => return write_response(stream, 400, json, &err_json("缺 cmd 字段")),
     };
     // 取 target（锁内）后立即释放锁；仅 FC/vsock 支持流式 exec。
     let tgt = shared.lock().unwrap().exec_target(id);
     let vsock = match tgt {
         Some(ExecTarget::Vsock(p)) => p,
-        Some(_) => return write_response(&mut stream, 400, json, &err_json("流式 exec 仅 FC 后端（vsock）支持")),
-        None => return write_response(&mut stream, 404, json, &err_json("未知沙箱或已回收")),
+        Some(_) => return write_response(stream, 400, json, &err_json("流式 exec 仅 FC 后端（vsock）支持")),
+        None => return write_response(stream, 404, json, &err_json("未知沙箱或已回收")),
     };
     // 连 guest、发 ExecStream、等 Ok ack（此前的错误都还能回规范 HTTP 响应）。
     let mut g = match connect_guest(&vsock) {
         Ok(s) => s,
-        Err(e) => return write_response(&mut stream, 502, json, &err_json(&format!("连 guest 失败: {e}"))),
+        Err(e) => return write_response(stream, 502, json, &err_json(&format!("连 guest 失败: {e}"))),
     };
     if let Err(e) = write_msg(&mut g, &Request::ExecStream { cmd }) {
-        return write_response(&mut stream, 502, json, &err_json(&format!("发 ExecStream 失败: {e}")));
+        return write_response(stream, 502, json, &err_json(&format!("发 ExecStream 失败: {e}")));
     }
     match read_msg::<_, Response>(&mut g) {
         Ok(Response::Ok) => {}
         Ok(Response::Error { message }) => {
-            return write_response(&mut stream, 500, json, &err_json(&format!("guest 执行错误: {message}")))
+            return write_response(stream, 500, json, &err_json(&format!("guest 执行错误: {message}")))
         }
-        Ok(other) => return write_response(&mut stream, 502, json, &err_json(&format!("非预期 ack: {other:?}"))),
-        Err(e) => return write_response(&mut stream, 502, json, &err_json(&format!("读 ack 失败: {e}"))),
+        Ok(other) => return write_response(stream, 502, json, &err_json(&format!("非预期 ack: {other:?}"))),
+        Err(e) => return write_response(stream, 502, json, &err_json(&format!("读 ack 失败: {e}"))),
     }
     // ack 成功 → 写 NDJSON 响应头（无 Content-Length），随后边收帧边发事件。
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";

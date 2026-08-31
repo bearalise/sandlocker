@@ -8,10 +8,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone **M3 Beta in progress** — clustering + multi-tenancy on top of the M2 single-machine base.
 The narrow `Store` trait (already MVCC-shaped in M1) gains an etcd implementation, so the daemon runs
 either single-machine (SQLite, zero regression) or clustered (`--serve --etcd`, multi-replica
-active-standby). W1–W7 delivered: etcd store, leader election, node heartbeat + dead-node reclaim,
-multi-node convergence, a splittable data-plane gateway, API-Key/scope/project multi-tenancy, and
-per-project quota + append-only audit (M3-Q4 met). Each week ships a backend-agnostic `--*-reconcile`
-verified against real etcd. See the plan: `docs/design/M3技术计划.md`.
+active-standby). W1–W8 delivered: etcd store, leader election, node heartbeat + dead-node reclaim,
+multi-node convergence, API-Key/scope/project multi-tenancy, per-project quota + append-only audit
+(M3-Q4 met), and Prometheus metrics + log sink + a read-only Grafana dashboard (M3-Q5/Q12). The
+data-plane gateway is now a **separate `sandlocker-gw` process** fed by node-initiated outbound
+streams over mTLS, so cross-node exec/logs/files/ports/streaming work with **zero inbound ports on
+nodes** (M3-Q3 met). Each week ships a backend-agnostic `--*-reconcile` verified against real etcd.
+See the plan: `docs/design/M3技术计划.md`.
 
 Milestone **M2 complete** — both hard exits met (pool-hit P50: warm ≈70 ms / hot ≈48 ms ≤100 ms;
 two switchable backends: Firecracker + gVisor pass one ABI contract suite). M2-Q1–Q9 and Q12 have
@@ -22,6 +25,47 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **Standalone data-plane gateway + node-initiated outbound streams + cluster mTLS (ADR-22 /
+  FR-7.1, M3-Q3, W5 remainder)** — a new **`sandlocker-gw` binary** terminates client traffic and
+  relays it to whichever node owns the sandbox, looked up live from etcd (`sandbox/<sid>/node`), so
+  **any replica serves any sandbox with no session stickiness**. Connections always run
+  **node → gateway**: each node pre-dials a pool of idle persistent connections (`--gw-pool`, default
+  8) and parks them; the gateway borrows one, hands over the already-verified ticket, and the node
+  serves it through **the same `serve_gw_ticket` path the in-process gateway uses** — ADR-22's
+  "splitting changes no semantics", cashed. **Nodes still listen on no inbound port.**
+  - The node refills the pool **the moment a stream opens**, not when it ends — otherwise long-lived
+    streams (PTY) would pin the idle budget and `--gw-pool` sessions could wedge a node's data plane.
+    Past `--gw-max-streams` (default 256) new streams are served inline, applying backpressure
+    instead of spawning threads without bound.
+  - Relaying is **full duplex** (PTY and NDJSON streaming exec need it). Since rustls' synchronous
+    `StreamOwned` cannot be read and written from two threads, `dataplane::Duplex` implements duplex
+    TLS directly: blocking socket reads happen *outside* the connection lock, and the write path
+    takes the socket lock *before* releasing the connection lock so TLS records reach the wire in the
+    order the state machine produced them.
+  - **mTLS** on the node-facing port (`WebPkiClientVerifier`, client certs mandatory). rustls is
+    pinned to `default-features = false` + **ring** — the provider ureq already uses — which keeps
+    the default `aws-lc-rs` (cmake + a lot of C) out of the tree; **`rustls-pemfile` is the only new
+    crate**. Plaintext is never a silent fallback: missing certs are an error unless `--gw-insecure`
+    is passed explicitly.
+  - Control-plane replicas forward `/v1/.../exec|logs|files` and `/v1/.../exec/stream` for
+    non-local sandboxes through `--gw-url`, streaming the response back chunk by chunk.
+  - `--gw-dataplane-reconcile [--etcd] [--gw-tls-*|--gw-insecure]` stands up a real gateway plus two
+    real node agents and asserts: ownership routing, no stickiness, one-time tickets, tamper
+    rejection, 404 for unknown sandboxes, bounded 503 when the owning node is absent, chunk-by-chunk
+    delivery (proving the relay is not buffering), and that a plaintext peer cannot join an mTLS
+    port. `scripts/verify-gw-dataplane.sh` adds an openssl live check that a client without a
+    certificate is refused while a valid one succeeds. Plaintext and mTLS × SQLite and real etcd all
+    pass.
+  - Still missing (stated plainly): **control-plane** routes (pause/resume/fork/destroy/keepalive/
+    expose) against a sandbox on another node — a gap left by W4's multi-node scheduling, not the
+    data plane.
+- **Observability: Prometheus metrics + log sink + read-only dashboard (§7.8, M3-Q5/Q12, W8)** —
+  `GET /metrics` (unauthenticated) exposes create-latency histograms, pool hits, exec latency, live
+  sandbox count and API request/error counters in the Prometheus text format, hand-written with
+  **no dependencies**; quantiles are computed by `histogram_quantile()` on the Prometheus side.
+  `--log-sink <url>` forwards structured lifecycle events (create events carry a segment-by-segment
+  timing breakdown). `dashboards/sandlocker.json` is a curated Grafana dashboard with **no bespoke
+  front-end**. A full OTLP tracing exporter is still outstanding.
 - **Per-project quota + append-only audit (FR-7.2/7.3, M3-Q4, W7)** — per-project limits
   (`quota/<project>`: max sandboxes / vcpus / mem, 0 = unlimited); usage is computed **live** from
   the project's current sandbox metas (crash-safe, no drifting counters). `create` / `fork` pre-flight

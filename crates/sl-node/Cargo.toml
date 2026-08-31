@@ -4,9 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# lib 目标（M3 W5 余项）：`sandlocker-gw` 独立进程与 `sl-node` 守护共用 dataplane/gateway 模块，
+# 故实现落 lib.rs，两个 bin 皆为薄壳。
+[lib]
+name = "sl_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sl-node"
 path = "src/main.rs"
+
+# 数据面网关独立进程（ADR-22，M3-Q3）：接节点主动外拨的持久多路复用流 + 按 etcd 沙箱→节点
+# 映射无粘滞中继。仅 `--features cluster` 有意义（须 store 查映射），单机构建下退化为提示。
+[[bin]]
+name = "sandlocker-gw"
+path = "src/bin/sandlocker-gw.rs"
 
 [dependencies]
 sl-proto = { path = "../sl-proto" }
@@ -25,9 +37,16 @@ ed25519-dalek = "2"
 ureq = { version = "2", features = ["tls"] }
 flate2 = "1"
 tar = "0.4"
+# M3 W5 余项（ADR-22）：节点→网关持久流的 **mTLS**（FR-7.1 集群内 mTLS）。rustls 0.23 已在依赖树里
+# （ureq 的 TLS 后端），此处直接用其**同步** `StreamOwned`——零 tokio，守全同步哲学；
+# rustls-pemfile 仅解析 PEM（无 C、无新传递依赖树）。全部 `cluster` feature 门控，单机构建不拉入。
+# default-features=false + ring：rustls 0.23 默认 provider 是 aws-lc-rs（cmake + 大量 C），
+# 会把 aws-lc-sys 拖进依赖树；这里钉到 **ring**——ureq 已在用的同一 provider，crate 数零回涨。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [features]
 default = []
 # cluster（M3 W1）：启用 sl-store 的 etcd 后端，供 `--store-contract --etcd` 对 EtcdStore 跑契约。
 # 单机构建（默认）不启用，不拉入 etcd 相关代码路径。
-cluster = ["sl-store/cluster"]
+cluster = ["sl-store/cluster", "dep:rustls", "dep:rustls-pemfile"]
