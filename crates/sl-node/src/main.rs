@@ -49,6 +49,8 @@ mod api;
 mod auth;
 mod quota;
 mod audit;
+mod metrics;
+mod logsink;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -256,6 +258,9 @@ struct Config {
     /// --quota-reconcile：M3-Q4 配额+审计对账——超限 QUOTA_EXCEEDED / 删后可再建 / 审计 append 可查。
     /// 默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
     quota_reconcile: bool,
+    /// --log-sink <url>：M3 W8 结构化日志转发 sink（Loki/ES/自建收集器）。--serve 时 create/destroy
+    /// 生命周期事件以 JSON POST 转发。未设=不转发（零回归）。
+    log_sink: Option<String>,
 }
 
 fn main() {
@@ -2330,6 +2335,7 @@ fn clone_paths(cfg: &Config) -> Config {
         max_vcpus: 0,
         max_mem: 0,
         quota_reconcile: false,
+        log_sink: None,
 }
 }
 
@@ -3074,6 +3080,7 @@ fn parse_args() -> Config {
         max_vcpus: 0,
         max_mem: 0,
         quota_reconcile: false,
+        log_sink: None,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -3149,6 +3156,7 @@ fn parse_args() -> Config {
             "--max-vcpus" => cfg.max_vcpus = take().parse().unwrap_or(0),
             "--max-mem" => cfg.max_mem = take().parse().unwrap_or(0),
             "--quota-reconcile" => cfg.quota_reconcile = true,
+            "--log-sink" => cfg.log_sink = Some(take()),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

@@ -712,6 +712,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: sl-store 单元测试（SqliteStore 过后端无关契约）
         run: cargo test -p sl-store
+      - name: sl-node 单元测试（election/cluster/auth/quota/audit/metrics/gateway）
+        run: cargo test -p sl-node
       - name: 构建 sl-node（cluster feature：编入 EtcdStore over sync ureq）
         run: cargo build -p sl-node --features cluster
       - name: 等 etcd gRPC-gateway 就绪
