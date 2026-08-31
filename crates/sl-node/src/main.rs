@@ -223,6 +223,9 @@ struct Config {
     /// --election-reconcile：M3-Q2 选主对账——双竞选者证单 leader + resign failover + 无双主。
     /// 默认对 SQLite 临时文件跑；给 --etcd 且 cluster 构建则对真 etcd 跑同一套。随后退出。
     election_reconcile: bool,
+    /// --node-reclaim-reconcile：M3-Q2 节点失联回收对账——节点心跳 + 失联节点名下沙箱被回收 +
+    /// 存活节点不受影响 + 护栏不回收自身。默认 SQLite 临时文件；--etcd 则对真 etcd 跑同一套。随后退出。
+    node_reclaim_reconcile: bool,
 }
 
 fn main() {
@@ -424,6 +427,18 @@ fn main() {
             Ok(()) => println!("[election] M3-Q2 election-reconcile PASS"),
             Err(e) => {
                 eprintln!("[election] M3-Q2 election-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --node-reclaim-reconcile：M3-Q2 节点失联回收对账（心跳 + 孤儿回收 + 存活不动 + 护栏）。
+    if cfg.node_reclaim_reconcile {
+        match run_node_reclaim_reconcile(&cfg) {
+            Ok(()) => println!("[reclaim] M3-Q2 node-reclaim-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[reclaim] M3-Q2 node-reclaim-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2199,7 +2214,8 @@ fn clone_paths(cfg: &Config) -> Config {
         etcd: None,
         cluster_init: false,
         election_reconcile: false,
-    }
+        node_reclaim_reconcile: false,
+}
 }
 
 /// 统计名字含 needle 的进程数（读 /proc/*/comm，避免依赖 pgrep）。
@@ -2372,6 +2388,92 @@ fn run_election_reconcile(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// M3-Q2 节点失联回收对账：心跳 + 失联节点沙箱被回收 + 存活节点不动 + 护栏不回收自身，两后端同一套。
+fn run_node_reclaim_reconcile(cfg: &Config) -> Result<(), String> {
+    use sl_store::cluster::{live_nodes, reclaim_orphans, register_node, sandbox_node_key};
+    use sl_store::{SqliteStore, Store};
+
+    fn asserts(store: &dyn Store) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        let e = |r: sl_store::Result<()>| r.map_err(|e| e.to_string());
+        // 起点干净
+        for kv in store.list("node/").map_err(|e| e.to_string())? {
+            e(store.delete(&kv.key).map(|_| ()))?;
+        }
+        for kv in store.list("sandbox/").map_err(|e| e.to_string())? {
+            e(store.delete(&kv.key).map(|_| ()))?;
+        }
+        // 两节点心跳存活
+        let la = register_node(store, "node-a", b"a", 30).map_err(|e| e.to_string())?;
+        let _lb = register_node(store, "node-b", b"b", 30).map_err(|e| e.to_string())?;
+        want!(live_nodes(store).map_err(|e| e.to_string())?.len() == 2, "两节点应存活");
+        // s1→A、s2→B（meta/node 同租约）
+        let put = |k: &str, v: &[u8], l: sl_store::LeaseId| -> Result<(), String> {
+            store.put(k, v, Some(l)).map(|_| ()).map_err(|e| e.to_string())
+        };
+        let l1 = store.lease_grant(30).map_err(|e| e.to_string())?;
+        put("sandbox/s1/meta", b"{}", l1)?;
+        put(&sandbox_node_key("s1"), b"node-a", l1)?;
+        let l2 = store.lease_grant(30).map_err(|e| e.to_string())?;
+        put("sandbox/s2/meta", b"{}", l2)?;
+        put(&sandbox_node_key("s2"), b"node-b", l2)?;
+        want!(reclaim_orphans(store, None).map_err(|e| e.to_string())?.is_empty(), "都存活时不应回收");
+        // A 失联 → 回收 s1，s2 不动
+        store.lease_revoke(la).map_err(|e| e.to_string())?;
+        want!(live_nodes(store).map_err(|e| e.to_string())? == vec!["node-b"], "仅 B 存活");
+        let r = reclaim_orphans(store, None).map_err(|e| e.to_string())?;
+        want!(r == vec!["s1"], "应只回收失联 A 的 s1");
+        want!(store.get("sandbox/s1/meta").map_err(|e| e.to_string())?.is_none(), "s1 应被清");
+        want!(store.get("sandbox/s2/meta").map_err(|e| e.to_string())?.is_some(), "s2 应保留");
+        // 护栏：B 也失联，但 protect=node-b → 绝不回收自身 s2
+        store.lease_revoke(_lb).map_err(|e| e.to_string())?;
+        want!(reclaim_orphans(store, Some("node-b")).map_err(|e| e.to_string())?.is_empty(), "护栏应保住自身 s2");
+        want!(store.get("sandbox/s2/meta").map_err(|e| e.to_string())?.is_some(), "护栏后 s2 仍在");
+        // 收尾清理
+        for kv in store.list("node/").map_err(|e| e.to_string())? {
+            e(store.delete(&kv.key).map(|_| ()))?;
+        }
+        for kv in store.list("sandbox/").map_err(|e| e.to_string())? {
+            e(store.delete(&kv.key).map(|_| ()))?;
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let store = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(&store)?;
+            println!("[reclaim] EtcdStore({ep}) 节点失联回收：心跳 + 孤儿回收 + 存活不动 + 护栏 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--node-reclaim-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-reclaim-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let store = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(&store)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[reclaim] SqliteStore(file) 节点失联回收：心跳 + 孤儿回收 + 存活不动 + 护栏 PASS");
+    Ok(())
+}
+
 /// M3 W2 `cluster init`：把 `--store <sqlite>` 全量键一次性迁移到 `--etcd <ep>`（ADR-17）。
 #[cfg(feature = "cluster")]
 fn run_cluster_init(cfg: &Config) -> Result<(), String> {
@@ -2448,7 +2550,8 @@ fn parse_args() -> Config {
         etcd: None,
         cluster_init: false,
         election_reconcile: false,
-    };
+        node_reclaim_reconcile: false,
+};
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut take = || args.next().unwrap_or_else(|| { eprintln!("缺少 {a} 的参数值"); std::process::exit(2); });
@@ -2509,6 +2612,7 @@ fn parse_args() -> Config {
             "--etcd" => cfg.etcd = Some(take()),
             "--cluster-init" => cfg.cluster_init = true,
             "--election-reconcile" => cfg.election_reconcile = true,
+            "--node-reclaim-reconcile" => cfg.node_reclaim_reconcile = true,
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {

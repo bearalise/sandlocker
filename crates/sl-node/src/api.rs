@@ -103,6 +103,10 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
             Err(e) => eprintln!("[sandlocker] 池未启用（模板解析失败，走冷路径）: {e}"),
         }
     }
+    // M3 W3（M3-Q2）：本节点 id（addr#pid）。设入 Orch → 创建的沙箱写归属键 `sandbox/<id>/node`，
+    // 供失联节点的沙箱被 leader 回收。
+    let node_id = format!("{addr}#{}", std::process::id());
+    orch.set_node_id(&node_id);
     let shared: Shared = Arc::new(Mutex::new(orch));
 
     // 端口暴露注册表（L4 透传监听器）。allow_public 由 --expose-allow-public 控制。
@@ -118,8 +122,34 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     // 驱动此标志——leader 跑 reaper、standby 置 false 不 tick（下方门控已就位，防双写）。
     let is_leader = Arc::new(AtomicBool::new(true));
 
-    // 后台 reaper：周期 tick(now)（TTL 硬顶 + idle sweep）。回收的沙箱须同步拆掉其暴露监听器。
-    // 仅 leader 执行——standby 不 tick（active-standby 无双写；单机恒 leader 即恒执行）。
+    // M3 W3（M3-Q2）：节点心跳（易失态走 lease TTL，ADR-17）。本节点在 `node/<id>` 写存活键并周期
+    // 续租；崩溃/失联 → 租约到期 → 键消失 → leader 回收其名下沙箱。用独立 store 句柄（同文件另一连接）。
+    // 单机：仅本节点、恒存活、无孤儿（回收含护栏，绝不回收自己名下沙箱）。
+    {
+        let hb_store = SqliteStore::open(db_str).map_err(|e| format!("打开心跳 store 失败: {e}"))?;
+        let node_id_hb = node_id.clone();
+        let meta = format!(r#"{{"addr":"{addr}"}}"#);
+        // 心跳租约窗 max(tick*3, 15s)；续租周期 ~ttl/3。
+        let ttl = std::cmp::max(cfg.tick_secs as i64 * 3, 15);
+        let period = std::cmp::max((ttl / 3) as u64, 1);
+        thread::spawn(move || {
+            let mut lease = sl_store::cluster::register_node(&hb_store, &node_id_hb, meta.as_bytes(), ttl).ok();
+            loop {
+                thread::sleep(Duration::from_secs(period));
+                let alive = match lease {
+                    Some(l) => sl_store::cluster::heartbeat(&hb_store, l).is_ok(),
+                    None => false,
+                };
+                if !alive {
+                    // 租约丢失（被 sweep/首次注册失败）→ 重新注册，恢复存活。
+                    lease = sl_store::cluster::register_node(&hb_store, &node_id_hb, meta.as_bytes(), ttl).ok();
+                }
+            }
+        });
+    }
+
+    // 后台 reaper：周期 tick(now)（TTL 硬顶 + idle sweep）+ 回收失联节点的孤儿沙箱。回收的沙箱须
+    // 同步拆掉其暴露监听器。仅 leader 执行——standby 不 tick/回收（active-standby 无双写；单机恒 leader）。
     let tick_secs = if cfg.tick_secs > 0 { cfg.tick_secs } else { 5 };
     let reaper = Arc::clone(&shared);
     let reaper_ex = Arc::clone(&exposes);
@@ -134,6 +164,15 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
             if let Ok(reaped) = o.tick(now) {
                 for id in reaped {
                     drop_exposes(&reaper_ex, &id);
+                }
+            }
+            // M3 W3：回收失联节点（心跳 lease 过期→node 键消失）名下的孤儿沙箱（护栏不碰自己的）。
+            if let Ok(orphans) = o.reclaim_orphans() {
+                if !orphans.is_empty() {
+                    for id in &orphans {
+                        drop_exposes(&reaper_ex, id);
+                    }
+                    println!("[sandlocker] 回收失联节点的孤儿沙箱: {orphans:?}");
                 }
             }
         }

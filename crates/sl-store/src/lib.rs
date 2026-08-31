@@ -23,6 +23,9 @@ pub mod contract;
 /// 后端无关的 leader 选举（M3-Q2）：orchestrator active-standby，建在 CAS+lease 之上。
 pub mod election;
 
+/// 后端无关的节点心跳 + 失联回收（M3-Q2）：易失态走 lease TTL，孤儿沙箱撤租回收。
+pub mod cluster;
+
 /// EtcdStore（集群模式，M3 W1）：over etcd v3 gRPC-gateway 的 sync ureq+JSON 实现。
 /// `cluster` feature 门控——单机构建不拉入任何 HTTP/TLS 依赖（守 M2 D5 精简依赖哲学）。
 #[cfg(feature = "cluster")]

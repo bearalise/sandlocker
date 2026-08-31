@@ -121,6 +121,9 @@ pub struct Orch<'a> {
     backends: Vec<Box<dyn SandboxBackend + Send + 'a>>,
     template: PathBuf,
     live: HashMap<String, LiveMeta>,
+    /// 本节点 id（集群模式，M3 W3）。Some 时创建沙箱写归属键 `sandbox/<id>/node`，供失联回收；
+    /// None=单机（不写归属键、不参与回收，零行为变化）。
+    node_id: Option<String>,
 }
 
 impl<'a> Orch<'a> {
@@ -136,7 +139,21 @@ impl<'a> Orch<'a> {
         if cfg.gvisor && GvisorBackend::probe(&cfg.gvisor_bin) {
             backends.push(Box::new(GvisorBackend::new(cfg.gvisor_bin.clone(), run_root.to_path_buf())));
         }
-        Ok(Self { store, backends, template, live: HashMap::new() })
+        Ok(Self { store, backends, template, live: HashMap::new(), node_id: None })
+    }
+
+    /// 设本节点 id（集群模式）：此后创建的沙箱写归属键 `sandbox/<id>/node`，供失联回收（M3 W3）。
+    pub fn set_node_id(&mut self, node_id: &str) {
+        self.node_id = Some(node_id.to_string());
+    }
+
+    /// 回收 owning node 已失联的沙箱（撤租连带删 meta/state/node）。leader 周期调用。返回被回收 id。
+    /// 护栏：传本节点 id → 绝不回收自己名下沙箱（只回收别的死节点的）。
+    pub fn reclaim_orphans(&mut self) -> Result<Vec<String>, String> {
+        let reclaimed = sl_store::cluster::reclaim_orphans(self.store.as_ref(), self.node_id.as_deref())
+            .map_err(|e| e.to_string())?;
+        // 死节点的沙箱不在本节点 live 台账里（本就在别的节点），故仅 store 层清理即可。
+        Ok(reclaimed)
     }
 
     /// 后端列表与能力集（`GET /v1/backends`，ADR-14）。
@@ -255,6 +272,14 @@ impl<'a> Orch<'a> {
             let _ = self.store.lease_revoke(lease);
             self.backends[idx].destroy(&bc.id);
             return Err(format!("写 sandbox state 失败: {e}"));
+        }
+        // 集群模式：写归属键（同租约 → 回收撤租一并删），供失联节点的沙箱被 leader 回收（M3 W3）。
+        if let Some(node_id) = &self.node_id {
+            if let Err(e) = self.store.put(&sl_store::cluster::sandbox_node_key(&bc.id), node_id.as_bytes(), Some(lease)) {
+                let _ = self.store.lease_revoke(lease);
+                self.backends[idx].destroy(&bc.id);
+                return Err(format!("写 sandbox 归属键失败: {e}"));
+            }
         }
         self.live.insert(bc.id.clone(), LiveMeta { lease, ttl_deadline, backend: idx });
         Ok(CreateOutcome {
