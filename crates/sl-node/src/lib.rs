@@ -54,6 +54,8 @@ mod logsink;
 // M3 W5 余项（ADR-22 / M3-Q3）：节点主动外拨持久流 + 网关无粘滞中继 + 集群内 mTLS。
 // pub：`sandlocker-gw` 独立进程（src/bin/）要用同一套传输与 `gw_serve`。
 pub mod dataplane;
+// M3 W9（ADR-15 / M3-Q6）：快照信封加密——KMS 根密钥 → 租户 KEK → 每快照 DEK，4MiB 分块 AEAD。
+mod snapcrypt;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -265,6 +267,15 @@ struct Config {
     /// 「按归属路由 / 无会话粘滞 / 一次性跨副本 / 未接入节点 503 / 全双工流式 / mTLS 拒无证书」。
     /// 默认 SQLite 临时文件；--etcd 则对真 etcd 跑同一套。随后退出。
     gw_dataplane_reconcile: bool,
+    /// --snap-kms-key <文件>：M3 W9（ADR-15）快照信封加密的**根密钥**（32 字节，权限 0600）。
+    /// 给了才启用加密——显式开关，不静默生效（加密改变快照落盘格式，与既有明文快照不兼容）。
+    snap_kms_key: Option<PathBuf>,
+    /// --snap-kms-init <文件>：生成一把新的根密钥文件（0600）后退出。拒绝覆盖既有文件
+    /// （覆盖 = 所有既有快照永久不可解）。
+    snap_kms_init: Option<PathBuf>,
+    /// --snapcrypt-reconcile：M3 W9 对账（M3-Q6）——密封/解封往返、篡改即拒、明文不落盘、
+    /// 随机读分块、租户 KEK 隔离、根密钥轮换边界。默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
+    snapcrypt_reconcile: bool,
     require_auth: bool,
     /// --apikey-create：创建 API Key（配 --org/--project/--scope）；用 --store/--etcd 指定的 store。
     /// 打印明文 token（仅此一次），随后退出。
@@ -565,6 +576,30 @@ pub fn cli_main() {
     }
 
     // --gw-cluster-reconcile：M3 W5 网关拆副本对账（共享 secret 无状态验签 + 一次性跨副本）。
+    // --snap-kms-init：生成一把新的快照加密根密钥（0600）后退出。
+    if let Some(p) = &cfg.snap_kms_init {
+        match snapcrypt::FileKms::init(p) {
+            Ok(()) => println!("[snapcrypt] 根密钥已生成: {}（0600；丢失即所有快照不可解，请备份）", p.display()),
+            Err(e) => {
+                eprintln!("[snapcrypt] 生成根密钥失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --snapcrypt-reconcile：M3 W9 快照信封加密对账（M3-Q6）。
+    if cfg.snapcrypt_reconcile {
+        match run_snapcrypt_reconcile(&cfg) {
+            Ok(()) => println!("[snapcrypt] M3 W9 snapcrypt-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[snapcrypt] M3 W9 snapcrypt-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // --gw-dataplane-reconcile：M3 W5 余项对账（M3-Q3 独立网关 + 外拨流 + 无粘滞中继）。
     if cfg.gw_dataplane_reconcile {
         match run_gw_dataplane_reconcile(&cfg) {
@@ -2371,6 +2406,9 @@ fn clone_paths(cfg: &Config) -> Config {
         abi_contract: None,
         q5_reconcile: None,
         gw_addr: None,
+        snap_kms_key: None,
+        snap_kms_init: None,
+        snapcrypt_reconcile: false,
         gw_node_endpoint: None,
         gw_url: None,
         gw_pool: 8,
@@ -2813,6 +2851,186 @@ fn run_auth_reconcile(cfg: &Config) -> Result<(), String> {
 ///
 /// mTLS 的活证（无证书客户端被握手拒）在 `scripts/verify-gw-dataplane.sh`——需 openssl 造证书，
 /// 不适合进程内对账。
+/// `--snapcrypt-reconcile`：M3 W9 对账（M3-Q6，ADR-15）——**快照信封加密**。
+///
+/// 走的是 pause/resume 真正调用的那两个函数（`fcbackend::seal_snapshot` / `unseal_snapshot`）
+/// 与真正的租户 KEK 解析路径，只是把 FC 落盘的 `vmstate`/`mem` 换成同名的构造文件——
+/// 加解密与密钥层级这一层不需要 KVM 就能取到证据。
+///
+/// | # | 断言 | 对应 M3-Q6 判据 |
+/// | - | --- | --- |
+/// | ① | 密封后明文 `vmstate`/`mem` 消失、`.enc` 出现且解回原文 | 落盘即密文 |
+/// | ② | `.enc` 里搜不到明文特征串 | 确实加密 |
+/// | ③ | 控制面 `kek/<project>` 存的是**密文**，搜不到明文 KEK | 不持久化明文密钥 |
+/// | ④ | 快照头里存的是**被包裹的** DEK，搜不到明文 DEK | **节点不持久化明文 DEK** |
+/// | ⑤ | 改一个密文字节 → 解封失败，且不留半成品明文 | **篡改即拒恢复** |
+/// | ⑥ | 项目 A 的快照用项目 B 的 KEK 解不开 | 租户隔离 |
+/// | ⑦ | 同一项目重复取 KEK 得同一把（CAS 收敛） | 跨副本一致，否则互相解不开 |
+/// | ⑧ | 换一把根密钥 → KEK 解不开 | 信封层级成立 |
+/// | ⑨ | 只解第 i 块与整解的对应切片一致 | 4MiB 分块**支持随机读**（懒加载前提） |
+///
+/// 端到端（真 FC pause → 密文落盘 → resume）依赖 KVM，随 `--q5-reconcile` 一类在 KVM 机器上取证。
+fn run_snapcrypt_reconcile(cfg: &Config) -> Result<(), String> {
+    use crate::fcbackend::{seal_snapshot, unseal_snapshot};
+    use crate::snapcrypt::{decrypt_chunk, FileKms, Key, Kms, SnapKey, CHUNK_SIZE};
+    use std::collections::BTreeMap;
+    use sl_store::Store;
+
+    macro_rules! want {
+        ($c:expr, $m:expr) => {
+            if !$c {
+                return Err($m.into());
+            }
+        };
+    }
+
+    let work = std::env::temp_dir().join(format!("sl-snapcrypt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| format!("建工作目录失败: {e}"))?;
+    let cleanup = |w: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(w);
+    };
+
+    let run = (|| -> Result<String, String> {
+        // —— 根密钥（文件 KMS）——
+        let root_path = work.join("root.key");
+        FileKms::init(&root_path)?;
+        want!(
+            FileKms::init(&root_path).is_err(),
+            "重复 init 应被拒（覆盖根密钥 = 既有快照永久不可解）"
+        );
+        // 权限门：0644 的根密钥必须被拒（宁可起不来，也不要静默用一把人人可读的根密钥）。
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let loose = work.join("loose.key");
+            std::fs::write(&loose, [0u8; 32]).map_err(|e| e.to_string())?;
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
+            want!(FileKms::open(&loose).is_err(), "0644 的根密钥应被拒绝");
+        }
+        let kms = FileKms::open(&root_path)?;
+
+        // —— 控制面：租户 KEK 以密文存 `kek/<project>` ——
+        let store: Box<dyn Store> = open_dp_store(&cfg.etcd, &work.join("store.db").to_string_lossy())?;
+        for p in ["proj-a", "proj-b"] {
+            let _ = store.delete(&format!("kek/{p}"));
+        }
+        let mut keks: BTreeMap<String, Key> = BTreeMap::new();
+        for p in ["proj-a", "proj-b"] {
+            let fresh = Key::random();
+            let wrapped = kms.wrap_kek(&fresh)?;
+            store.put(&format!("kek/{p}"), &wrapped, None).map_err(|e| e.to_string())?;
+            keks.insert(p.to_string(), kms.unwrap_kek(&wrapped)?);
+        }
+        // ③ 控制面存的是密文
+        for p in ["proj-a", "proj-b"] {
+            let kv = store.get(&format!("kek/{p}")).map_err(|e| e.to_string())?.ok_or("KEK 未写入")?;
+            let plain = keks.get(p).unwrap().expose_for_test();
+            want!(
+                !kv.value.windows(plain.len()).any(|w| w == plain),
+                format!("控制面 kek/{p} 里出现了明文 KEK")
+            );
+        }
+        // ⑦ 重复解裹得同一把（CAS 收敛后跨副本必须一致，否则互相解不开对方的快照）
+        {
+            let kv = store.get("kek/proj-a").map_err(|e| e.to_string())?.unwrap();
+            let again = kms.unwrap_kek(&kv.value)?;
+            want!(
+                again.expose_for_test() == keks.get("proj-a").unwrap().expose_for_test(),
+                "同一 KEK 密文两次解裹应得同一把"
+            );
+        }
+        // ⑧ 换根密钥 → 解不开
+        {
+            let other_root = work.join("root2.key");
+            FileKms::init(&other_root)?;
+            let kms2 = FileKms::open(&other_root)?;
+            let kv = store.get("kek/proj-a").map_err(|e| e.to_string())?.unwrap();
+            want!(kms2.unwrap_kek(&kv.value).is_err(), "换根密钥不应能解出 KEK");
+        }
+
+        let key_a = SnapKey { kek: kms.unwrap_kek(&store.get("kek/proj-a").map_err(|e| e.to_string())?.unwrap().value)?, kek_id: "proj-a".into() };
+        let key_b = SnapKey { kek: kms.unwrap_kek(&store.get("kek/proj-b").map_err(|e| e.to_string())?.unwrap().value)?, kek_id: "proj-b".into() };
+
+        // —— 实例目录：造 vmstate/mem（mem 跨 2 块，逼出分块路径）——
+        let inst = work.join("inst");
+        std::fs::create_dir_all(&inst).map_err(|e| e.to_string())?;
+        let needle = b"SECRET-IN-GUEST-MEMORY-4f3a9c";
+        let mut mem = vec![0u8; CHUNK_SIZE as usize + 4096];
+        for (i, b) in mem.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        mem[CHUNK_SIZE as usize - 10..CHUNK_SIZE as usize - 10 + needle.len()].copy_from_slice(needle);
+        let vmstate = b"vmstate-blob".repeat(100);
+        std::fs::write(inst.join("mem"), &mem).map_err(|e| e.to_string())?;
+        std::fs::write(inst.join("vmstate"), &vmstate).map_err(|e| e.to_string())?;
+
+        // ① 密封：明文消失、密文出现
+        seal_snapshot(&inst, &key_a)?;
+        want!(!inst.join("mem").exists(), "密封后明文 mem 仍在");
+        want!(!inst.join("vmstate").exists(), "密封后明文 vmstate 仍在");
+        want!(inst.join("mem.enc").exists() && inst.join("vmstate.enc").exists(), "密文未生成");
+
+        // ② 密文里搜不到明文特征串
+        let ct = std::fs::read(inst.join("mem.enc")).map_err(|e| e.to_string())?;
+        want!(!ct.windows(needle.len()).any(|w| w == needle), "密文中出现了明文 guest 内存片段");
+
+        // ④ 节点不持久化明文 DEK：快照头里是被 KEK 包裹的 DEK
+        {
+            let mut f = std::fs::File::open(inst.join("mem.enc")).map_err(|e| e.to_string())?;
+            let hdr = crate::snapcrypt::Header::read_from(&mut f)?;
+            let dek = hdr.unwrap_dek(&key_a.kek)?;
+            let raw = dek.expose_for_test();
+            want!(!ct.windows(raw.len()).any(|w| w == raw), "快照文件里出现了明文 DEK");
+            want!(hdr.kek_id == "proj-a", "头部 kek_id 应记录租户");
+        }
+
+        // ⑨ 随机读：只解第 1 块，与原文对应切片一致
+        {
+            let c1 = decrypt_chunk(&inst.join("mem.enc"), &key_a.kek, 1)?;
+            want!(c1 == mem[CHUNK_SIZE as usize..], "随机读第 1 块与原文不一致");
+        }
+
+        // ⑥ 租户隔离：B 的 KEK 解不开 A 的快照
+        want!(unseal_snapshot(&inst, &key_b).is_err(), "别的项目的 KEK 不应能解开本项目快照");
+        // 失败不得留下半成品明文
+        want!(!inst.join("mem").exists(), "跨租户解封失败后不得留下明文 mem");
+
+        // ① 解封往返：内容逐字节一致
+        unseal_snapshot(&inst, &key_a)?;
+        want!(std::fs::read(inst.join("mem")).map_err(|e| e.to_string())? == mem, "解封后 mem 与原文不一致");
+        want!(
+            std::fs::read(inst.join("vmstate")).map_err(|e| e.to_string())? == vmstate,
+            "解封后 vmstate 与原文不一致"
+        );
+
+        // ⑤ 篡改即拒：改密文一个字节 → 解封失败且不留半成品
+        {
+            let _ = std::fs::remove_file(inst.join("mem"));
+            let p = inst.join("mem.enc");
+            let mut b = std::fs::read(&p).map_err(|e| e.to_string())?;
+            let i = b.len() - 7;
+            b[i] ^= 0xff;
+            std::fs::write(&p, &b).map_err(|e| e.to_string())?;
+            let err = unseal_snapshot(&inst, &key_a).unwrap_err();
+            want!(err.contains("AEAD 校验失败"), format!("篡改应报 AEAD 失败，实得: {err}"));
+            want!(!inst.join("mem").exists(), "篡改用例不得留下半解密的明文");
+        }
+
+        for p in ["proj-a", "proj-b"] {
+            let _ = store.delete(&format!("kek/{p}"));
+        }
+        Ok(cfg.etcd.clone().unwrap_or_else(|| "SQLite(临时)".into()))
+    })();
+
+    cleanup(&work);
+    let backend = run?;
+    println!(
+        "[snapcrypt] {backend}：密封/解封往返 + 密文无明文 + 控制面无明文 KEK + 节点无明文 DEK + \
+篡改即拒 + 租户隔离 + KEK 收敛 + 换根密钥拒 + 分块随机读 PASS"
+    );
+    Ok(())
+}
+
 fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
     use crate::dataplane::{gw_serve, start_node_agent, AgentCfg, GwCfg};
     use crate::gateway::{Action, Gateway};
@@ -3429,6 +3647,9 @@ fn parse_args() -> Config {
         abi_contract: None,
         q5_reconcile: None,
         gw_addr: None,
+        snap_kms_key: None,
+        snap_kms_init: None,
+        snapcrypt_reconcile: false,
         gw_node_endpoint: None,
         gw_url: None,
         gw_pool: 8,
@@ -3515,6 +3736,9 @@ fn parse_args() -> Config {
             "--abi-contract" => cfg.abi_contract = Some(PathBuf::from(take())),
             "--q5-reconcile" => cfg.q5_reconcile = Some(PathBuf::from(take())),
             "--gw-addr" => cfg.gw_addr = Some(take()),
+            "--snap-kms-key" => cfg.snap_kms_key = Some(PathBuf::from(take())),
+            "--snap-kms-init" => cfg.snap_kms_init = Some(PathBuf::from(take())),
+            "--snapcrypt-reconcile" => cfg.snapcrypt_reconcile = true,
             "--gw" => cfg.gw_node_endpoint = Some(take()),
             "--gw-url" => cfg.gw_url = Some(take()),
             "--gw-pool" => cfg.gw_pool = take().parse().unwrap_or(8),

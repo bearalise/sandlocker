@@ -42,6 +42,9 @@ tar = "0.4"
 # rustls-pemfile 仅解析 PEM（无 C、无新传递依赖树）。全部 `cluster` feature 门控，单机构建不拉入。
 # default-features=false + ring：rustls 0.23 默认 provider 是 aws-lc-rs（cmake + 大量 C），
 # 会把 aws-lc-sys 拖进依赖树；这里钉到 **ring**——ureq 已在用的同一 provider，crate 数零回涨。
+# M3 W9 快照信封加密（ADR-15 / M3-Q6）：AEAD 用 ring——它早已在依赖树里（ureq → rustls → ring），
+# 故本特性**零新增 crate**，守 M2 D5「精简依赖」。非可选：加密不该被 feature 藏起来。
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 

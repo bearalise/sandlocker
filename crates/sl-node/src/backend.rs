@@ -251,6 +251,14 @@ pub trait SandboxBackend {
     // —— pause/resume/fork（M2 W9 / FR-1.4 / M2-Q5；能力门控，默认不支持）——
 
     /// 暂停：落快照 + 停 VM（需 `pause_resume`）。默认后端不支持。
+    /// 设本次快照操作的密钥材料（M3 W9 / ADR-15）。默认忽略——不支持快照的后端（gVisor）无需实现。
+    ///
+    /// 为什么用「先注入、再操作」而不是给 `pause/resume/fork` 加参数：这三个签名被 M2 的
+    /// ABI 契约套件（`--abi-contract`）钉住，改签名等于动 Sandbox ABI（ADR-14）。密钥是
+    /// **旁路的执行上下文**而非沙箱语义的一部分，注入式更贴合。orchestrator 在每次
+    /// pause/resume/fork 之前调一次。
+    fn set_snapshot_key(&mut self, _key: Option<std::sync::Arc<crate::snapcrypt::SnapKey>>) {}
+
     fn pause(&mut self, _id: &str) -> Result<(), String> {
         Err(format!("{UNSUPPORTED_BY_BACKEND}: 后端 {} 无 pause_resume，不支持 pause", self.id()))
     }

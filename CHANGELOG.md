@@ -8,12 +8,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 Milestone **M3 Beta in progress** — clustering + multi-tenancy on top of the M2 single-machine base.
 The narrow `Store` trait (already MVCC-shaped in M1) gains an etcd implementation, so the daemon runs
 either single-machine (SQLite, zero regression) or clustered (`--serve --etcd`, multi-replica
-active-standby). W1–W8 delivered: etcd store, leader election, node heartbeat + dead-node reclaim,
+active-standby). W1–W9 delivered: etcd store, leader election, node heartbeat + dead-node reclaim,
 multi-node convergence, API-Key/scope/project multi-tenancy, per-project quota + append-only audit
 (M3-Q4 met), and Prometheus metrics + log sink + a read-only Grafana dashboard (M3-Q5/Q12). The
 data-plane gateway is now a **separate `sandlocker-gw` process** fed by node-initiated outbound
 streams over mTLS, so cross-node exec/logs/files/ports/streaming work with **zero inbound ports on
-nodes** (M3-Q3 met). Each week ships a backend-agnostic `--*-reconcile` verified against real etcd.
+nodes** (M3-Q3 met). Paused snapshots are sealed at rest under a KMS → tenant KEK → per-snapshot DEK
+envelope with 4 MiB chunked AES-256-GCM (M3-Q6 met, one of the four debts M2 handed over). Each week ships a backend-agnostic `--*-reconcile` verified against real etcd.
 See the plan: `docs/design/M3技术计划.md`.
 
 Milestone **M2 complete** — both hard exits met (pool-hit P50: warm ≈70 ms / hot ≈48 ms ≤100 ms;
@@ -25,6 +26,46 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **Snapshot envelope encryption (ADR-15, M3-Q6, W9)** — paused snapshots are now sealed at rest
+  under a three-level envelope: a KMS root key wraps a per-project **tenant KEK**, which wraps a
+  fresh **per-snapshot DEK**, which encrypts `vmstate` and `mem` as AES-256-GCM in **4 MiB chunks**.
+  Enable it with `--snap-kms-key <file>` (`--snap-kms-init` mints a 0600 root key and refuses to
+  overwrite an existing one). Off by default: encryption changes the on-disk snapshot format, so
+  when to switch is the operator's call. **Recommended on by default at GA.**
+  - Firecracker writes and `mmap`s its own snapshot files and has no hook for a custom storage
+    layer, so encryption wraps *around* it: `pause` seals `vmstate|mem` into `.enc` and shreds the
+    plaintext; `resume`/`fork` unseal before handing the files to Firecracker. **What this protects
+    is the paused snapshot — the state that outlives the node.** A running instance's `mem` is
+    necessarily plaintext (Firecracker mmaps it for the VM's lifetime), which is no extra exposure
+    since that memory is in host RAM anyway. Decrypting onto tmpfs would make plaintext never touch
+    disk but costs a second copy of RAM per instance, which would sink the density exit (M3-Q9).
+  - The node **never persists a plaintext DEK or KEK**: the DEK lives wrapped in the snapshot
+    header, the KEK lives wrapped in the control plane at `kek/<project>` (established by CAS on
+    first use), and in-memory keys are zeroed on drop.
+  - The `SLSNAP1` header is plaintext but **every header field is bound into each chunk's AAD**, so
+    altering one byte of it fails the whole chunk. Chunk *i* starts at a computed offset, so the
+    format **supports random reads** — the groundwork for userfaultfd lazy loading (P2) without a
+    format change, which is why ADR-15 chose chunked AEAD over whole-file AEAD.
+  - New `Request::WipeKeys`: the host sends it **before** `PATCH /vm Paused` so sl-envd overwrites
+    and unlinks the session key it issued. Lossless — `resume`/`fork` always run `Reinit`, which
+    mints a fresh one. This wipes only sl-envd's *own* key material; **pause still captures whatever
+    secrets live in guest memory** (PRD §8.2).
+  - Sealing **fails closed**: if it cannot complete, the plaintext and any partial output are
+    shredded and the VM is put back in the running state (the sandbox survives, the pause fails).
+    Plaintext guest memory is never left on disk because sealing failed.
+  - AEAD comes from **ring**, already in the tree via ureq → rustls, so this feature adds **zero new
+    crates**.
+  - `--snapcrypt-reconcile [--etcd]` drives the same `seal_snapshot`/`unseal_snapshot` and tenant-KEK
+    paths `pause`/`resume` use, asserting: plaintext gone after sealing and recoverable, no plaintext
+    needle in the ciphertext, no plaintext KEK in the control plane, no plaintext DEK in the snapshot
+    file, one flipped byte refused with no partial plaintext left behind, project A's snapshot
+    unopenable with project B's key, repeated KEK unwraps agreeing, a different root key failing, and
+    a single random-access chunk matching the full decrypt. SQLite and real etcd both pass, alongside
+    9 crypto unit tests.
+  - Outstanding: end-to-end (real Firecracker pause → sealed on disk → resume) needs KVM and is
+    covered on KVM hosts; the **Vault KMS plugin stays P1/GA**, so V1's file KMS keeps the root key on
+    the node — it defends against a stolen disk, not against a compromised node; and overwrite-before-
+    unlink is defence in depth, not a guarantee on CoW filesystems or SSDs.
 - **Standalone data-plane gateway + node-initiated outbound streams + cluster mTLS (ADR-22 /
   FR-7.1, M3-Q3, W5 remainder)** — a new **`sandlocker-gw` binary** terminates client traffic and
   relays it to whichever node owns the sandbox, looked up live from etcd (`sandbox/<sid>/node`), so
