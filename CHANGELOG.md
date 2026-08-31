@@ -5,6 +5,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## [Unreleased]
 
+Milestone **M3 Beta in progress** — clustering + multi-tenancy on top of the M2 single-machine base.
+The narrow `Store` trait (already MVCC-shaped in M1) gains an etcd implementation, so the daemon runs
+either single-machine (SQLite, zero regression) or clustered (`--serve --etcd`, multi-replica
+active-standby). W1–W7 delivered: etcd store, leader election, node heartbeat + dead-node reclaim,
+multi-node convergence, a splittable data-plane gateway, API-Key/scope/project multi-tenancy, and
+per-project quota + append-only audit (M3-Q4 met). Each week ships a backend-agnostic `--*-reconcile`
+verified against real etcd. See the plan: `docs/design/M3技术计划.md`.
+
 Milestone **M2 complete** — both hard exits met (pool-hit P50: warm ≈70 ms / hot ≈48 ms ≤100 ms;
 two switchable backends: Firecracker + gVisor pass one ABI contract suite). M2-Q1–Q9 and Q12 have
 per-question conclusions; M2-Q10 (bare-metal density) is method-ready but **pending a self-hosted
@@ -12,6 +20,58 @@ runner**; M2-Q11 (snapshot encryption) is **deferred to M3** per the plan's cut-
 review: `docs/design/M2出口评审.md`.
 
 ### Added
+
+#### M3 Beta (clustering + multi-tenancy)
+- **Per-project quota + append-only audit (FR-7.2/7.3, M3-Q4, W7)** — per-project limits
+  (`quota/<project>`: max sandboxes / vcpus / mem, 0 = unlimited); usage is computed **live** from
+  the project's current sandbox metas (crash-safe, no drifting counters). `create` / `fork` pre-flight
+  a quota check — over any limit → `QUOTA_EXCEEDED` mapped to **HTTP 429**, before the VM is built.
+  A backend-agnostic **append-only audit log** (`audit/<ts>-<seq>`, put-only) records every
+  Write/Build request under `--require-auth`; `GET /v1/audit` lists entries filtered by the caller's
+  project. `--quota-set` / `--quota-reconcile [--etcd]`.
+- **Multi-tenant API Key + scopes + project isolation (FR-7.1, M3-Q4, W6)** — `org → project → Key`
+  with three scopes (readonly / readwrite / build). The store holds only `apikey/<sha256(token)>` →
+  record, so leaking the store does not leak usable tokens. `--serve --require-auth` gates every
+  `/v1` request: authenticate (`Authorization: Bearer` / `X-API-Key`), authorize by scope, and
+  project-guard sandbox routes (a sandbox carries its project; list is filtered, single-sandbox routes
+  require ownership match). Default off = zero regression. `--apikey-create` / `--auth-reconcile`.
+- **Splittable data-plane gateway (ADR-22, W5)** — the ticket HMAC secret converges via a store CAS
+  (`cluster/gw_secret`) and the one-time nonce is consumed via store CAS, so **any gateway replica
+  statelessly verifies any replica's ticket and one-time holds across replicas** — the M2-pinned
+  interface is now split-ready with zero semantic change. Single-machine keeps the in-process
+  secret/nonce. `--gw-cluster-reconcile [--etcd]`. (Node-agent outbound streams + cross-node data
+  forwarding remain a follow-up.)
+- **Multi-node daemon on etcd + active-standby (M3-Q1/Q2, W4)** — `--serve --etcd <ep>` backs the
+  orchestrator, heartbeat, and election with etcd; multiple replicas share state, only the leader runs
+  the reaper/reclaim, and a standby takes over on leader death (verified live with two daemons:
+  election + failover + a shared sandbox view). `--cluster-reconcile [--etcd]`.
+- **Node heartbeat + dead-node sandbox reclaim (M3-Q2, W3)** — volatile state via lease TTL: a node
+  writes a lease-backed `node/<id>` liveness key; on crash the lease expires and the leader reclaims
+  that node's sandboxes (a sandbox carries `sandbox/<id>/node`). Safety rail: a node **never** reclaims
+  its own sandboxes. `--node-reclaim-reconcile [--etcd]`.
+- **Leader election + cluster-init migration (M3-Q2, W2)** — backend-agnostic election over
+  `compare_and_swap` + lease (`cluster/leader`); single-machine SQLite is always-leader (ADR-17, no
+  election). `migrate_all` powers `--cluster-init --store <sqlite> --etcd <ep>` (one-time downtime
+  migration). `--election-reconcile [--etcd]`.
+- **EtcdStore + store contract suite (M3-Q1, W1)** — an `EtcdStore` implements the same `Store` trait
+  over etcd's gRPC-gateway HTTP/JSON API using synchronous `ureq` + rustls — **zero tokio/tonic**
+  (`cluster` feature; single-machine builds pull none of it). A backend-agnostic contract
+  (`contract::run_all`) runs against SqliteStore and EtcdStore, proving no dual semantics.
+  `--store-contract [--etcd]`.
+
+#### Post-M2 runtime features
+- **Runtime network egress (`network:egress`)** — a sandbox can cold-boot with a NIC into a
+  per-instance netns (veth + tap + host NAT), so code inside can reach the network (`npm` / `pip
+  install`) at runtime, not just at build time. `POST /v1/sandboxes {network:"egress"}`; FC + root,
+  capability-gated. `sl-node --net-egress-reconcile`.
+- **Port exposure L4 passthrough** — external clients reach a dynamic service inside the VM (e.g. a
+  Next.js dev server) through a stable address via raw L4 splice over vsock, beyond the simple HTTP/1.0
+  reverse proxy. `POST /v1/sandboxes/{id}/expose`; `sl-node --expose-reconcile`.
+- **Streaming exec** — `run(cmd, {onStdout, onStderr})` streams output chunk-by-chunk (NDJSON, stdout
+  / stderr separated, exit code propagated) instead of buffering. `sl-node --exec-stream-reconcile`.
+- **`Sandbox.connect`** — attach to an existing sandbox by id (TS + Python SDKs).
+
+#### M2 Alpha
 - **Interactive PTY + SDK M2 endpoints (M2-Q7)** — a new `sl-proto` `Pty{cols,rows}` frame makes
   `sl-envd` `forkpty` an interactive `/bin/sh` (guest now mounts `devpts`); after the `Ok` ack the
   vsock connection carries **framed input** (`pty_stdin_frame` / `pty_resize_frame` — stdin vs
