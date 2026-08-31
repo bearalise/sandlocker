@@ -668,12 +668,43 @@ pub fn reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
 /// M2-Q4：gVisor(runsc) 第二后端接入——create/exec/fs/destroy 走 ABI，能力显式无 prebake/pause，
 /// 与 FC 可切换。rootless（`--rootless --platform=systrap --network=none`），**无需 root/KVM**。
 /// runsc 缺失则输出 skip JSON 退 0（不阻塞 CI）。用同一模板的 rootfs.ext4 作 gVisor bundle rootfs。
-pub fn gvisor_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+/// 本环境能否**真正运行** gVisor 沙箱（runsc 装了不等于起得来：GH runner 的 systrap 平台常因
+/// seccomp/内核收紧而 rc=128 起不了）。用独立后端跑一次最小 create→destroy 判定：
+///   - Ok(true)  = 成功起了沙箱（可运行）；
+///   - Ok(false) = runsc **执行**失败（run/spec）——环境不具备 → 调用方 skip 不误报；
+///   - Err(..)   = 其它 setup 失败（debugfs/bundle 等真问题）→ 上抛。
+/// 供 gvisor-reconcile / abi-contract 把「环境起不了 gVisor」与「代码 bug」区分开（skip vs fail）。
+fn gvisor_runnable(cfg: &Config, template: &Path) -> Result<bool, String> {
     if !GvisorBackend::probe(&cfg.gvisor_bin) {
-        println!(r#"{{"metric":"gvisor_reconcile","skipped":true,"reason":"runsc-not-found"}}"#);
+        return Ok(false);
+    }
+    let probe_root = cfg.workdir.join("gvisor-probe");
+    let _ = std::fs::remove_dir_all(&probe_root);
+    std::fs::create_dir_all(&probe_root).map_err(|e| format!("建 gVisor probe 目录失败: {e}"))?;
+    let mut be = GvisorBackend::new(cfg.gvisor_bin.clone(), probe_root.clone());
+    let verdict = match be.create(template, &SandboxSpec::default()) {
+        Ok(bc) => {
+            be.destroy(&bc.id);
+            Ok(true)
+        }
+        // runsc 自身起不了沙箱（run/spec 执行失败）= 环境不具备 → skip。
+        Err(e) if e.contains("runsc run") || e.contains("runsc spec") => Ok(false),
+        // 其它（debugfs 抽取、bundle 生成等）= 真问题 → 上抛。
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_dir_all(&probe_root);
+    verdict
+}
+
+pub fn gvisor_reconcile(cfg: &Config, template: &Path) -> Result<(), String> {
+    let template = abspath(template)?;
+    // runsc 缺失 or 装了但本环境起不了沙箱（systrap/seccomp/内核）→ skip 不误报（不 hard-fail）。
+    if !gvisor_runnable(cfg, &template)? {
+        println!(
+            r#"{{"metric":"gvisor_reconcile","skipped":true,"reason":"runsc-unavailable-or-cannot-run-here"}}"#
+        );
         return Ok(());
     }
-    let template = abspath(template)?;
     let run_root = cfg.workdir.join("gvisor-reconcile");
     let _ = std::fs::remove_dir_all(&run_root);
     // 强制注册 gVisor（本对账目标即它）。
@@ -873,6 +904,8 @@ pub fn abi_contract(cfg: &Config, template: &Path) -> Result<(), String> {
     let mut orch = Orch::new(&cfg2, &template, &run_root, Box::new(store))?;
 
     let kvm_ok = std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
+    // gVisor：runsc 装了不等于起得来（GH runner systrap 环境常 rc=128）——实测一次运行力。
+    let gvisor_env_ok = gvisor_runnable(cfg, &template).unwrap_or(false);
     let registered: Vec<(String, Vec<String>)> = orch
         .backends_info()
         .into_iter()
@@ -886,7 +919,8 @@ pub fn abi_contract(cfg: &Config, template: &Path) -> Result<(), String> {
     for (id, caps) in &registered {
         let eligible = match id.as_str() {
             "fc" => kvm_ok,
-            _ => true, // 注册即已探活
+            "gvisor" => gvisor_env_ok, // 注册（--version）不够，还须本环境真能起沙箱
+            _ => true,
         };
         if !eligible {
             reports.push(serde_json::json!({"id":id,"eligible":false,"reason":"env-not-ready"}));
@@ -914,7 +948,7 @@ pub fn abi_contract(cfg: &Config, template: &Path) -> Result<(), String> {
 
     if cfg.json {
         println!(
-            r#"{{"metric":"abi_contract","backends":{},"both_backends":{both_backends},"switchable":{switchable},"pass":{pass}}}"#,
+            r#"{{"metric":"abi_contract","backends":{},"both_backends":{both_backends},"switchable":{switchable},"pass":{pass},"gvisor_env_ready":{gvisor_env_ok}}}"#,
             serde_json::Value::Array(reports)
         );
     } else {
