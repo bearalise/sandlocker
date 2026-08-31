@@ -72,8 +72,57 @@
   >
   > `slo-gate.sh` 会校核宿主规格：超出参考机型 20% 容差时，密度两行判为**不认**，严格档失败。
   > 确有理由在大机器上认这两行时须显式 `SLO_DENSITY_HOST_OK=1`，并在出口评审写明理由。
-- **本地 NVMe**。存储栈用 reflink/CoW（ADR-23），网络盘会把 copy 段的分位彻底带偏。
+- **本地 NVMe**，且**文件系统必须支持 reflink**（见下节）。网络盘会把 copy 段的分位彻底带偏。
 - **按小时计费**（D4 的 opex 前提）。按月起租的产品要算清最短计费周期。
+
+## 1.5 操作系统与文件系统
+
+### 发行版：**Ubuntu 22.04 LTS**（别选 24.04）
+
+理由有两条，都很具体：
+
+- **apt 依赖与文档/CI 逐条对得上**——`bench.yml` 跑在 `ubuntu-latest`，部署指南 §1.1 的包名
+  也是 Debian 系。换 RHEL 系要自己映射一遍包名，租机时间不该花在这上面。
+- **24.04 默认拦非特权 user namespace**（`kernel.apparmor_restrict_unprivileged_userns=1`，
+  Ubuntu 23.10 起）。本项目的网络与私有 rootfs 全走 rootless `unshare --map-root-user`，
+  被拦住就直接跑不起来。虽然一条 sysctl 能关（部署指南 §5.1 有表），但没必要给自己埋雷。
+  **22.04 没有这个限制。**
+
+Debian 12 也可以，但历史上需要 `kernel.unprivileged_userns_clone=1`，同样见 §5.1。
+
+开机后先自测一句，出 `OK` 再往下：
+
+```bash
+unshare --user --map-root-user true && echo OK || echo BLOCKED
+```
+
+### 文件系统：**XFS（reflink=1）或 Btrfs —— 不能是 ext4**
+
+这一条会**静默**把创建分位带偏，务必当回事。
+
+创建热路径每次都要拷一份私有 rootfs，走的是 `cp --reflink=auto`（`orch.rs` 的 `cp_reflink`）。
+**ext4 不支持 reflink**，`--reflink=auto` 会**静默回退成全量拷贝**——密度爬坡起 200~500 个实例
+就是 200~500 次全量拷贝。后果：`restore_create` 的 `copy` 分段与创建 P50 被显著抬高、密度爬坡
+被拖慢，**而且全程没有任何报错**，事后看 JSONL 完全看不出是文件系统的锅。
+
+Ubuntu 默认给你 ext4，所以要**手动把 NVMe 格成 XFS** 并挂到工作目录：
+
+```bash
+sudo mkfs.xfs -f /dev/nvme0n1          # mkfs.xfs 现默认 reflink=1
+sudo mkdir -p /srv/bench && sudo mount /dev/nvme0n1 /srv/bench
+sudo chown "$USER" /srv/bench
+xfs_info /srv/bench | grep reflink     # 须为 reflink=1
+cd /srv/bench && git clone https://github.com/bearalise/sandlocker && cd sandlocker
+```
+
+`scripts/bench/check-env.sh` 会**实测一次** reflink（真做一次 `cp --reflink=always`，
+而不是看文件系统名），不支持时给出 WARN 并说明后果。
+
+### 内核
+
+发行版自带即可（22.04 是 5.15）。KVM / device-mapper thin（ADR-23）/ nftables / netns /
+XFS reflink 都在其中。**不要**为了追新去换内核——guest 内核由 `scripts/build-kernel.sh`
+自己构建，与宿主内核版本无关。
 
 **候选**（具体规格/价格以当下官网为准，此处不列数字以免过期）：
 
@@ -118,11 +167,14 @@ grep -q hypervisor /proc/cpuinfo && echo "⚠️ 检测到 hypervisor flag——
 # ② 规格对得上口径？（要 ≥64C / ≥128G）
 nproc && free -g
 
-# ③ 仓库自带的环境检查
+# ③ 非特权 userns 是否可用（24.04 默认被拦；本项目 rootless 路径依赖它）
+unshare --user --map-root-user true && echo OK || echo BLOCKED
+
+# ④ 仓库自带的环境检查（含 reflink 实测——ext4 会静默回退全拷，抬高创建分位）
 git clone https://github.com/bearalise/sandlocker && cd sandlocker
 scripts/bench/check-env.sh
 
-# ④ 让工具自己判一次——这是 slo-gate.sh 严格档用的**同一个函数**，
+# ⑤ 让工具自己判一次——这是 slo-gate.sh 严格档用的**同一个函数**，
 #    它说 bare-metal 才作数（说 unknown / virtualized / container 都会被拒收）。
 ( . scripts/bench/_common.sh; echo "host_kind=$(host_kind)" )
 ```
