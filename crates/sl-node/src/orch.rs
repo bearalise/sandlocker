@@ -295,6 +295,11 @@ impl<'a> Orch<'a> {
                 return Err(format!("写 sandbox 归属键失败: {e}"));
             }
         }
+        // M3 W10（ADR-16）：记版本钉（模板/内核/VMM 三元组，从模板 manifest 读）——恢复兼容门控用。
+        // 非预烘焙模板无 manifest → 不钉（best-effort，不阻塞创建）。
+        if let Some(pin) = crate::retention::pin_from_template(template) {
+            let _ = crate::retention::set_pin(self.store.as_ref(), &bc.id, &pin, Some(lease));
+        }
         self.live.insert(bc.id.clone(), LiveMeta { lease, ttl_deadline, backend: idx });
         Ok(CreateOutcome {
             id: bc.id,
@@ -316,9 +321,20 @@ impl<'a> Orch<'a> {
     pub fn pause(&mut self, id: &str) -> Result<(), String> {
         let idx = self.backend_of(id)?;
         self.require_cap(idx, Capability::PauseResume)?;
+        // M3 W10（FR-7.2 存储配额）：快照占存储——pause 前置检查，超限拒（先于落快照）。
+        // 存储量估算 = VM 内存（paused 快照主体，ADR-25 单份 512MiB 量级）。
+        let size_mib = self.sandbox_mem_mib(id).unwrap_or(0);
+        if let Some(project) = self.sandbox_project(id)? {
+            crate::quota::check(self.store.as_ref(), &project, 0, 0, size_mib)?;
+        }
         self.arm_snapshot_key(idx, id)?; // M3 W9：快照密封用的租户 KEK
         self.backends[idx].pause(id)?;
-        let _ = self.store.put(&state_key(id), b"paused", self.lease_of(id));
+        let lease = self.lease_of(id);
+        let _ = self.store.put(&state_key(id), b"paused", lease);
+        // M3 W10（ADR-16）：记保留期（默认 7 天过期 GC）+ 存储占用（配额累计）。
+        let deadline = now_unix() + crate::retention::DEFAULT_RETENTION_SECS;
+        let _ = crate::retention::set_retention(self.store.as_ref(), id, deadline, lease);
+        let _ = crate::quota::set_size(self.store.as_ref(), id, size_mib, lease);
         Ok(())
     }
 
@@ -394,6 +410,12 @@ impl<'a> Orch<'a> {
     }
     fn lease_of(&self, id: &str) -> Option<LeaseId> {
         self.live.get(id).map(|m| m.lease)
+    }
+    /// 读沙箱 meta 的 mem_mib（M3 W10 快照存储量估算：paused 快照主体≈VM 内存，ADR-25）。
+    fn sandbox_mem_mib(&self, id: &str) -> Option<u64> {
+        let kv = self.store.get(&meta_key(id)).ok()??;
+        let v: serde_json::Value = serde_json::from_slice(&kv.value).ok()?;
+        v.get("mem_mib").and_then(|x| x.as_u64())
     }
     fn require_cap(&self, idx: usize, cap: Capability) -> Result<(), String> {
         if self.backends[idx].capabilities().contains(cap) {
@@ -533,9 +555,15 @@ impl<'a> Orch<'a> {
     /// 未设配额 → 放行。project=None（无鉴权）→ 不检查。
     pub fn check_quota(&self, project: Option<&str>, add_vcpus: u32, add_mem_mib: u32) -> Result<(), String> {
         match project {
-            Some(p) => crate::quota::check(self.store.as_ref(), p, add_vcpus as u64, add_mem_mib as u64),
+            // create/fork 不占存储配额（存储在 pause 落快照 / build 出模板时计）→ add_storage=0。
+            Some(p) => crate::quota::check(self.store.as_ref(), p, add_vcpus as u64, add_mem_mib as u64, 0),
             None => Ok(()),
         }
+    }
+
+    /// M3 W10（ADR-16）：GC 过期的 paused 快照（保留期到期）。leader 周期调用（并入 reaper）。返回被回收 id。
+    pub fn gc_retention(&mut self, now: i64) -> Result<Vec<String>, String> {
+        crate::retention::gc_expired(self.store.as_ref(), now)
     }
 
     /// 读沙箱项目归属（None=无归属键）。供 dispatch 跨项目访问门控。

@@ -56,6 +56,8 @@ mod logsink;
 pub mod dataplane;
 // M3 W9（ADR-15 / M3-Q6）：快照信封加密——KMS 根密钥 → 租户 KEK → 每快照 DEK，4MiB 分块 AEAD。
 mod snapcrypt;
+// M3 W10（ADR-16 / M3-Q7）：快照保留期 GC + 版本钉住（模板/内核/VMM 三元组 + 兼容矩阵）。
+mod retention;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -304,9 +306,11 @@ struct Config {
     max_sandboxes: u64,
     max_vcpus: u64,
     max_mem: u64,
+    max_storage: u64,
     /// --quota-reconcile：M3-Q4 配额+审计对账——超限 QUOTA_EXCEEDED / 删后可再建 / 审计 append 可查。
     /// 默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
     quota_reconcile: bool,
+    retention_reconcile: bool,
     /// --log-sink <url>：M3 W8 结构化日志转发 sink（Loki/ES/自建收集器）。--serve 时 create/destroy
     /// 生命周期事件以 JSON POST 转发。未设=不转发（零回归）。
     log_sink: Option<String>,
@@ -580,6 +584,18 @@ pub fn cli_main() {
             Ok(()) => println!("[quota] M3-Q4 quota-reconcile PASS"),
             Err(e) => {
                 eprintln!("[quota] M3-Q4 quota-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --retention-reconcile：M3-Q7 保留期+版本钉住对账（过期 GC / 版本兼容矩阵 / 存储配额）。
+    if cfg.retention_reconcile {
+        match run_retention_reconcile(&cfg) {
+            Ok(()) => println!("[retention] M3-Q7 retention-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[retention] M3-Q7 retention-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2473,7 +2489,9 @@ fn clone_paths(cfg: &Config) -> Config {
         max_sandboxes: 0,
         max_vcpus: 0,
         max_mem: 0,
+        max_storage: 0,
         quota_reconcile: false,
+        retention_reconcile: false,
         log_sink: None,
 }
 }
@@ -2676,12 +2694,99 @@ fn run_quota_set(cfg: &Config) -> Result<(), String> {
     use crate::quota::{set_limits, Limits};
     let project = cfg.project.as_deref().ok_or("--quota-set 需 --project <项目>")?;
     let store = open_store_for(cfg)?;
-    let l = Limits { max_sandboxes: cfg.max_sandboxes, max_vcpus: cfg.max_vcpus, max_mem_mib: cfg.max_mem };
+    let l = Limits { max_sandboxes: cfg.max_sandboxes, max_vcpus: cfg.max_vcpus, max_mem_mib: cfg.max_mem, max_storage_mib: cfg.max_storage };
     set_limits(store.as_ref(), project, l)?;
     println!(
-        "项目 {project} 配额已设：max_sandboxes={} max_vcpus={} max_mem_mib={}（0=不限）",
-        l.max_sandboxes, l.max_vcpus, l.max_mem_mib
+        "项目 {project} 配额已设：max_sandboxes={} max_vcpus={} max_mem_mib={} max_storage_mib={}（0=不限）",
+        l.max_sandboxes, l.max_vcpus, l.max_mem_mib, l.max_storage_mib
     );
+    Ok(())
+}
+
+/// M3-Q7 保留期 + 版本钉住对账：过期 paused 快照 GC / 版本兼容矩阵（精确/N-1/不兼容）/ 存储配额，
+/// 后端无关同一套（SQLite 临时文件；--etcd 则真 etcd）。
+fn run_retention_reconcile(cfg: &Config) -> Result<(), String> {
+    use crate::quota::{check, set_limits, set_size, Limits, QUOTA_EXCEEDED};
+    use crate::retention::{check_compat, gc_expired, get_pin, set_pin, set_retention, Compat, Pin};
+    use sl_store::{SqliteStore, Store};
+
+    fn asserts(store: &dyn Store) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        for pfx in ["sandbox/", "quota/"] {
+            for kv in store.list(pfx).map_err(|e| e.to_string())? {
+                let _ = store.delete(&kv.key);
+            }
+        }
+        let now = 2_000_000i64;
+
+        // ① 版本钉往返 + 兼容矩阵（精确 / N-1 警告 / VMM 不符 / 内核越界）。
+        let pin = Pin { template_version: "t1".into(), kernel_version: "6.6.10".into(), vmm_version: "1.7.0".into() };
+        set_pin(store, "sb1", &pin, None).map_err(|e| e.to_string())?;
+        want!(get_pin(store, "sb1").map_err(|e| e.to_string())?.as_ref() == Some(&pin), "版本钉往返不符");
+        want!(check_compat(&pin, "6.6.10", "1.7.0", &[]) == Compat::Ok, "精确匹配应 Ok");
+        want!(check_compat(&pin, "6.6.11", "1.7.0", &["6.6.10".into()]) == Compat::OldKernelWarn, "N-1 应警告");
+        want!(matches!(check_compat(&pin, "6.6.10", "1.8.0", &[]), Compat::Incompatible(_)), "VMM 不符应拒");
+        want!(matches!(check_compat(&pin, "6.6.11", "1.7.0", &[]), Compat::Incompatible(_)), "内核越界应拒");
+
+        // ② 保留期 GC：过期 paused → 回收；未过期 paused / running 不碰。
+        store.put("sandbox/exp/meta", b"{}", None).map_err(|e| e.to_string())?;
+        store.put("sandbox/exp/state", b"paused", None).map_err(|e| e.to_string())?;
+        set_retention(store, "exp", now - 1, None).map_err(|e| e.to_string())?;
+        store.put("sandbox/keep/state", b"paused", None).map_err(|e| e.to_string())?;
+        set_retention(store, "keep", now + 3600, None).map_err(|e| e.to_string())?;
+        let gced = gc_expired(store, now).map_err(|e| e.to_string())?;
+        want!(gced == vec!["exp"], "应只 GC 过期的 exp");
+        want!(store.get("sandbox/exp/meta").map_err(|e| e.to_string())?.is_none(), "exp 应被 GC");
+        want!(store.get("sandbox/keep/state").map_err(|e| e.to_string())?.is_some(), "未过期 keep 应留");
+
+        // ③ 存储配额：记录 size + 超限 QUOTA_EXCEEDED。
+        set_limits(store, "projA", Limits { max_storage_mib: 1024, ..Default::default() }).map_err(|e| e.to_string())?;
+        store.put("sandbox/s1/meta", br#"{"vcpus":1,"mem_mib":128}"#, None).map_err(|e| e.to_string())?;
+        store.put("sandbox/s1/project", b"projA", None).map_err(|e| e.to_string())?;
+        set_size(store, "s1", 600, None).map_err(|e| e.to_string())?;
+        want!(check(store, "projA", 0, 0, 400).is_ok(), "1000<=1024 应放行");
+        want!(check(store, "projA", 0, 0, 500).unwrap_err().starts_with(QUOTA_EXCEEDED), "1100>1024 应超限");
+
+        for pfx in ["sandbox/", "quota/"] {
+            for kv in store.list(pfx).map_err(|e| e.to_string())? {
+                let _ = store.delete(&kv.key);
+            }
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let store = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(&store)?;
+            println!("[retention] EtcdStore({ep}) 保留期 GC + 版本兼容矩阵 + 存储配额 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--retention-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-retention-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let store = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(&store)
+    };
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(format!("{p}-wal"));
+    let _ = std::fs::remove_file(format!("{p}-shm"));
+    r?;
+    println!("[retention] SqliteStore(file) 保留期 GC + 版本兼容矩阵 + 存储配额 PASS");
     Ok(())
 }
 
@@ -2717,19 +2822,19 @@ fn run_quota_reconcile(cfg: &Config) -> Result<(), String> {
 
         // 配额 max_sandboxes=2。
         set_limits(store, "projA", Limits { max_sandboxes: 2, ..Default::default() }).map_err(|e| e.to_string())?;
-        want!(check(store, "projA", 1, 128).is_ok(), "空项目应可建");
+        want!(check(store, "projA", 1, 128, 0).is_ok(), "空项目应可建");
         put_sb("s1", "projA", 1, 128)?;
         put_sb("s2", "projA", 1, 128)?;
         // 已达上限：再建 → QUOTA_EXCEEDED。
-        let e = check(store, "projA", 1, 128).unwrap_err();
+        let e = check(store, "projA", 1, 128, 0).unwrap_err();
         want!(e.starts_with(QUOTA_EXCEEDED), "超限应 QUOTA_EXCEEDED");
         // 删一个 → 可再建（用量实时算）。
         for k in ["sandbox/s2/meta", "sandbox/s2/project"] {
             store.delete(k).map_err(|e| e.to_string())?;
         }
-        want!(check(store, "projA", 1, 128).is_ok(), "删后应可再建");
+        want!(check(store, "projA", 1, 128, 0).is_ok(), "删后应可再建");
         // 其它项目不受 projA 配额影响。
-        want!(check(store, "projB", 100, 100_000).is_ok(), "projB 未设配额应不限");
+        want!(check(store, "projB", 100, 100_000, 0).is_ok(), "projB 未设配额应不限");
 
         // 审计 append-only 可查。
         crate::audit::record(store, "projA", "create_sandbox", "s1", 201).map_err(|e| e.to_string())?;
@@ -3717,7 +3822,9 @@ fn parse_args() -> Config {
         max_sandboxes: 0,
         max_vcpus: 0,
         max_mem: 0,
+        max_storage: 0,
         quota_reconcile: false,
+        retention_reconcile: false,
         log_sink: None,
 };
     let mut args = std::env::args().skip(1);
@@ -3809,7 +3916,9 @@ fn parse_args() -> Config {
             "--max-sandboxes" => cfg.max_sandboxes = take().parse().unwrap_or(0),
             "--max-vcpus" => cfg.max_vcpus = take().parse().unwrap_or(0),
             "--max-mem" => cfg.max_mem = take().parse().unwrap_or(0),
+            "--max-storage" => cfg.max_storage = take().parse().unwrap_or(0),
             "--quota-reconcile" => cfg.quota_reconcile = true,
+            "--retention-reconcile" => cfg.retention_reconcile = true,
             "--log-sink" => cfg.log_sink = Some(take()),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),

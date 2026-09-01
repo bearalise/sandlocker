@@ -16,6 +16,14 @@ pub struct Limits {
     pub max_sandboxes: u64,
     pub max_vcpus: u64,
     pub max_mem_mib: u64,
+    /// 模板+快照存储量上限（MiB，0=不限；M3 W10，FR-7.2 存储配额）。
+    pub max_storage_mib: u64,
+}
+
+/// 记某沙箱的存储占用（MiB，挂沙箱租约 → 回收一并删）。pause 落快照 / build 出模板时调。
+pub fn set_size(store: &dyn Store, sid: &str, mib: u64, lease: Option<sl_store::LeaseId>) -> Result<(), String> {
+    store.put(&format!("sandbox/{sid}/size"), mib.to_string().as_bytes(), lease).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn quota_key(project: &str) -> String {
@@ -25,8 +33,8 @@ fn quota_key(project: &str) -> String {
 /// 设置项目限额。
 pub fn set_limits(store: &dyn Store, project: &str, l: Limits) -> Result<(), String> {
     let json = format!(
-        r#"{{"max_sandboxes":{},"max_vcpus":{},"max_mem_mib":{}}}"#,
-        l.max_sandboxes, l.max_vcpus, l.max_mem_mib
+        r#"{{"max_sandboxes":{},"max_vcpus":{},"max_mem_mib":{},"max_storage_mib":{}}}"#,
+        l.max_sandboxes, l.max_vcpus, l.max_mem_mib, l.max_storage_mib
     );
     store.put(&quota_key(project), json.as_bytes(), None).map_err(|e| e.to_string())?;
     Ok(())
@@ -41,12 +49,13 @@ pub fn get_limits(store: &dyn Store, project: &str) -> Result<Option<Limits>, St
             max_sandboxes: v.get("max_sandboxes").and_then(|x| x.as_u64()).unwrap_or(0),
             max_vcpus: v.get("max_vcpus").and_then(|x| x.as_u64()).unwrap_or(0),
             max_mem_mib: v.get("max_mem_mib").and_then(|x| x.as_u64()).unwrap_or(0),
+            max_storage_mib: v.get("max_storage_mib").and_then(|x| x.as_u64()).unwrap_or(0),
         })
     }))
 }
 
-/// 项目当前用量：`(并发沙箱数, vcpus 合计, mem_mib 合计)`。遍历该项目沙箱 meta 实时累加。
-pub fn usage(store: &dyn Store, project: &str) -> Result<(u64, u64, u64), String> {
+/// 项目当前用量：`(并发沙箱数, vcpus 合计, mem_mib 合计, storage_mib 合计)`。实时遍历累加。
+pub fn usage(store: &dyn Store, project: &str) -> Result<(u64, u64, u64, u64), String> {
     let kvs = store.list("sandbox/").map_err(|e| e.to_string())?;
     // id→project 映射。
     let mut proj = std::collections::HashMap::new();
@@ -55,31 +64,34 @@ pub fn usage(store: &dyn Store, project: &str) -> Result<(u64, u64, u64), String
             proj.insert(id.to_string(), String::from_utf8_lossy(&kv.value).into_owned());
         }
     }
-    let (mut count, mut vcpus, mut mem) = (0u64, 0u64, 0u64);
+    let in_project = |id: &str| proj.get(id).map(|p| p == project).unwrap_or(false);
+    let (mut count, mut vcpus, mut mem, mut storage) = (0u64, 0u64, 0u64, 0u64);
     for kv in &kvs {
-        let id = match kv.key.strip_prefix("sandbox/").and_then(|s| s.strip_suffix("/meta")) {
-            Some(id) => id,
-            None => continue,
-        };
-        if proj.get(id).map(|p| p == project).unwrap_or(false) {
-            count += 1;
-            if let Ok(v) = serde_json::from_slice::<Value>(&kv.value) {
-                vcpus += v.get("vcpus").and_then(|x| x.as_u64()).unwrap_or(0);
-                mem += v.get("mem_mib").and_then(|x| x.as_u64()).unwrap_or(0);
+        if let Some(id) = kv.key.strip_prefix("sandbox/").and_then(|s| s.strip_suffix("/meta")) {
+            if in_project(id) {
+                count += 1;
+                if let Ok(v) = serde_json::from_slice::<Value>(&kv.value) {
+                    vcpus += v.get("vcpus").and_then(|x| x.as_u64()).unwrap_or(0);
+                    mem += v.get("mem_mib").and_then(|x| x.as_u64()).unwrap_or(0);
+                }
+            }
+        } else if let Some(id) = kv.key.strip_prefix("sandbox/").and_then(|s| s.strip_suffix("/size")) {
+            if in_project(id) {
+                storage += String::from_utf8_lossy(&kv.value).parse::<u64>().unwrap_or(0);
             }
         }
     }
-    Ok((count, vcpus, mem))
+    Ok((count, vcpus, mem, storage))
 }
 
-/// create/fork 前置配额检查：投影（当前用量 + 本次 add）超任一已设限额即 `QUOTA_EXCEEDED`。
-/// 未设限额（None）→ 放行。
-pub fn check(store: &dyn Store, project: &str, add_vcpus: u64, add_mem: u64) -> Result<(), String> {
+/// create/fork/pause 前置配额检查：投影（当前用量 + 本次 add）超任一已设限额即 `QUOTA_EXCEEDED`。
+/// `add_storage` 用于 pause（落快照）/build（出模板）；create 传 0。未设限额（None）→ 放行。
+pub fn check(store: &dyn Store, project: &str, add_vcpus: u64, add_mem: u64, add_storage: u64) -> Result<(), String> {
     let lim = match get_limits(store, project)? {
         Some(l) => l,
         None => return Ok(()), // 未设配额 = 不限
     };
-    let (count, vcpus, mem) = usage(store, project)?;
+    let (count, vcpus, mem, storage) = usage(store, project)?;
     if lim.max_sandboxes > 0 && count + 1 > lim.max_sandboxes {
         return Err(format!("{QUOTA_EXCEEDED}: 项目 {project} 并发沙箱数超限（{}/{}）", count + 1, lim.max_sandboxes));
     }
@@ -88,6 +100,9 @@ pub fn check(store: &dyn Store, project: &str, add_vcpus: u64, add_mem: u64) -> 
     }
     if lim.max_mem_mib > 0 && mem + add_mem > lim.max_mem_mib {
         return Err(format!("{QUOTA_EXCEEDED}: 项目 {project} 内存超限（{}/{} MiB）", mem + add_mem, lim.max_mem_mib));
+    }
+    if lim.max_storage_mib > 0 && storage + add_storage > lim.max_storage_mib {
+        return Err(format!("{QUOTA_EXCEEDED}: 项目 {project} 存储超限（{}/{} MiB）", storage + add_storage, lim.max_storage_mib));
     }
     Ok(())
 }
@@ -108,34 +123,34 @@ mod tests {
     fn no_limit_allows_everything() {
         let s = SqliteStore::open_in_memory().unwrap();
         // 未设配额 → 放行。
-        assert!(check(&s, "projA", 100, 100_000).is_ok());
+        assert!(check(&s, "projA", 100, 100_000, 0).is_ok());
     }
 
     #[test]
     fn concurrent_and_cpu_and_mem_limits() {
         let s = SqliteStore::open_in_memory().unwrap();
-        set_limits(&s, "projA", Limits { max_sandboxes: 2, max_vcpus: 4, max_mem_mib: 1024 }).unwrap();
+        set_limits(&s, "projA", Limits { max_sandboxes: 2, max_vcpus: 4, max_mem_mib: 1024, max_storage_mib: 0 }).unwrap();
         // 空项目：可建（1<=2, 2<=4, 512<=1024）。
-        assert!(check(&s, "projA", 2, 512).is_ok());
+        assert!(check(&s, "projA", 2, 512, 0).is_ok());
         put_sandbox(&s, "s1", "projA", 2, 512);
         // 再建一个 2vcpu/512 → count 2<=2, vcpu 4<=4, mem 1024<=1024，放行（边界）。
-        assert!(check(&s, "projA", 2, 512).is_ok());
+        assert!(check(&s, "projA", 2, 512, 0).is_ok());
         put_sandbox(&s, "s2", "projA", 2, 512);
         // 第三个 → 并发数 3>2 超限。
-        let e = check(&s, "projA", 1, 128).unwrap_err();
+        let e = check(&s, "projA", 1, 128, 0).unwrap_err();
         assert!(e.starts_with(QUOTA_EXCEEDED) && e.contains("并发"), "应并发超限: {e}");
     }
 
     #[test]
     fn cpu_limit_independent_of_count() {
         let s = SqliteStore::open_in_memory().unwrap();
-        set_limits(&s, "projA", Limits { max_sandboxes: 0, max_vcpus: 4, max_mem_mib: 0 }).unwrap();
+        set_limits(&s, "projA", Limits { max_sandboxes: 0, max_vcpus: 4, max_mem_mib: 0, max_storage_mib: 0 }).unwrap();
         put_sandbox(&s, "s1", "projA", 3, 256);
         // 再加 2 vcpu → 5>4 超限（并发/内存不限）。
-        let e = check(&s, "projA", 2, 999_999).unwrap_err();
+        let e = check(&s, "projA", 2, 999_999, 0).unwrap_err();
         assert!(e.contains("vCPU"), "应 vCPU 超限: {e}");
         // 加 1 vcpu → 4<=4 放行。
-        assert!(check(&s, "projA", 1, 0).is_ok());
+        assert!(check(&s, "projA", 1, 0, 0).is_ok());
     }
 
     #[test]
@@ -144,7 +159,20 @@ mod tests {
         set_limits(&s, "projA", Limits { max_sandboxes: 1, ..Default::default() }).unwrap();
         put_sandbox(&s, "s1", "projA", 1, 128);
         // projA 满，但 projB 无配额 → 不受影响。
-        assert!(check(&s, "projA", 1, 0).is_err());
-        assert!(check(&s, "projB", 1, 0).is_ok());
+        assert!(check(&s, "projA", 1, 0, 0).is_err());
+        assert!(check(&s, "projB", 1, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn storage_limit_counts_recorded_sizes() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        set_limits(&s, "projA", Limits { max_storage_mib: 1024, ..Default::default() }).unwrap();
+        put_sandbox(&s, "s1", "projA", 1, 128);
+        set_size(&s, "s1", 600, None).unwrap(); // 已用 600 MiB 存储
+        // 再落 400 → 1000<=1024 放行（边界内）。
+        assert!(check(&s, "projA", 0, 0, 400).is_ok());
+        // 再落 500 → 1100>1024 超限。
+        let e = check(&s, "projA", 0, 0, 500).unwrap_err();
+        assert!(e.starts_with(QUOTA_EXCEEDED) && e.contains("存储"), "应存储超限: {e}");
     }
 }
