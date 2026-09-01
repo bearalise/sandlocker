@@ -273,6 +273,16 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                     println!("[sandlocker] 回收失联节点的孤儿沙箱: {orphans:?}");
                 }
             }
+            // M3 W10（ADR-16）：GC 过期的 paused 快照（保留期到期，默认 7 天）。
+            if let Ok(expired) = o.gc_retention(now) {
+                if !expired.is_empty() {
+                    for id in &expired {
+                        drop_exposes(&reaper_ex, id);
+                        crate::metrics::metrics().record_destroy();
+                    }
+                    println!("[sandlocker] 保留期过期回收 paused 快照: {expired:?}");
+                }
+            }
         }
     });
 

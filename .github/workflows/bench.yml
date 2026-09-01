@@ -758,3 +758,5 @@ jobs:
         run: ./target/debug/sl-node --auth-reconcile --etcd http://127.0.0.1:2379
       - name: M3-Q4 配额+审计对账（超限 QUOTA_EXCEEDED / 删后可建 / 项目隔离 / 审计 append，真 etcd）
         run: ./target/debug/sl-node --quota-reconcile --etcd http://127.0.0.1:2379
+      - name: M3-Q7 保留期+版本钉住对账（过期 GC / 版本兼容矩阵 / 存储配额，真 etcd）
+        run: ./target/debug/sl-node --retention-reconcile --etcd http://127.0.0.1:2379
