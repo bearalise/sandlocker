@@ -26,6 +26,12 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **SDK API-Key auth + typed errors (TS 0.5.0 / Python 0.2.0)** — both SDKs now send an API key as
+  `Authorization: Bearer <key>` on every request, so they work against a multi-tenant daemon
+  (`--serve --require-auth`). Pass it via the client constructor / factory (`apiKey` / `api_key`) or
+  the `SANDLOCKER_API_KEY` env var. HTTP 401/403/429 map to typed errors (`Unauthorized` / `Forbidden`
+  / `QuotaExceeded`, all `ApiError` subclasses), and a new `audit()` method reads `GET /v1/audit`
+  (project-filtered). openapi.yaml, `ROUTES`, and the contract tests are kept in sync.
 - **Snapshot envelope encryption (ADR-15, M3-Q6, W9)** — paused snapshots are now sealed at rest
   under a three-level envelope: a KMS root key wraps a per-project **tenant KEK**, which wraps a
   fresh **per-snapshot DEK**, which encrypts `vmstate` and `mem` as AES-256-GCM in **4 MiB chunks**.

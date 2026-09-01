@@ -44,6 +44,19 @@ with Sandbox.create(template="hello", timeout=300) as sbx:   # timeout → ttl�
 地址默认 `127.0.0.1:7878`，可用 `Sandbox.create(..., addr="host:port")` 或环境变量
 `SANDLOCKER_ADDR`（示例脚本读它）覆盖。
 
+### 鉴权（多租户守护，M3 W6）
+
+守护带 `--require-auth` 时，需传 API Key——经 `api_key=` 参数或环境变量 `SANDLOCKER_API_KEY`，
+每请求以 `Authorization: Bearer <key>` 发送：
+
+```python
+sbx = Sandbox.create("hello", api_key="<key>")          # 或设 SANDLOCKER_API_KEY 环境变量
+# 或：Client(addr="127.0.0.1:7878", api_key="<key>")
+```
+
+`401`/`403`/`429` 映射为 `Unauthorized`/`Forbidden`/`QuotaExceeded`（均 `ApiError` 子类）；
+`Client.audit()` 读按项目过滤的审计日志。
+
 ## API 速览
 
 | 调用 | 说明 | REST 端点 |

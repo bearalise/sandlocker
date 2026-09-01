@@ -156,6 +156,7 @@ test("contract alignment: ROUTES == openapi M1 集合", () => {
     "DELETE /v1/sandboxes/{id}/expose/{guest_port}",
     "GET /v1/templates",
     "GET /v1/backends",
+    "GET /v1/audit",
     // 注：POST /v1/templates:build M1 恒 501，SDK 不封装，故不入集。
   ]);
   assert.deepEqual(new Set(ROUTES), expected);
@@ -351,4 +352,71 @@ test("连接失败 → ConnectionError", async () => {
     assert.equal((e as Error).name, "ConnectionError");
     return true;
   });
+});
+
+// ── M3 W6/W7 鉴权 + 类型化错误 ─────────────────────────────────────────────
+import { Unauthorized, Forbidden, QuotaExceeded } from "../src/index.js";
+
+// 小工具：起一个只回固定状态并记录 Authorization 头的服务器。
+function startProbe(status: number, obj: unknown): Promise<{ addr: string; close: () => Promise<void>; lastAuth: () => string | undefined }> {
+  let lastAuth: string | undefined;
+  const server = http.createServer((req, res) => {
+    lastAuth = req.headers["authorization"] as string | undefined;
+    req.on("data", () => {});
+    req.on("end", () => {
+      const body = Buffer.from(JSON.stringify(obj), "utf8");
+      res.writeHead(status, { "Content-Type": "application/json", "Content-Length": String(body.length), Connection: "close" });
+      res.end(body);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const p = (server.address() as AddressInfo).port;
+      resolve({
+        addr: `127.0.0.1:${p}`,
+        close: () => new Promise((r) => server.close(() => r())),
+        lastAuth: () => lastAuth,
+      });
+    });
+  });
+}
+
+test("apiKey → Authorization: Bearer 头注入", async () => {
+  const d = await startProbe(200, []);
+  try {
+    const c = new Client(d.addr, 120000, "tok-abc");
+    await c.listSandboxes();
+    assert.equal(d.lastAuth(), "Bearer tok-abc");
+  } finally {
+    await d.close();
+  }
+});
+
+test("无 apiKey → 不带 Authorization 头", async () => {
+  const d = await startProbe(200, []);
+  try {
+    const c = new Client(d.addr); // 无 key、无环境变量
+    delete process.env.SANDLOCKER_API_KEY;
+    await c.listSandboxes();
+    assert.equal(d.lastAuth(), undefined);
+  } finally {
+    await d.close();
+  }
+});
+
+test("401/403/429 → Unauthorized/Forbidden/QuotaExceeded（均 ApiError 子类）", async () => {
+  for (const [status, ctor] of [[401, Unauthorized], [403, Forbidden], [429, QuotaExceeded]] as const) {
+    const d = await startProbe(status, { error: "x" });
+    try {
+      const c = new Client(d.addr, 120000, "k");
+      await assert.rejects(c.listSandboxes(), (e: unknown) => {
+        assert.ok(e instanceof ctor, `${status} 应为 ${ctor.name}`);
+        assert.ok(e instanceof ApiError);
+        assert.equal((e as ApiError).status, status);
+        return true;
+      });
+    } finally {
+      await d.close();
+    }
+  }
 });

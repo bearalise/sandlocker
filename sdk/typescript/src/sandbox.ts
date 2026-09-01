@@ -39,6 +39,8 @@ export interface CreateOptions {
   network?: "none" | "egress";
   addr?: string;
   client?: Client;
+  /** M3 W6 多租户 API Key（`Authorization: Bearer`）；缺省取环境变量 `SANDLOCKER_API_KEY`。 */
+  apiKey?: string;
 }
 
 export interface RunOptions {
@@ -62,7 +64,7 @@ export class Sandbox {
   }
 
   static async create(template: string, opts: CreateOptions = {}): Promise<Sandbox> {
-    const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR);
+    const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR, undefined, opts.apiKey);
     const body: Record<string, unknown> = { template, ttl: Math.trunc(opts.timeout ?? 300) };
     if (opts.idle != null) body.idle = Math.trunc(opts.idle);
     if (opts.cpu != null) body.cpu = Math.trunc(opts.cpu);
@@ -75,8 +77,8 @@ export class Sandbox {
     return new Sandbox(id, c, resp);
   }
 
-  static async list(opts: { addr?: string; client?: Client } = {}): Promise<SandboxInfo[]> {
-    const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR);
+  static async list(opts: { addr?: string; client?: Client; apiKey?: string } = {}): Promise<SandboxInfo[]> {
+    const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR, undefined, opts.apiKey);
     return (await c.listSandboxes()).map((d) => SandboxInfo.fromJson(d));
   }
 
@@ -90,16 +92,16 @@ export class Sandbox {
    */
   static async connect(
     id: string,
-    opts: { addr?: string; client?: Client; verify?: boolean } = {},
+    opts: { addr?: string; client?: Client; verify?: boolean; apiKey?: string } = {},
   ): Promise<Sandbox> {
-    const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR);
+    const c = opts.client ?? new Client(opts.addr ?? DEFAULT_ADDR, undefined, opts.apiKey);
     if (opts.verify === false) return new Sandbox(id, c);
     const meta = await c.getSandbox(id);
     return new Sandbox(id, c, meta);
   }
 
   /** `connect` 的校验式别名（总是往返一次拉取元数据）。 */
-  static async get(id: string, opts: { addr?: string; client?: Client } = {}): Promise<Sandbox> {
+  static async get(id: string, opts: { addr?: string; client?: Client; apiKey?: string } = {}): Promise<Sandbox> {
     return Sandbox.connect(id, { ...opts, verify: true });
   }
 

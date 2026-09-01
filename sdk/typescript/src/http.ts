@@ -24,6 +24,8 @@ export interface RequestOptions {
   contentType?: string;
   addr?: string;
   timeoutMs?: number;
+  /** M3 W6 多租户鉴权：非空则加 `Authorization: Bearer <apiKey>` 头。 */
+  apiKey?: string;
 }
 
 export interface RequestLinesOptions extends RequestOptions {
@@ -41,6 +43,7 @@ export function requestLines(method: string, path: string, opts: RequestLinesOpt
   const { host, port } = splitAddr(addr);
   const headers: Record<string, string> = { Connection: "close" };
   if (opts.contentType) headers["Content-Type"] = opts.contentType;
+  if (opts.apiKey) headers["Authorization"] = `Bearer ${opts.apiKey}`;
   const body = opts.body;
   if (body) headers["Content-Length"] = String(body.length);
   const timeoutMs = opts.timeoutMs ?? 120000;
@@ -79,6 +82,7 @@ export function request(method: string, path: string, opts: RequestOptions = {})
   const { host, port } = splitAddr(addr);
   const headers: Record<string, string> = { Connection: "close" };
   if (opts.contentType) headers["Content-Type"] = opts.contentType;
+  if (opts.apiKey) headers["Authorization"] = `Bearer ${opts.apiKey}`;
   const body = opts.body;
   if (body) headers["Content-Length"] = String(body.length);
   const timeoutMs = opts.timeoutMs ?? 120000;

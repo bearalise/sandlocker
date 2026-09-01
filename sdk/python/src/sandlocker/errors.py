@@ -28,3 +28,15 @@ class ApiError(SandLockerError):
 
 class NotFound(ApiError):
     """沙箱 / 资源不存在（HTTP 404）。"""
+
+
+class Unauthorized(ApiError):
+    """缺 / 错 API Key（HTTP 401，M3 W6 多租户鉴权）。"""
+
+
+class Forbidden(ApiError):
+    """作用域不足 / 跨项目访问（HTTP 403，M3 W6）。"""
+
+
+class QuotaExceeded(ApiError):
+    """项目配额超限（HTTP 429，M3 W7/W10）。"""
