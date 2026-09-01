@@ -2,7 +2,10 @@
 //   SandLockerError            —— SDK 错误基类（catch-all）
 //   ├── ConnectionError        —— 守护不可达 / 地址错
 //   └── ApiError               —— 非预期 HTTP 状态（带 .status/.detail）
-//       └── NotFound           —— HTTP 404
+//       ├── NotFound           —— HTTP 404
+//       ├── Unauthorized       —— HTTP 401（缺/错 API Key，M3 W6）
+//       ├── Forbidden          —— HTTP 403（作用域不足 / 跨项目，M3 W6）
+//       └── QuotaExceeded      —— HTTP 429（项目配额超限，M3 W7/W10）
 
 export class SandLockerError extends Error {
   constructor(message: string) {
@@ -35,5 +38,26 @@ export class NotFound extends ApiError {
   constructor(status: number, detail: string) {
     super(status, detail);
     this.name = "NotFound";
+  }
+}
+
+export class Unauthorized extends ApiError {
+  constructor(status: number, detail: string) {
+    super(status, detail);
+    this.name = "Unauthorized";
+  }
+}
+
+export class Forbidden extends ApiError {
+  constructor(status: number, detail: string) {
+    super(status, detail);
+    this.name = "Forbidden";
+  }
+}
+
+export class QuotaExceeded extends ApiError {
+  constructor(status: number, detail: string) {
+    super(status, detail);
+    this.name = "QuotaExceeded";
   }
 }

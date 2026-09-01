@@ -425,6 +425,22 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Backend'
+  /v1/audit:
+    get:
+      summary: 审计日志（M3 W7，FR-7.3）
+      description: >
+        append-only 审计条目（变更操作 + 状态码）。鉴权模式（--require-auth）下按调用者项目过滤；
+        每条形如 {ts, actor, action, target, code}。
+      operationId: listAudit
+      responses:
+        '200':
+          description: 审计条目数组
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
 
 components:
   parameters:

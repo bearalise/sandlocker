@@ -62,6 +62,7 @@ class Sandbox:
         network=None,
         addr=DEFAULT_ADDR,
         client=None,
+        api_key=None,
     ):
         # type: (...) -> "Sandbox"
         """创建并启动沙箱（走快照恢复，~秒级）。
@@ -74,7 +75,7 @@ class Sandbox:
         network : "none"（默认）| "egress"。egress = 冷启动带 NIC 可出站（npm/pip install，
                   开放出口）；仅 FC 后端 + 守护 root，且走冷启动（比恢复慢）、不进池。
         """
-        c = client or Client(addr=addr)
+        c = client or Client(addr=addr, api_key=api_key)
         body = {"template": template, "ttl": int(timeout)}
         if idle is not None:
             body["idle"] = int(idle)
@@ -94,13 +95,13 @@ class Sandbox:
         return cls(sid, c, meta=resp)
 
     @classmethod
-    def list(cls, addr=DEFAULT_ADDR, client=None):
+    def list(cls, addr=DEFAULT_ADDR, client=None, api_key=None):
         # type: (...) -> List[SandboxInfo]
-        c = client or Client(addr=addr)
+        c = client or Client(addr=addr, api_key=api_key)
         return [SandboxInfo.from_json(d) for d in c.list_sandboxes()]
 
     @classmethod
-    def connect(cls, sid, addr=DEFAULT_ADDR, client=None, verify=True):
+    def connect(cls, sid, addr=DEFAULT_ADDR, client=None, verify=True, api_key=None):
         # type: (str, str, Optional[Client], bool) -> "Sandbox"
         """附着（attach）到已存在的沙箱以便后续操作（run/keep_alive/logs/files/...）。
 
@@ -110,17 +111,17 @@ class Sandbox:
                             （不存在 → NotFound）。
         verify=False       ：惰性绑定，**不打任何网络**，立即返回句柄，错误延迟到首个真实操作。
         """
-        c = client or Client(addr=addr)
+        c = client or Client(addr=addr, api_key=api_key)
         if not verify:
             return cls(sid, c)
         meta = c.get_sandbox(sid)
         return cls(sid, c, meta=meta)
 
     @classmethod
-    def get(cls, sid, addr=DEFAULT_ADDR, client=None):
+    def get(cls, sid, addr=DEFAULT_ADDR, client=None, api_key=None):
         # type: (...) -> "Sandbox"
         """connect 的校验式别名（总是往返一次拉取元数据）。"""
-        return cls.connect(sid, addr=addr, client=client, verify=True)
+        return cls.connect(sid, addr=addr, client=client, verify=True, api_key=api_key)
 
     # --- 操作 ---
     def run(self, cmd, on_stdout=None, on_stderr=None):

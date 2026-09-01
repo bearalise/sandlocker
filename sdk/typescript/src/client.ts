@@ -1,7 +1,7 @@
 // 低层 REST 客户端（对标 sdk/python/src/sandlocker/client.py）：一方法一 OpenAPI 路由。
 // 无共享可变状态、每调用新连接 → 天然并发安全。
 import { request, requestLines, DEFAULT_ADDR } from "./http.js";
-import { ApiError, NotFound } from "./errors.js";
+import { ApiError, NotFound, Unauthorized, Forbidden, QuotaExceeded } from "./errors.js";
 
 // 契约漂移防线（替代 codegen，对标 Python client.ROUTES）：改 openapi 或路由时，
 // contracts/openapi.yaml ↔ 此 ROUTES ↔ test 的 expected 三处必须同步，否则单测红。
@@ -26,9 +26,26 @@ export const ROUTES: ReadonlySet<string> = new Set<string>([
   "DELETE /v1/sandboxes/{id}/expose/{guest_port}",
   "GET /v1/templates",
   "GET /v1/backends",
+  "GET /v1/audit",
 ]);
 
-/** 非预期状态 → 异常（仅 404 特化为 NotFound；错误体形如 {"error":"..."}）。 */
+/** 状态码 → 特化异常构造（404/401/403/429，其余通用 ApiError）。 */
+function errorFor(status: number, detail: string): ApiError {
+  switch (status) {
+    case 404:
+      return new NotFound(status, detail);
+    case 401:
+      return new Unauthorized(status, detail);
+    case 403:
+      return new Forbidden(status, detail);
+    case 429:
+      return new QuotaExceeded(status, detail);
+    default:
+      return new ApiError(status, detail);
+  }
+}
+
+/** 非预期状态 → 异常（错误体形如 {"error":"..."}）。 */
 function decodeError(status: number, body: Buffer): ApiError {
   let detail: string;
   try {
@@ -37,22 +54,24 @@ function decodeError(status: number, body: Buffer): ApiError {
   } catch {
     detail = body.toString("utf8");
   }
-  return status === 404 ? new NotFound(status, detail) : new ApiError(status, detail);
+  return errorFor(status, detail);
 }
 
-/** 已拿到错误文本（如流式端点的 {"error":..} 行）时构造异常（404 特化 NotFound）。 */
+/** 已拿到错误文本（如流式端点的 {"error":..} 行）时构造异常。 */
 function decodeErrorDetail(status: number, detail: string): ApiError {
-  const d = detail || `HTTP ${status}`;
-  return status === 404 ? new NotFound(status, d) : new ApiError(status, d);
+  return errorFor(status, detail || `HTTP ${status}`);
 }
 
 export class Client {
   readonly addr: string;
   readonly timeoutMs: number;
+  /** M3 W6 多租户 API Key（`Authorization: Bearer`）。缺省取环境变量 `SANDLOCKER_API_KEY`；空=不鉴权。 */
+  readonly apiKey?: string;
 
-  constructor(addr: string = DEFAULT_ADDR, timeoutMs = 120000) {
+  constructor(addr: string = DEFAULT_ADDR, timeoutMs = 120000, apiKey?: string) {
     this.addr = addr;
     this.timeoutMs = timeoutMs;
+    this.apiKey = apiKey ?? process.env.SANDLOCKER_API_KEY ?? undefined;
   }
 
   /** JSON in/out；空体返回 null；状态不在 expect → decodeError。 */
@@ -63,7 +82,7 @@ export class Client {
       body = Buffer.from(JSON.stringify(bodyObj), "utf8");
       contentType = "application/json";
     }
-    const resp = await request(method, path, { body, contentType, addr: this.addr, timeoutMs: this.timeoutMs });
+    const resp = await request(method, path, { body, contentType, addr: this.addr, timeoutMs: this.timeoutMs, apiKey: this.apiKey });
     if (!expect.includes(resp.status)) throw decodeError(resp.status, resp.body);
     if (resp.body.length === 0) return null;
     return JSON.parse(resp.body.toString("utf8"));
@@ -125,6 +144,10 @@ export class Client {
   async listBackends(): Promise<any[]> {
     return (await this.json("GET", "/v1/backends")) ?? [];
   }
+  /** M3 W7：审计日志（鉴权模式下按调用者项目过滤；append-only）。 */
+  async audit(): Promise<any[]> {
+    return (await this.json("GET", "/v1/audit")) ?? [];
+  }
   async exec(id: string, cmd: string): Promise<any> {
     return this.json("POST", `/v1/sandboxes/${id}/exec`, { cmd });
   }
@@ -168,7 +191,7 @@ export class Client {
       body,
       contentType: "application/json",
       addr: this.addr,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: this.timeoutMs, apiKey: this.apiKey,
       onLine,
     });
     if (status !== 200) {
@@ -181,20 +204,20 @@ export class Client {
       body: data,
       contentType: "application/octet-stream",
       addr: this.addr,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: this.timeoutMs, apiKey: this.apiKey,
     });
     if (resp.status !== 204 && resp.status !== 200) throw decodeError(resp.status, resp.body);
   }
   async getFile(id: string, path: string): Promise<Buffer> {
     const resp = await request("GET", `/v1/sandboxes/${id}/files/${Client.cleanPath(path)}`, {
       addr: this.addr,
-      timeoutMs: this.timeoutMs,
+      timeoutMs: this.timeoutMs, apiKey: this.apiKey,
     });
     if (resp.status !== 200) throw decodeError(resp.status, resp.body);
     return resp.body;
   }
   async logs(id: string): Promise<string> {
-    const resp = await request("GET", `/v1/sandboxes/${id}/logs`, { addr: this.addr, timeoutMs: this.timeoutMs });
+    const resp = await request("GET", `/v1/sandboxes/${id}/logs`, { addr: this.addr, timeoutMs: this.timeoutMs, apiKey: this.apiKey });
     if (resp.status !== 200) throw decodeError(resp.status, resp.body);
     return resp.body.toString("utf8");
   }

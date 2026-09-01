@@ -376,10 +376,84 @@ class SdkTest(unittest.TestCase):
                 ("DELETE", "/v1/sandboxes/{id}/expose/{guest_port}"),  # unexposePort
                 ("GET", "/v1/templates"),                     # listTemplates
                 ("GET", "/v1/backends"),                      # listBackends (M2 W6)
+                ("GET", "/v1/audit"),                         # listAudit (M3 W7)
                 # 注：POST /v1/templates:build 在 M1 恒返 501，SDK 不封装，故不在此集合。
             }
         )
         self.assertEqual(ROUTES, expected)
+
+
+class _ProbeHandler(BaseHTTPRequestHandler):
+    status = 200
+    captured = {}
+
+    def _reply(self):
+        _ProbeHandler.captured["auth"] = self.headers.get("Authorization")
+        body = b'{"error":"x"}' if _ProbeHandler.status >= 400 else b"[]"
+        self.send_response(_ProbeHandler.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._reply()
+
+    def log_message(self, *a):
+        pass
+
+
+class _Probe:
+    def __init__(self, status):
+        _ProbeHandler.status = status
+        _ProbeHandler.captured = {}
+        self.httpd = HTTPServer(("127.0.0.1", 0), _ProbeHandler)
+        self.addr = "127.0.0.1:{}".format(self.httpd.server_address[1])
+
+    def __enter__(self):
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *a):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class AuthTest(unittest.TestCase):
+    def test_api_key_header_injected(self):
+        from sandlocker import Client
+
+        with _Probe(200) as p:
+            Client(addr=p.addr, api_key="tok-abc").list_sandboxes()
+            self.assertEqual(_ProbeHandler.captured.get("auth"), "Bearer tok-abc")
+
+    def test_no_api_key_no_header(self):
+        from sandlocker import Client
+
+        os.environ.pop("SANDLOCKER_API_KEY", None)
+        with _Probe(200) as p:
+            Client(addr=p.addr).list_sandboxes()
+            self.assertIsNone(_ProbeHandler.captured.get("auth"))
+
+    def test_env_api_key(self):
+        from sandlocker import Client
+
+        os.environ["SANDLOCKER_API_KEY"] = "env-key"
+        try:
+            with _Probe(200) as p:
+                Client(addr=p.addr).list_sandboxes()
+                self.assertEqual(_ProbeHandler.captured.get("auth"), "Bearer env-key")
+        finally:
+            os.environ.pop("SANDLOCKER_API_KEY", None)
+
+    def test_typed_errors(self):
+        from sandlocker import Client, Forbidden, QuotaExceeded, Unauthorized
+
+        for status, exc in ((401, Unauthorized), (403, Forbidden), (429, QuotaExceeded)):
+            with _Probe(status) as p:
+                with self.assertRaises(exc):
+                    Client(addr=p.addr, api_key="k").list_sandboxes()
 
 
 if __name__ == "__main__":

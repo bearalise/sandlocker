@@ -41,6 +41,19 @@ const lazy = await Sandbox.connect("sbx-123", { verify: false });
 `Sandbox.create` / `list` / `connect` / `get` accept `{ addr }` (default `127.0.0.1:7878`, requires the
 `sandlocker up` daemon to be running), or you can share a `Client`.
 
+### Auth (multi-tenant daemon, M3 W6)
+
+Against a daemon started with `--require-auth`, pass an API key — via the factory/`Client` option or the
+`SANDLOCKER_API_KEY` env var. It is sent as `Authorization: Bearer <key>` on every request.
+
+```ts
+const sbx = await Sandbox.create("hello", { apiKey: process.env.SANDLOCKER_API_KEY });
+// or: new Client("127.0.0.1:7878", 120000, "<key>")
+```
+
+`401` / `403` / `429` map to `Unauthorized` / `Forbidden` / `QuotaExceeded` (all `ApiError` subclasses).
+`client.audit()` reads the project-filtered audit log.
+
 ---
 
 ## High-level API — `Sandbox`

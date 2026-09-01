@@ -29,17 +29,21 @@ def request(
     content_type=None,
     addr=DEFAULT_ADDR,
     timeout=120.0,
+    api_key=None,
 ):
-    # type: (str, str, Optional[bytes], Optional[str], str, float) -> Tuple[int, bytes]
+    # type: (str, str, Optional[bytes], Optional[str], str, float, Optional[str]) -> Tuple[int, bytes]
     """发一个请求，返回 ``(status_code, body_bytes)``。
 
     body 传 bytes（调用方负责编码）；content_type 为空时不带该头。
+    api_key 非空则加 ``Authorization: Bearer`` 头（M3 W6 多租户鉴权）。
     连接失败抛 ConnectionError（守护没起 / 地址错）。
     """
     host, port = _split_addr(addr)
     headers = {}
     if content_type is not None:
         headers["Content-Type"] = content_type
+    if api_key:
+        headers["Authorization"] = "Bearer {}".format(api_key)
     # http.client 会按 body 长度自动补 Content-Length。
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
@@ -63,8 +67,9 @@ def request_lines(
     addr=DEFAULT_ADDR,
     timeout=120.0,
     on_line=None,
+    api_key=None,
 ):
-    # type: (str, str, Optional[bytes], Optional[str], str, float, Optional[callable]) -> int
+    # type: (str, str, Optional[bytes], Optional[str], str, float, Optional[callable], Optional[str]) -> int
     """发一个请求，**增量**按行读响应体（NDJSON 流式 exec 用），每整行回调 ``on_line(line_str)``。
 
     守护以 ``Connection: close`` + 无 Content-Length 推流；``HTTPResponse.readline()`` 到 EOF
@@ -75,6 +80,8 @@ def request_lines(
     headers = {}
     if content_type is not None:
         headers["Content-Type"] = content_type
+    if api_key:
+        headers["Authorization"] = "Bearer {}".format(api_key)
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         conn.request(method, path, body=body, headers=headers)

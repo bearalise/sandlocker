@@ -16,13 +16,16 @@ from .client import Client
 from .errors import (
     ApiError,
     ConnectionError,
+    Forbidden,
     NotFound,
+    QuotaExceeded,
     SandLockerError,
+    Unauthorized,
 )
 from .models import ExecResult, SandboxInfo, Template
 from .sandbox import FilesProxy, Sandbox
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Sandbox",
@@ -34,6 +37,9 @@ __all__ = [
     "SandLockerError",
     "ApiError",
     "NotFound",
+    "Unauthorized",
+    "Forbidden",
+    "QuotaExceeded",
     "ConnectionError",
     "__version__",
 ]

@@ -13,7 +13,9 @@ import json
 from typing import Any, Dict, List, Optional
 
 from . import _http
-from .errors import ApiError, NotFound
+import os
+
+from .errors import ApiError, Forbidden, NotFound, QuotaExceeded, Unauthorized
 
 # openapi.yaml 声明、且 M1 已实现的端点全集（method, path_template）。
 # 改动此表时，务必同步 contracts/openapi.yaml 与 tests/test_sdk.py 的期望集合。
@@ -39,8 +41,22 @@ ROUTES = frozenset(
         ("DELETE", "/v1/sandboxes/{id}/expose/{guest_port}"),
         ("GET", "/v1/templates"),
         ("GET", "/v1/backends"),
+        ("GET", "/v1/audit"),
     }
 )
+
+
+def _error_for(status, msg):
+    """状态码 → 特化异常（404/401/403/429，其余通用 ApiError）。"""
+    if status == 404:
+        return NotFound(status, msg)
+    if status == 401:
+        return Unauthorized(status, msg)
+    if status == 403:
+        return Forbidden(status, msg)
+    if status == 429:
+        return QuotaExceeded(status, msg)
+    return ApiError(status, msg)
 
 
 def _decode_error(status, body):
@@ -50,17 +66,17 @@ def _decode_error(status, body):
         msg = json.loads(body.decode("utf-8")).get("error", "")
     except (ValueError, UnicodeDecodeError):
         msg = body.decode("utf-8", "replace")
-    if status == 404:
-        return NotFound(status, msg)
-    return ApiError(status, msg)
+    return _error_for(status, msg)
 
 
 class Client:
     """薄 REST 客户端。线程安全（无共享可变状态，每次调用新建连接）。"""
 
-    def __init__(self, addr=_http.DEFAULT_ADDR, timeout=120.0):
+    def __init__(self, addr=_http.DEFAULT_ADDR, timeout=120.0, api_key=None):
         self.addr = addr
         self.timeout = timeout
+        # M3 W6 多租户 API Key（Authorization: Bearer）。缺省取环境变量 SANDLOCKER_API_KEY。
+        self.api_key = api_key if api_key is not None else os.environ.get("SANDLOCKER_API_KEY")
 
     # --- 内部 helper ---
     def _json(self, method, path, body_obj=None, expect=(200,)):
@@ -71,7 +87,7 @@ class Client:
             ctype = "application/json"
         status, data = _http.request(
             method, path, body=body, content_type=ctype,
-            addr=self.addr, timeout=self.timeout,
+            addr=self.addr, timeout=self.timeout, api_key=self.api_key,
         )
         if status not in expect:
             raise _decode_error(status, data)
@@ -101,7 +117,7 @@ class Client:
         # type: (str) -> None
         status, data = _http.request(
             "DELETE", "/v1/sandboxes/{}".format(sid),
-            addr=self.addr, timeout=self.timeout,
+            addr=self.addr, timeout=self.timeout, api_key=self.api_key,
         )
         if status not in (204, 200):
             raise _decode_error(status, data)
@@ -169,6 +185,11 @@ class Client:
         # type: () -> List[Dict[str, Any]]
         return self._json("GET", "/v1/backends") or []
 
+    # --- 审计日志（M3 W7，FR-7.3；鉴权模式按调用者项目过滤，append-only） ---
+    def audit(self):
+        # type: () -> List[Dict[str, Any]]
+        return self._json("GET", "/v1/audit") or []
+
     # --- exec（POST /v1/sandboxes/{id}/exec） ---
     def exec(self, sid, cmd):
         # type: (str, str) -> Dict[str, Any]
@@ -211,14 +232,12 @@ class Client:
             "POST", "/v1/sandboxes/{}/exec/stream".format(sid),
             body=json.dumps({"cmd": cmd}).encode("utf-8"),
             content_type="application/json",
-            addr=self.addr, timeout=self.timeout,
+            addr=self.addr, timeout=self.timeout, api_key=self.api_key,
             on_line=_on_line,
         )
         if status != 200:
             detail = agg["error"] or "HTTP {}".format(status)
-            if status == 404:
-                raise NotFound(status, detail)
-            raise ApiError(status, detail)
+            raise _error_for(status, detail)
         return {
             "exit_code": agg["exit_code"],
             "stdout": "".join(agg["stdout"]),
@@ -231,7 +250,7 @@ class Client:
         p = "/v1/sandboxes/{}/files/{}".format(sid, self._clean_path(path))
         status, resp = _http.request(
             "PUT", p, body=data, content_type="application/octet-stream",
-            addr=self.addr, timeout=self.timeout,
+            addr=self.addr, timeout=self.timeout, api_key=self.api_key,
         )
         if status not in (204, 200):
             raise _decode_error(status, resp)
@@ -240,7 +259,7 @@ class Client:
         # type: (str, str) -> bytes
         p = "/v1/sandboxes/{}/files/{}".format(sid, self._clean_path(path))
         status, data = _http.request(
-            "GET", p, addr=self.addr, timeout=self.timeout,
+            "GET", p, addr=self.addr, timeout=self.timeout, api_key=self.api_key,
         )
         if status != 200:
             raise _decode_error(status, data)
@@ -251,7 +270,7 @@ class Client:
         # type: (str) -> str
         status, data = _http.request(
             "GET", "/v1/sandboxes/{}/logs".format(sid),
-            addr=self.addr, timeout=self.timeout,
+            addr=self.addr, timeout=self.timeout, api_key=self.api_key,
         )
         if status != 200:
             raise _decode_error(status, data)
