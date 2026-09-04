@@ -713,6 +713,81 @@ jobs:
           path: build/bench/results.jsonl
           if-no-files-found: ignore
 
+  # M3-Q10（3 节点集群端到端 SLO，**硬出口**）。在此 job 之前 M3-Q10 **零覆盖**——
+  # 跨节点生命周期、失联回收、选主切换没有任何自动化承载，出口评审只能靠人肉跑再手抄。
+  #
+  # 两种形态，同一个脚本：
+  #   ① 托管 runner（ubuntu-latest 自带 /dev/kvm）起三个守护 → mode=single-host。
+  #      这是**机制回归**：跨节点路由/回收/选主还通不通。**不是** M3-Q10 取证，
+  #      slo-gate.sh 严格档会拒收 single-host 的集群行（与它拒收非裸金属宿主同理）。
+  #   ② 三台真机 → mode=multi-host，才是出口证据。把守护按部署指南 §4.5 起好，
+  #      再用 CLUSTER_REPLICAS/CLUSTER_KILL_SSH 指过去跑同一个脚本（runbook §7）。
+  #
+  # 这里只做 ①。②需要三台按小时租的裸金属，跟 bench-density 一样是手动那一趟的事。
+  bench-cluster:
+    runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: gcr.io/etcd-development/etcd:v3.5.17
+        ports:
+          - 2379:2379
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装内核构建依赖
+        run: sudo apt-get update && sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc
+      - name: Rust 工具链（含 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: 获取 Firecracker
+        run: scripts/fetch-firecracker.sh
+      - name: 构建 guest 内核
+        run: scripts/build-kernel.sh
+      - name: 等 etcd gRPC-gateway 就绪
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:2379/v3/kv/range -X POST -d '{"key":"AA=="}' >/dev/null && exit 0
+            sleep 1
+          done
+          echo "etcd gateway 30s 未就绪"; exit 1
+      - name: 集群基准（三守护同机 → 机制回归）
+        env:
+          BENCH_CLUSTER: "1"
+          BENCH_ONLY: "cluster"
+          CLUSTER_ETCD: "http://127.0.0.1:2379"
+        run: scripts/bench/run-all.sh
+      # 宽松档：single-host 的集群行本来就不作数，严格档必红。这里要的是「机制没坏」，
+      # 判定看下一步的断言。
+      - name: SLO 判定（宽松档；single-host 的集群行不计入）
+        run: scripts/bench/slo-gate.sh build/bench/results.jsonl
+      # 机制断言：跨节点路由通、三副本视图一致、失联回收发生、幸存副本仍可服务。
+      # 这四件事与 mode 无关——同机也该成立，不成立就是真坏了。
+      - name: 机制断言（与 mode 无关的四条）
+        run: |
+          F=build/bench/results.jsonl
+          fail=0
+          need() { grep -q "$1" "$F" || { echo "✗ $2"; fail=1; }; }
+          grep -q '"metric":"cluster_topology"' "$F" || { echo "✗ 集群基准没产出（见上方日志）"; exit 1; }
+          grep -q '"metric":"cluster_topology".*"skipped":true' "$F" && {
+            echo "✗ 集群基准被跳过：$(grep -o '"reason":"[^"]*"' "$F" | tail -1)"; exit 1; }
+          need '"view_consistent":true'  "三副本视图不一致"
+          need '"xnode_resume_p50_ms"'   "跨节点 pause/resume 一个样本都没取到（跨节点路由不通？）"
+          need '"api_available":true'    "杀掉一个节点后幸存副本不可服务"
+          obs=$(grep -o '"observed_s":-\?[0-9]*' "$F" | tail -1 | cut -d: -f2)
+          [ -n "$obs" ] && [ "$obs" != "-1" ] || { echo "✗ 观测窗内未见失联回收（observed_s=${obs:-无})"; fail=1; }
+          [ "$fail" = 0 ] && echo "✓ 集群机制四条全过（mode=single-host，非 M3-Q10 取证）"
+          exit $fail
+      - name: 上传基准结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-cluster-${{ github.sha }}
+          path: build/bench/results.jsonl
+          if-no-files-found: ignore
+
   # M3 W1（M3-Q1）：store 契约双实现对账——SqliteStore（单机）与 EtcdStore（集群）跑**同一套**
   #   后端无关契约（contract::run_all），证「单机→集群无两套语义」。免 root（纯元数据）。
   #   etcd 用 service 容器（gRPC-gateway HTTP/JSON 端口 2379）；EtcdStore 走同步 ureq，零 tokio。
@@ -760,3 +835,8 @@ jobs:
         run: ./target/debug/sl-node --quota-reconcile --etcd http://127.0.0.1:2379
       - name: M3-Q7 保留期+版本钉住对账（过期 GC / 版本兼容矩阵 / 存储配额，真 etcd）
         run: ./target/debug/sl-node --retention-reconcile --etcd http://127.0.0.1:2379
+      # M3-Q3 数据面 + 控制面跨节点中继。此前**只在本地跑过、从未进 CI**——网关拆分那一
+      # 步的活证（真网关 + 两个真节点代理 + mTLS 握手）因此没有回归护栏。verify 脚本自带
+      # 明文/mTLS 两趟 + openssl 造证书验"无客户端证书握手被拒"。
+      - name: M3-Q3 网关数据面/控制面跨节点对账（明文 + mTLS + 强制客户端证书，真 etcd）
+        run: ./scripts/verify-gw-dataplane.sh http://127.0.0.1:2379

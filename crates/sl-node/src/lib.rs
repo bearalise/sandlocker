@@ -3270,11 +3270,16 @@ fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
                     Err(_) => return,
                 };
                 // 分块 + 间隔写：⑦ 要据此判定中继是**逐块**转发而非整体缓冲。
+                // 回显里带上 **action/port**：⑨ 据此判定控制面票带着「哪个操作、哪个端口」
+                // 原样到了 owning 节点（两者都在签名里）。
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
                 let _ = ch.write_all(head.as_bytes());
                 let _ = ch.flush();
                 for i in 0..3 {
-                    let _ = ch.write_all(format!("{who}:{}:{i}\n", ticket.sid).as_bytes());
+                    let _ = ch.write_all(
+                        format!("{who}:{}:{}:{}:{i}\n", ticket.sid, ticket.action.as_str(), ticket.port)
+                            .as_bytes(),
+                    );
                     let _ = ch.flush();
                     if i < 2 {
                         std::thread::sleep(Duration::from_millis(200));
@@ -3374,6 +3379,38 @@ fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
         );
     }
 
+    // ⑨ **控制面跨节点**（M3 W4 余项）：pause/resume/fork/destroy/keepalive/expose/unexpose/
+    //    exposes 八条同样按归属路由，且**动作与端口是签名里的那个**原样抵达 owning 节点。
+    //    此前这些路由压根不转发——落到收请求的副本自己的 `live` 表上，一律 404。
+    for (action, port) in [
+        (Action::Pause, 0),
+        (Action::Resume, 0),
+        (Action::Fork, 0),
+        (Action::Destroy, 0),
+        (Action::Keepalive, 0),
+        (Action::Expose, 0),
+        (Action::Unexpose, 8080),
+        (Action::Exposes, 0),
+    ] {
+        let name = action.as_str();
+        let (code, body, _) =
+            http_get(&client_addr, &rel(signer.mint("dp-s1", action, port, 60, now)))?;
+        want!(code == 200, format!("控制面 {name} 应 200，实得 {code}: {body}"));
+        want!(
+            body.contains(&format!("dp-node-a:dp-s1:{name}:{port}:")),
+            format!("控制面 {name} 应带 (action={name}, port={port}) 抵达 dp-node-a，实得: {body}")
+        );
+    }
+
+    // ⑩ **动作不可替换**：拿一张 pause 票改写 action=destroy → 签名覆盖 action，403。
+    //    这是「每个操作各占一个动作」而非「一个笼统 ctl 动作 + 未签名路径」的理由。
+    let swapped = {
+        let u = rel(signer.mint("dp-s1", Action::Pause, 0, 60, now));
+        u.replace("action=pause", "action=destroy")
+    };
+    let (c7, _, _) = http_get(&client_addr, &swapped)?;
+    want!(c7 == 403, format!("pause 票改写成 destroy 应 403，实得 {c7}"));
+
     // 收尾清理。
     for sid in ["dp-s1", "dp-s2", "dp-orphan"] {
         let _ = admin.delete(&sl_store::cluster::sandbox_node_key(sid));
@@ -3390,7 +3427,7 @@ fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
     let transport = if secure { "mTLS" } else { "明文" };
     println!(
         "[gw-dataplane] {backend} / {transport}：按归属路由 + 无粘滞 + 一次性 + 篡改拒 + 未知 404 + \
-未接入 503 + 逐块全双工{} PASS",
+未接入 503 + 逐块全双工 + 控制面八动作按归属路由 + 动作不可替换{} PASS",
         if secure { " + 明文连接被拒" } else { "" }
     );
     Ok(())

@@ -13,7 +13,7 @@ multi-node convergence, API-Key/scope/project multi-tenancy, per-project quota +
 (M3-Q4 met), and Prometheus metrics + log sink + a read-only Grafana dashboard (M3-Q5/Q12). The
 data-plane gateway is now a **separate `sandlocker-gw` process** fed by node-initiated outbound
 streams over mTLS, so cross-node exec/logs/files/ports/streaming work with **zero inbound ports on
-nodes** (M3-Q3 met). Paused snapshots are sealed at rest under a KMS → tenant KEK → per-snapshot DEK
+nodes** (M3-Q3 met), and **control-plane operations route the same way** (M3 W4 remainder). Paused snapshots are sealed at rest under a KMS → tenant KEK → per-snapshot DEK
 envelope with 4 MiB chunked AES-256-GCM (M3-Q6 met, one of the four debts M2 handed over). Each week ships a backend-agnostic `--*-reconcile` verified against real etcd.
 See the plan: `docs/design/M3技术计划.md`.
 
@@ -26,6 +26,44 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **`bench-cluster` — the M3-Q10 (3-node cluster SLO) evidence harness** — `scripts/bench/bench-cluster.sh`
+  measures four things in one run: topology + three-replica view consistency, cross-node lifecycle
+  percentiles (pause/resume issued at a replica that does *not* own the sandbox, with the owning
+  replica as a baseline so the relay overhead falls out), dead-node reclaim time, and leader state.
+  M3-Q10 had **zero coverage** before this — the exit review would have been a manual run copied out
+  by hand.
+  - Every row carries a **`mode`**. Three daemons on one machine are three nodes as far as etcd is
+    concerned, and the clustering machinery really does run — but there are no network hops, no
+    independent memory/IO contention, and killing a "node" is not killing a machine. So
+    `single-host` is a mechanism regression only; `multi-host` is the evidence. `slo-gate.sh` in
+    strict mode **refuses** the cluster rows for `single-host`, the same way it refuses a
+    non-bare-metal host: the two look identical in the JSONL apart from that one field.
+  - The reclaim budget is **derived, not invented**: PRD §8.4 gives no time limit, so the script
+    computes the bound from the mechanism (heartbeat lease TTL + a few reaper ticks) and records it
+    next to the measurement.
+  - New `sandlocker_build_info{node="addr#pid"}` metric so each replica can state its own identity.
+    Daemons commonly bind `0.0.0.0` or sit behind a load balancer, where the URL host does not match
+    the node id — guessing wrong would silently measure the local path and call it cross-node.
+    The label also lets the Grafana dashboard break down by node.
+  - Surfaces an implementation gap it did not create: `placement` is always `caller-local` —
+    a sandbox lands on whichever replica received the create, and **there is no scheduler**
+    (the create path never consults the live-node set). The "scheduling" half of M3-Q10's criterion
+    is not implemented, and the gate prints this so a green table cannot be read as if it were.
+- **Cross-node control-plane routing (M3 W4 remainder)** — `pause` / `resume` / `fork` / `destroy` /
+  `keepalive` / `expose` / `unexpose` / `exposes` now reach the sandbox wherever it lives. They used
+  to be answered by whichever replica received the request, which looks up `Orch::live` — an
+  in-memory table — and so returned a plain **404** for any sandbox owned by another node. They now
+  ride the **same reverse tunnel** the data plane uses (ADR-22), so nodes still open **zero inbound
+  ports**. Each operation gets its own signed ticket action, and `unexpose`'s guest port travels in
+  the signed `port` field, so a `pause` ticket cannot be rewritten into a `destroy` ticket.
+  `POST /v1/sandboxes/{id}/ticket` refuses control-plane actions — those tickets are minted only by
+  a replica while forwarding, never handed to clients, because the quota pre-check (FR-7.2) and the
+  audit record (FR-7.3) live on the `/v1` side.
+  - **Fixes a silent audit hole**: the forwarding path used to return before the audit step, so
+    cross-node `exec` / `put_file` left **no audit record at all** — the same operation was logged
+    on one node and silent on another.
+  - `expose` binds its listener on the **owning node**, so the address it returns is that machine's
+    (see 部署指南 §4.5).
 - **SDK API-Key auth + typed errors (TS 0.5.0 / Python 0.2.0)** — both SDKs now send an API key as
   `Authorization: Bearer <key>` on every request, so they work against a multi-tenant daemon
   (`--serve --require-auth`). Pass it via the client constructor / factory (`apiKey` / `api_key`) or
