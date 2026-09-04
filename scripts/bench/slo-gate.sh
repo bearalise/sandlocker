@@ -68,6 +68,13 @@ field() {
     | grep -oE "\"$key\":[0-9]+" | grep -oE '[0-9]+$' || true
 }
 
+# 同上，但取字符串/布尔字段（"mode":"single-host" / "view_consistent":true）。
+sfield() {
+  local metric="$1" key="$2"
+  grep "\"metric\":\"$metric\"" "$FILE" 2>/dev/null | tail -1 \
+    | grep -oE "\"$key\":(\"[^\"]*\"|true|false)" | sed -E "s/^\"$key\"://; s/^\"//; s/\"$//" || true
+}
+
 PASS=0; FAIL=0; SKIP=0
 printf '%-34s %10s %10s   %s\n' "指标（PRD §8.1）" "实测" "口径" "判定"
 printf '%s\n' "----------------------------------------------------------------------------"
@@ -165,6 +172,59 @@ else
   if [ "$STRICT" = "1" ]; then FAIL=$((FAIL+2)); else SKIP=$((SKIP+2)); fi
 fi
 
+# ————————————————————— M3-Q10：3 节点集群（硬出口）—————————————————————
+#
+# 只有 results.jsonl 里真有集群指标时这一段才出现——单节点那趟不该因为"没测集群"而变红，
+# 那是两件不同的事（M3-Q9 vs M3-Q10）。
+CLUSTER_MODE="$(sfield cluster_topology mode)"
+if [ -n "$CLUSTER_MODE" ]; then
+  printf '%s\n' "----------------------------------------------------------------------------"
+  printf '%s\n' "M3-Q10：3 节点集群（mode=${CLUSTER_MODE}）"
+
+  # mode 闸：三个守护跑在同一台机器上，集群机制全都会动，但那不是 3 节点集群的 SLO——
+  # 没有网络跳数、没有独立的内存/IO 竞争、杀一个"节点"也不是杀一台机器。与 host_kind 闸
+  # 同一个理由：两种数据在 JSONL 里只差这个标记，不拦住就一定有人拿错的那份去过评审。
+  CLUSTER_OK=1
+  if [ "$CLUSTER_MODE" != "multi-host" ]; then
+    CLUSTER_OK=0
+  fi
+
+  if [ "$CLUSTER_OK" = 1 ]; then
+    # §8.1 的恢复口径，走**跨节点**路径（请求打到不持有该沙箱的副本）。
+    row "跨节点恢复 P50" "$(field cluster_xnode xnode_resume_p50_ms)" "$RESTORE_P50_MS" le "ms"
+    # 回收预算不是 PRD 数字——§8.4 只说"回收"，没给时限。脚本按机制推导（心跳租约 TTL +
+    # 若干 reaper 周期）并把预算写进结果，这里照读，不另立标准。
+    _budget="$(field cluster_reclaim budget_s)"
+    _obs="$(field cluster_reclaim observed_s)"
+    if [ -n "$_budget" ]; then
+      row "节点失联回收（派生预算）" "$_obs" "$_budget" le "s"
+      [ "$_obs" = "-1" ] && printf '%34s %s\n' "" "└ -1 = 观测窗内未见回收"
+    else
+      row "节点失联回收（派生预算）" "" "?" le "s"
+    fi
+    # 视图一致 / 幸存副本可服务：布尔，映射成 1/0 走同一张表。
+    _vc="$(sfield cluster_topology view_consistent)"
+    row "三副本视图一致" "$([ "$_vc" = "true" ] && echo 1)" 1 ge ""
+    _av="$(sfield cluster_failover api_available)"
+    row "幸存副本仍可服务" "$([ "$_av" = "true" ] && echo 1)" 1 ge ""
+  else
+    printf '%-34s %10s %10s   %s\n' "跨节点恢复 P50" "$(field cluster_xnode xnode_resume_p50_ms)ms" "${RESTORE_P50_MS}ms" "**不认**（非 multi-host）"
+    printf '%-34s %10s %10s   %s\n' "节点失联回收（派生预算）" "$(field cluster_reclaim observed_s)s" "$(field cluster_reclaim budget_s)s" "**不认**（非 multi-host）"
+    if [ "$STRICT" = "1" ]; then FAIL=$((FAIL+2)); else SKIP=$((SKIP+2)); fi
+  fi
+
+  # 归属是**调度出来的**还是**谁收到请求就落谁身上**。M3-Q10 判据写的是「跨节点创建/**调度**」，
+  # 而创建路径从不查存活节点集，`Orch::register` 直接写本副本的 node_id。这一行必须显示，
+  # 否则一张全 PASS 的表会被读成「调度成立」，而证据只到「另外两个副本看得见」。
+  _pl="$(sfield cluster_topology placement)"
+  if [ "$_pl" = "caller-local" ]; then
+    printf '%s\n' "注：placement=caller-local —— 沙箱恒落在**收到创建请求的那个副本**上；"
+    printf '%s\n' "    尚无按存活节点集选放置的调度器。M3-Q10 的「跨节点调度」这一半未实现。"
+  fi
+  _ro="$(field cluster_xnode relay_overhead_p50_ms)"
+  [ -n "$_ro" ] && printf '%s\n' "备查：跨节点中继开销 P50 = ${_ro}ms（跨节点 − 本地基线）"
+fi
+
 printf '%s\n' "----------------------------------------------------------------------------"
 _whole="$(field restore_create p50_ms)"
 [ -n "$_whole" ] && echo "备查：restore_create 整体 P50 = ${_whole}ms（含 copy/api-ready 编排开销）"
@@ -181,7 +241,12 @@ if [ "$DENSITY_HOST_OK" != "1" ]; then
   echo "⚠️  确有理由在大机器上认这两行时，显式 SLO_DENSITY_HOST_OK=1（须在出口评审写明理由）。"
 fi
 echo
-echo "[slo-gate] PASS=${PASS} FAIL=${FAIL} SKIP=${SKIP} 宿主=${HOST_KIND} ${HOST_CPUS}C/${HOST_MEM_GB}G（严格档=${STRICT}，口径来源 PRD §8.1）"
+if [ -n "$CLUSTER_MODE" ] && [ "$CLUSTER_MODE" != "multi-host" ]; then
+  echo "⚠️  集群 mode=${CLUSTER_MODE}：三个守护同机只证明**机制**跑通，不是 3 节点集群的 SLO。"
+  echo "⚠️  M3-Q10 取证须三台真机——把 CLUSTER_REPLICAS 指向三台不同主机的守护再跑一遍。"
+  echo
+fi
+echo "[slo-gate] PASS=${PASS} FAIL=${FAIL} SKIP=${SKIP} 宿主=${HOST_KIND} ${HOST_CPUS}C/${HOST_MEM_GB}G${CLUSTER_MODE:+ 集群=${CLUSTER_MODE}}（严格档=${STRICT}，口径来源 PRD §8.1）"
 if [ "$FAIL" -gt 0 ]; then
   echo "[slo-gate] 未达标——**口径不下调**（计划 §4 D4）；须以配置/实现改进补，或走 go/no-go 上报。" >&2
   exit 1

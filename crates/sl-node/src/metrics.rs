@@ -58,6 +58,9 @@ pub struct Metrics {
     api_errors: AtomicU64, // code >= 400
     create_hist: Mutex<Hist>,
     exec_hist: Mutex<Hist>,
+    /// 本副本的 node id（`addr#pid`，与 `node/<id>` 心跳键、`sandbox/<sid>/node` 归属键同值）。
+    /// 空 = 未设（单机 `run` 路径不起 serve，没有身份）。
+    node_id: Mutex<String>,
 }
 
 impl Metrics {
@@ -73,6 +76,7 @@ impl Metrics {
             api_errors: AtomicU64::new(0),
             create_hist: Mutex::new(Hist::default()),
             exec_hist: Mutex::new(Hist::default()),
+            node_id: Mutex::new(String::new()),
         }
     }
 
@@ -111,6 +115,11 @@ impl Metrics {
         }
     }
 
+    /// 记本副本的 node id（`serve()` 启动时调一次）。
+    pub fn set_node_id(&self, id: &str) {
+        *self.node_id.lock().unwrap() = id.to_string();
+    }
+
     /// 渲染 Prometheus 文本曝露格式。
     pub fn render(&self) -> String {
         let mut o = String::with_capacity(2048);
@@ -127,6 +136,15 @@ impl Metrics {
         let cur = self.current.load(Ordering::Relaxed).max(0);
         o.push_str("# HELP sandlocker_sandboxes_current 当前存活沙箱数\n# TYPE sandlocker_sandboxes_current gauge\n");
         o.push_str(&format!("sandlocker_sandboxes_current {cur}\n"));
+        // build_info：恒为 1 的 gauge，信息全在标签上——Prometheus 的惯用法。
+        // 有它，看板才能按 node 拆分（M3-Q12），集群基准也才有办法**问一个副本"你是谁"**：
+        // 除此之外副本的身份只出现在启动日志和 etcd 键里，跨机取证时两者都够不着。
+        let nid = self.node_id.lock().unwrap().clone();
+        if !nid.is_empty() {
+            o.push_str("# HELP sandlocker_build_info 本副本身份（值恒为 1，信息在标签上）\n");
+            o.push_str("# TYPE sandlocker_build_info gauge\n");
+            o.push_str(&format!("sandlocker_build_info{{node=\"{}\",version=\"{}\"}} 1\n", nid, env!("CARGO_PKG_VERSION")));
+        }
         self.create_hist.lock().unwrap().render("sandlocker_create_latency_ms", "沙箱创建延迟(ms)", &mut o);
         self.exec_hist.lock().unwrap().render("sandlocker_exec_latency_ms", "exec 延迟(ms)", &mut o);
         o
@@ -161,6 +179,20 @@ mod tests {
         assert!(txt.contains("sandlocker_create_latency_ms_bucket{le=\"100\"}"));
         assert!(txt.contains("sandlocker_create_latency_ms_count 2"));
         assert!(txt.contains("sandlocker_exec_latency_ms_count 1"));
+    }
+
+    /// `build_info` 是集群基准问出「哪个副本拥有这个沙箱」的唯一途径（副本身份此外只存在于
+    /// 启动日志与 etcd 键里，跨机取证时两者都够不着）。标签名/形状变了，基准会静默地把
+    /// owning 副本当成远端——那时整组"跨节点"分位量的其实是本地路径。
+    #[test]
+    fn build_info_carries_node_label() {
+        let m = Metrics::new();
+        assert!(!m.render().contains("sandlocker_build_info"), "未设身份时不该出这条");
+        m.set_node_id("10.0.0.7:7878#4242");
+        let txt = m.render();
+        assert!(txt.contains("# TYPE sandlocker_build_info gauge"));
+        assert!(txt.contains("sandlocker_build_info{node=\"10.0.0.7:7878#4242\",version="));
+        assert!(txt.trim_end().ends_with(" 1") || txt.contains("\"} 1\n"), "值应恒为 1");
     }
 
     #[test]

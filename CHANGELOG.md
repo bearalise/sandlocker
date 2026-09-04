@@ -26,6 +26,29 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **`bench-cluster` — the M3-Q10 (3-node cluster SLO) evidence harness** — `scripts/bench/bench-cluster.sh`
+  measures four things in one run: topology + three-replica view consistency, cross-node lifecycle
+  percentiles (pause/resume issued at a replica that does *not* own the sandbox, with the owning
+  replica as a baseline so the relay overhead falls out), dead-node reclaim time, and leader state.
+  M3-Q10 had **zero coverage** before this — the exit review would have been a manual run copied out
+  by hand.
+  - Every row carries a **`mode`**. Three daemons on one machine are three nodes as far as etcd is
+    concerned, and the clustering machinery really does run — but there are no network hops, no
+    independent memory/IO contention, and killing a "node" is not killing a machine. So
+    `single-host` is a mechanism regression only; `multi-host` is the evidence. `slo-gate.sh` in
+    strict mode **refuses** the cluster rows for `single-host`, the same way it refuses a
+    non-bare-metal host: the two look identical in the JSONL apart from that one field.
+  - The reclaim budget is **derived, not invented**: PRD §8.4 gives no time limit, so the script
+    computes the bound from the mechanism (heartbeat lease TTL + a few reaper ticks) and records it
+    next to the measurement.
+  - New `sandlocker_build_info{node="addr#pid"}` metric so each replica can state its own identity.
+    Daemons commonly bind `0.0.0.0` or sit behind a load balancer, where the URL host does not match
+    the node id — guessing wrong would silently measure the local path and call it cross-node.
+    The label also lets the Grafana dashboard break down by node.
+  - Surfaces an implementation gap it did not create: `placement` is always `caller-local` —
+    a sandbox lands on whichever replica received the create, and **there is no scheduler**
+    (the create path never consults the live-node set). The "scheduling" half of M3-Q10's criterion
+    is not implemented, and the gate prints this so a green table cannot be read as if it were.
 - **Cross-node control-plane routing (M3 W4 remainder)** — `pause` / `resume` / `fork` / `destroy` /
   `keepalive` / `expose` / `unexpose` / `exposes` now reach the sandbox wherever it lives. They used
   to be answered by whichever replica received the request, which looks up `Orch::live` — an

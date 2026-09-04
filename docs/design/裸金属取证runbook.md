@@ -284,27 +284,77 @@ SLO_STRICT=1 scripts/bench/slo-gate.sh build/bench/results.jsonl
 
 ---
 
-## 7. M3-Q10（3 节点集群 SLO）：**当前还没有 CI job**
+## 7. M3-Q10（3 节点集群 SLO）
 
-**这是一个已知缺口，如实记录。** `bench.yml` 里只有单节点的 `bench-density`；三节点集群的
-跨节点创建/调度/回收与分位 SLO 没有任何自动化承载。W12 之前需要补一个 `bench-cluster` job，
-或按下面的手动步骤跑并人工记录。
+`scripts/bench/bench-cluster.sh` 是这一枪的取证载体：拓扑/视图一致、跨节点生命周期分位、
+节点失联回收、选主状态，四组指标一趟跑完，判定交 `slo-gate.sh`。
 
-手动路径（三台机器 A/B/C，etcd 跑在 A 上）：
+**先看清楚 mode。** 脚本给每一行结果打一个 `mode`：
+
+| mode | 什么情况 | 算不算 M3-Q10 取证 |
+| --- | --- | --- |
+| `single-host` | 三个守护跑在同一台机器上 | **不算**。集群机制会真的动起来（etcd 眼里就是三个节点），但没有网络跳数、没有独立的内存/IO 竞争、杀一个"节点"也不是杀一台机器 |
+| `multi-host` | 三台真机 | **算**，这才是出口证据 |
+
+`slo-gate.sh` 严格档对 `single-host` 的集群行**直接拒收**——理由与它拒收非裸金属宿主完全相同：
+两种数据在 JSONL 里长得一模一样，只差这个标记。`bench.yml` 的 `bench-cluster` job 跑的是
+`single-host`，那是**机制回归**（跨节点路由/回收/选主还通不通），不是取证。
+
+### 7.1 三台机器怎么起
+
+三台 A/B/C，etcd 与网关跑在 A（或单独一台）：
 
 ```bash
-# A：起 etcd + 控制面副本
-sl-node --serve --etcd http://A:2379 --gw gw:7880 --gw-url http://gw:7879 --gw-tls-* ...
-# B、C：同样接同一个 etcd（active-standby 由选主决定谁是 leader）
-# 网关：sandlocker-gw --bind 0.0.0.0:7879 --node-bind 0.0.0.0:7880 --etcd http://A:2379 --tls-*
+# 网关（可多副本，前面挂 L4 LB）
+sandlocker-gw --bind 0.0.0.0:7879 --node-bind 0.0.0.0:7880 --etcd http://A:2379 \
+  --tls-cert gw.pem --tls-key gw.key --tls-ca ca.pem
+
+# A / B / C 各起一个守护，接同一个 etcd（谁是 leader 由选主决定）
+sl-node --serve --addr 0.0.0.0:7878 --etcd http://A:2379 \
+  --gw gw:7880 --gw-url http://gw:7879 \
+  --gw-tls-cert node.pem --gw-tls-key node.key --gw-tls-ca ca.pem --gw-tls-name sandlocker-gw
 ```
 
-要产出的证据（对齐 M3-Q10 判据）：
+证书按部署指南 §4.5 造。三台都要有模板（`sl-node --build examples/hello.sandlocker.toml`）。
 
-- 跨节点创建/调度：沙箱落到非本副本的节点上，`/v1/sandboxes` 三副本视图一致。
-- **跨节点生命周期端到端**（M3 W4 余项，至今只验到中继层，端到端要 KVM + 多节点）：
-  在**不持有该沙箱的副本**上依次打 keepalive → pause → resume → fork → destroy，每一步都应
-  正常返回，而不是 404。这条现在是**新代码的唯一端到端缺口**，三节点这一趟必须带回来：
+### 7.2 跑取证
+
+在任意一台能同时够到三个副本的机器上：
+
+```bash
+BENCH_CLUSTER=1 BENCH_ONLY=cluster \
+  CLUSTER_ETCD=http://A:2379 \
+  CLUSTER_REPLICAS=http://A:7878,http://B:7878,http://C:7878 \
+  CLUSTER_KILL_SSH=ubuntu@A,ubuntu@B,ubuntu@C \
+  scripts/bench/run-all.sh
+
+SLO_STRICT=1 scripts/bench/slo-gate.sh build/bench/results.jsonl
+```
+
+- `CLUSTER_REPLICAS` 里写副本的**对外地址**即可——脚本从各副本的 `/metrics`
+  （`sandlocker_build_info{node="..."}`）问出它们真正的 node_id，不靠 URL 猜。守护绑
+  `0.0.0.0` 或藏在 LB 后面都不影响。
+- `CLUSTER_KILL_SSH` **与 `CLUSTER_REPLICAS` 同序**，用于「杀掉沙箱归属节点」那一步
+  （`pkill -9 -x sl-node`）。条目数对不上脚本会拒绝执行，免得杀错机器。不给的话失联回收
+  那一行会记成未测，严格档即失败。
+- 分位样本量 `CLUSTER_N`（默认 10）。
+
+### 7.3 收工前确认这几点
+
+- `mode=multi-host`（不是 single-host——否则这趟白跑）
+- `placement`：目前必然是 `caller-local`。**沙箱恒落在收到创建请求的那个副本上，没有调度器**
+  （创建路径从不查存活节点集）。M3-Q10 判据里「跨节点创建/**调度**」的调度那一半尚未实现，
+  这一行会被 `slo-gate.sh` 显式打印出来——出口评审时要按这个如实讲，不能拿一张全 PASS 的表
+  当成「调度成立」。
+- `cluster_reclaim.observed_s` 不是 `-1`（`-1` = 观测窗内没等到回收）。
+- 顺手把 §7.4 的跨节点生命周期手测也跑一遍（脚本只覆盖 pause/resume，其余五个没覆盖）。
+
+### 7.4 跨节点生命周期手测（M3 W4 余项的端到端）
+
+`bench-cluster.sh` 只量了 pause/resume 两个动作的分位。另外六个控制面动作
+（keepalive/fork/destroy/expose/unexpose/exposes）的端到端此前**只验到中继层**——票带着正确的
+动作到了正确的节点，但节点侧真正调 `Orch::*` 那一段要 KVM + 多节点才跑得到。这是 M3 W4 余项
+留下的唯一端到端缺口，三节点这一趟顺手带回来：
 
   ```bash
   SID=$(curl -sX POST http://B:7878/v1/sandboxes -d '{"template":"hello"}' | jq -r .id)
@@ -317,9 +367,6 @@ sl-node --serve --etcd http://A:2379 --gw gw:7880 --gw-url http://gw:7879 --gw-t
   ```
 
   同时查 `GET /v1/audit`：跨节点的每一条变更都该在册（转发路径的审计此前是漏的，已修）。
-- 创建/恢复分位达 §8.1 口径（同 `slo-gate.sh`，但样本来自跨节点路径）。
-- 节点故障回收在 SLO 内：杀掉一台，心跳 lease 过期 → leader 回收其名下沙箱的耗时。
-- 选主切换 / 网关副本切换不破坏 SLO。
 
 部署细节见 `docs/design/部署指南.md` §4.5；集群机制的对账命令见
 `docs/design/M3技术计划.md` 的 W1–W5 各周落地段。

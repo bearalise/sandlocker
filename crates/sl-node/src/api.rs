@@ -164,6 +164,10 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     // 供失联节点的沙箱被 leader 回收。
     let node_id = format!("{addr}#{}", std::process::id());
     orch.set_node_id(&node_id);
+    // 同一身份也曝到 /metrics 上（`sandlocker_build_info{node=...}`）：看板按节点拆分要它，
+    // 集群基准要靠它问出「哪个副本是这个沙箱的 owner」——否则副本身份只存在于启动日志与
+    // etcd 键里，跨机取证时两者都够不着。
+    crate::metrics::metrics().set_node_id(&node_id);
     let shared: Shared = Arc::new(Mutex::new(orch));
 
     // 端口暴露注册表（L4 透传监听器）。allow_public 由 --expose-allow-public 控制。
