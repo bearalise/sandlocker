@@ -77,12 +77,12 @@ fn authorize(
 
 /// 端口暴露（L4 透传）共享态：sid→guest_port→监听器句柄 + 对外 bind 放行开关。
 /// 打包进一个 Arc 避免在 handle_conn/dispatch/reaper 到处加参数。
-struct ExposeState {
+pub(crate) struct ExposeState {
     registry: Mutex<HashMap<String, HashMap<u32, ExposeHandle>>>,
     /// `--expose-allow-public`：未开启时拒绝非回环 bind（对外暴露须显式选择）。
     allow_public: bool,
 }
-type Exposes = Arc<ExposeState>;
+pub(crate) type Exposes = Arc<ExposeState>;
 
 /// 停止并移除某沙箱的全部暴露监听器（destroy/回收路径调用，防悬挂/线程泄漏）。
 fn drop_exposes(exposes: &Exposes, id: &str) {
@@ -301,15 +301,16 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     {
         let gw_l = Arc::clone(&gw);
         let sh_l = Arc::clone(&shared);
+        let ex_l = Arc::clone(&exposes);
         let bind = gw_addr.clone();
         match TcpListener::bind(&bind) {
             Ok(gwl) => {
                 println!("[sandlocker] 数据面网关就绪 http://{bind}（一次性 HMAC 签名 URL；/gw/*）");
                 thread::spawn(move || {
                     for conn in gwl.incoming().flatten() {
-                        let (g, s) = (Arc::clone(&gw_l), Arc::clone(&sh_l));
+                        let (g, s, x) = (Arc::clone(&gw_l), Arc::clone(&sh_l), Arc::clone(&ex_l));
                         thread::spawn(move || {
-                            if let Err(e) = handle_gw_conn(conn, &s, &g) {
+                            if let Err(e) = handle_gw_conn(conn, &s, &g, &x) {
                                 eprintln!("[sandlocker] 网关连接错误: {e}");
                             }
                         });
@@ -342,6 +343,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
             eprintln!("[sandlocker][WARN] 数据面外拨未启用 mTLS（--gw-insecure）：仅限本机对账/开发");
         }
         let sh = Arc::clone(&shared);
+        let ex = Arc::clone(&exposes);
         crate::dataplane::start_node_agent(
             crate::dataplane::AgentCfg {
                 gw_addr: gw_node.clone(),
@@ -355,7 +357,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                 // 网关已验签并下发 ticket；这里读它复刻的 HTTP 请求，走**与进程内网关同一段**分发。
                 match read_request(&mut ch) {
                     Ok((method, path, _k, body)) => {
-                        if let Err(e) = serve_gw_ticket(&mut ch, &ticket, &method, &path, &body, &sh) {
+                        if let Err(e) = serve_gw_ticket(&mut ch, &ticket, &method, &path, &body, &sh, &ex) {
                             eprintln!("[sandlocker][gw-agent] 服务 {} 失败: {e}", ticket.sid);
                         }
                     }
@@ -614,18 +616,37 @@ fn parse_route(method: &str, path: &str) -> Route {
     }
 }
 
-// ————————————————————— 跨节点转发（M3 W5 余项，ADR-22 / M3-Q3）—————————————————————
+// ——————————— 跨节点转发（数据面 M3 W5 余项 / 控制面 M3 W4 余项，ADR-22 / M3-Q3）———————————
 
-/// 该路由是否是**数据面**（可经网关转到 owning 节点）；是则给出 (ticket 动作, HTTP 方法, 附加 query)。
+/// 该路由是否**必须在 owning 节点受理**（故可经网关中继过去）；是则给出
+/// (ticket 动作, HTTP 方法, 签进票里的 port, 附加 query)。
 ///
-/// 只有这几类会跨节点转：它们最终都落到 guest 的 vsock/exec 通道上，而通道只在 owning 节点。
-/// 其余（生命周期/配额/审计/模板）是控制面，任一副本读同一 etcd 即可，无需转发。
-fn dataplane_route(route: &Route) -> Option<(Action, &'static str, String)> {
+/// 判据是「这件事的状态在哪」：
+/// - **数据面**（exec/logs/files/stream，M2 起）：落到 guest 的 vsock 通道，通道只在 owning 节点。
+/// - **控制面**（pause/resume/fork/destroy/keepalive/expose，M3 W4 余项）：落到 owning 节点的
+///   `Orch::live` 表（内存态：lease 句柄、ttl 硬顶、后端归属）与后端进程（FC 的 API socket、
+///   jailer 目录）上。**这些都不在 etcd 里**，所以别的副本读同一份 etcd 也办不了——
+///   此前它们直接落到本副本的 `live` 表上查无此人，一律 404。
+///
+/// 其余（GetSandbox/ListSandboxes/审计/模板/配额）纯读 store，任一副本自足，不转。
+///
+/// `port` 走**签名**字段而非查询串：`Unexpose` 要指明拆哪个 guest 端口，签进票里才不可篡改。
+fn forwardable_route(route: &Route) -> Option<(Action, &'static str, u32, String)> {
     match route {
-        Route::Exec(_) => Some((Action::Exec, "POST", String::new())),
-        Route::Logs(_) => Some((Action::Logs, "GET", String::new())),
-        Route::GetFile(_, p) => Some((Action::File, "GET", format!("&p={p}"))),
-        Route::PutFile(_, p) => Some((Action::File, "PUT", format!("&p={p}"))),
+        // —— 数据面（M3 W5 余项）——
+        Route::Exec(_) => Some((Action::Exec, "POST", 0, String::new())),
+        Route::Logs(_) => Some((Action::Logs, "GET", 0, String::new())),
+        Route::GetFile(_, p) => Some((Action::File, "GET", 0, format!("&p={p}"))),
+        Route::PutFile(_, p) => Some((Action::File, "PUT", 0, format!("&p={p}"))),
+        // —— 控制面（M3 W4 余项）——
+        Route::Pause(_) => Some((Action::Pause, "POST", 0, String::new())),
+        Route::Resume(_) => Some((Action::Resume, "POST", 0, String::new())),
+        Route::Fork(_) => Some((Action::Fork, "POST", 0, String::new())),
+        Route::DeleteSandbox(_) => Some((Action::Destroy, "DELETE", 0, String::new())),
+        Route::Keepalive(_) => Some((Action::Keepalive, "POST", 0, String::new())),
+        Route::Expose(_) => Some((Action::Expose, "POST", 0, String::new())),
+        Route::Unexpose(_, gp) => Some((Action::Unexpose, "DELETE", *gp, String::new())),
+        Route::ListExposes(_) => Some((Action::Exposes, "GET", 0, String::new())),
         _ => None,
     }
 }
@@ -730,6 +751,25 @@ fn forward_via_gw<S: Read + Write>(
 
 // ————————————————————— 分派 / handler —————————————————————
 
+/// M3 W7 审计（FR-7.3）：鉴权模式下记录变更操作（append-only）。审计失败不阻断响应。
+///
+/// 抽成函数是因为它有**两个**调用点：本地 dispatch 之后，与跨节点转发之后。审计写的是共享
+/// store，故记在**收到客户端请求的这个副本**上即可（而不是执行操作的 owning 节点）——
+/// 一次请求一条，不重不漏。
+fn record_audit(auth: &SharedAuth, route: &Route, project: Option<&str>, code: u16) {
+    if !auth.require {
+        return;
+    }
+    match route.required_op() {
+        Some(op) if op != crate::auth::Op::Read => {
+            let actor = project.unwrap_or("-");
+            let target = route.sandbox_id().unwrap_or("-");
+            let _ = crate::audit::record(auth.store.as_ref(), actor, route.audit_action(), target, code);
+        }
+        _ => {}
+    }
+}
+
 fn handle_conn(
     mut stream: TcpStream,
     shared: &Shared,
@@ -769,17 +809,16 @@ fn handle_conn(
             Err((code, b)) => return write_response(&mut stream, code, json, &b),
         },
     };
-    // M3 W5 余项：**数据面**路由若指向别节点的沙箱，经独立网关转到 owning 节点。
-    // 控制面路由（pause/resume/fork/destroy/keepalive/expose）仍须在 owning 节点受理——
-    // 那是 W4 多节点调度的遗留缺口，见 docs/design/M3技术计划.md「W5 余项落地」。
-    if let Some(dp) = dataplane_route(&route) {
-        if let Some(id) = route.sandbox_id() {
-            if remote_owner(shared, rt, id).is_some() {
-                let (action, m, extra) = dp;
-                let code = forward_via_gw(&mut stream, rt, gw, id, action, 0, m, &extra, &body)?;
-                crate::metrics::metrics().record_api(code);
-                return Ok(());
-            }
+    // 沙箱不在本节点 → 经独立网关中继到 owning 节点（数据面 M3 W5 余项，控制面 M3 W4 余项）。
+    if let (Some((action, m, port, extra)), Some(id)) = (forwardable_route(&route), route.sandbox_id()) {
+        if remote_owner(shared, rt, id).is_some() {
+            let code = forward_via_gw(&mut stream, rt, gw, id, action, port, m, &extra, &body)?;
+            crate::metrics::metrics().record_api(code);
+            // 响应已由 forward_via_gw 逐块回灌，这里只补审计。**此前转发路径直接 return，
+            // 于是跨节点的 exec/put_file 一条审计都不落**——FR-7.3 要求变更操作条条在册，
+            // 而"在不在本节点"不该改变这一点。
+            record_audit(auth, &route, project.as_deref(), code);
+            return Ok(());
         }
     }
     let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref());
@@ -787,16 +826,7 @@ fn handle_conn(
     if !matches!(route, Route::Metrics) {
         crate::metrics::metrics().record_api(code);
     }
-    // M3 W7 审计（FR-7.3）：鉴权模式下记录变更操作（append-only）。审计失败不阻断响应。
-    if auth.require {
-        if let Some(op) = route.required_op() {
-            if op != crate::auth::Op::Read {
-                let actor = project.as_deref().unwrap_or("-");
-                let target = route.sandbox_id().unwrap_or("-");
-                let _ = crate::audit::record(auth.store.as_ref(), actor, route.audit_action(), target, code);
-            }
-        }
-    }
+    record_audit(auth, &route, project.as_deref(), code);
     write_response(&mut stream, code, ctype, &resp)
 }
 
@@ -1036,6 +1066,11 @@ fn mint_ticket(id: &str, body: &[u8], gw: &SharedGw) -> Result<Vec<u8>, String> 
         .and_then(|x| x.as_str())
         .and_then(Action::from_str)
         .ok_or("缺/非法 action（exec|file|logs|port）")?;
+    // 控制面票**只由副本在跨节点转发时自签**，不签发给客户端：客户端拿到就能直连网关做
+    // pause/destroy，绕开配额前置检查（FR-7.2）与审计落账（FR-7.3）。用 /v1 的对应端点。
+    if action.is_control() {
+        return Err(format!("action={} 是控制面动作，不签发 ticket（请用对应 /v1 端点）", action.as_str()));
+    }
     let port = v.get("port").and_then(|x| x.as_i64()).unwrap_or(0) as u32;
     let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
     let url = gw.mint(id, action, port, ttl, now_unix());
@@ -1109,7 +1144,12 @@ fn list_exposes(id: &str, exposes: &Exposes) -> Vec<u8> {
 /// **进程内网关**（单机 `--serve` 自带的 `/gw/*` 监听）走这条；独立 `sandlocker-gw` 进程验签后
 /// 经数据面把已验签 ticket 下发到 owning 节点，节点侧**跳过验签**直接调 `serve_gw_ticket`
 /// （nonce 已被网关一次性消费，节点再验必失败；采信根据是 mTLS，见 dataplane.rs 模块头）。
-fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Result<(), String> {
+fn handle_gw_conn(
+    mut stream: TcpStream,
+    shared: &Shared,
+    gw: &SharedGw,
+    exposes: &Exposes,
+) -> Result<(), String> {
     // 网关连接靠 ticket 验签授权（非 API Key），忽略 header 里的 api_key。
     let (method, path, _api_key, body) = read_request(&mut stream)?;
     let q = parse_query(&path);
@@ -1119,10 +1159,10 @@ fn handle_gw_conn(mut stream: TcpStream, shared: &Shared, gw: &SharedGw) -> Resu
             return write_response(&mut stream, 403, "application/json", &err_json(&format!("ticket 无效: {e}")))
         }
     };
-    serve_gw_ticket(&mut stream, &ticket, &method, &path, &body, shared)
+    serve_gw_ticket(&mut stream, &ticket, &method, &path, &body, shared, exposes)
 }
 
-/// 按**已验签**的 ticket 就地服务一次数据面请求（沙箱须在本节点）。
+/// 按**已验签**的 ticket 就地服务一次数据面 / 控制面请求（沙箱须在本节点）。
 ///
 /// 泛型 over `Read + Write`：既服务进程内网关的 `TcpStream`，也服务 `sandlocker-gw` 借用的那条
 /// 外拨连接（`dataplane::Chan`）——**同一套语义、同一段代码**，这正是 ADR-22「拆分零语义变更」。
@@ -1133,6 +1173,7 @@ pub(crate) fn serve_gw_ticket<S: Read + Write>(
     path: &str,
     body: &[u8],
     shared: &Shared,
+    exposes: &Exposes,
 ) -> Result<(), String> {
     let json = "application/json";
     let q = parse_query(path);
@@ -1179,6 +1220,104 @@ pub(crate) fn serve_gw_ticket<S: Read + Write>(
                 Some(_) => write_response(stream, 400, json, &err_json("端口暴露仅 FC 后端（vsock）支持")),
                 None => write_response(stream, 404, json, &err_json("未知沙箱或已回收")),
             }
+        }
+        // ————————————————————— 控制面（M3 W4 余项）—————————————————————
+        //
+        // 这几条走的是与本地 `dispatch` **完全相同**的 orch 调用与状态码——中继只换了到达
+        // 路径，不换语义（ADR-22「拆分零语义变更」对控制面同样成立）。
+        //
+        // **项目归属从 store 现取**（`sandbox/<id>/project`），不从线上参数取：转发请求里的
+        // 任何未签名字段都不该被采信，而发起副本在签票前已经用 API Key 做过跨项目门控，
+        // 归属键与那次门控读的是同一个值。
+        ("/gw/pause", Action::Pause) => {
+            let r = shared.lock().unwrap().pause(&ticket.sid);
+            match r {
+                Ok(()) => {
+                    let sid = &ticket.sid;
+                    write_response(stream, 200, json, format!(r#"{{"id":"{sid}","state":"paused"}}"#).as_bytes())
+                }
+                Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => write_response(stream, 409, json, &err_json(&e)),
+                Err(e) => write_response(stream, 404, json, &err_json(&e)),
+            }
+        }
+        ("/gw/resume", Action::Resume) => {
+            let r = shared.lock().unwrap().resume(&ticket.sid);
+            match r {
+                Ok(mid) => {
+                    let sid = &ticket.sid;
+                    let b = format!(r#"{{"id":"{sid}","state":"running","machine_id":"{mid}"}}"#);
+                    write_response(stream, 200, json, b.as_bytes())
+                }
+                Err(e) if e.starts_with(UNSUPPORTED_BY_BACKEND) => write_response(stream, 409, json, &err_json(&e)),
+                Err(e) => write_response(stream, 404, json, &err_json(&e)),
+            }
+        }
+        ("/gw/fork", Action::Fork) => {
+            let project = shared.lock().unwrap().sandbox_project(&ticket.sid).unwrap_or(None);
+            match fork_sandbox(&ticket.sid, body, shared, project.as_deref()) {
+                Ok(v) => write_response(stream, 201, json, &v),
+                Err(e) => write_response(stream, quota_status(&e), json, &err_json(&e)),
+            }
+        }
+        ("/gw/destroy", Action::Destroy) => {
+            // 项目归属**先读后销毁**：destroy 撤租，挂在该租约上的 `sandbox/<id>/project` 随之
+            // 消失，事后再读就只剩 "-"，日志里那条 destroy 事件会丢掉租户维度。
+            let r = {
+                let mut o = shared.lock().unwrap();
+                let project = o.sandbox_project(&ticket.sid).ok().flatten();
+                o.destroy(&ticket.sid).map(|_| project)
+            };
+            match r {
+                Ok(project) => {
+                    drop_exposes(exposes, &ticket.sid); // 拆掉该沙箱的暴露监听器，防悬挂
+                    crate::metrics::metrics().record_destroy();
+                    crate::logsink::emit(format!(
+                        r#"{{"event":"sandbox_destroy","id":"{}","project":"{}"}}"#,
+                        ticket.sid,
+                        project.as_deref().unwrap_or("-")
+                    ));
+                    write_response(stream, 204, json, &[])
+                }
+                Err(_) => write_response(stream, 404, json, &err_json("未知沙箱")),
+            }
+        }
+        ("/gw/keepalive", Action::Keepalive) => {
+            let mut orch = shared.lock().unwrap();
+            match orch.keepalive(&ticket.sid) {
+                Ok(lease_deadline) => {
+                    let sid = &ticket.sid;
+                    let ttl = orch.ttl_deadline(sid).map(|v| v.to_string()).unwrap_or_else(|| "null".into());
+                    let b = format!(r#"{{"id":"{sid}","lease_deadline":{lease_deadline},"ttl_deadline":{ttl}}}"#);
+                    drop(orch);
+                    write_response(stream, 200, json, b.as_bytes())
+                }
+                Err(_) => {
+                    drop(orch);
+                    write_response(stream, 404, json, &err_json("未知沙箱"))
+                }
+            }
+        }
+        // 暴露：监听器起在 **owning 节点**上，返回的地址因此是那台机器的地址（默认回环则
+        // 只有该节点自己可达）。跨节点暴露给外部访问须 `--expose-allow-public` + 节点可路由
+        // 地址，见 docs/design/端口暴露.md。
+        ("/gw/expose", Action::Expose) => match expose_port(&ticket.sid, body, shared, exposes) {
+            Ok(v) => write_response(stream, 201, json, &v),
+            Err(e) => write_response(stream, 400, json, &err_json(&e)),
+        },
+        ("/gw/unexpose", Action::Unexpose) => {
+            // 拆哪个 guest 端口取**票里签过的 port**，不取查询串（未签名字段不可信）。
+            let removed =
+                exposes.registry.lock().unwrap().get_mut(&ticket.sid).and_then(|m| m.remove(&ticket.port));
+            match removed {
+                Some(h) => {
+                    h.stop();
+                    write_response(stream, 204, json, &[])
+                }
+                None => write_response(stream, 404, json, &err_json("未暴露该端口")),
+            }
+        }
+        ("/gw/exposes", Action::Exposes) => {
+            write_response(stream, 200, json, &list_exposes(&ticket.sid, exposes))
         }
         _ => write_response(stream, 403, json, &err_json("ticket 动作与路径不符")),
     }
@@ -1432,6 +1571,90 @@ mod tests {
         assert_eq!(parse_route("POST", "/v1/sandboxes/abc/keepalive"), Route::Keepalive("abc".into()));
         assert_eq!(parse_route("POST", "/v1/sandboxes/abc/exec"), Route::Exec("abc".into()));
         assert_eq!(parse_route("GET", "/v1/sandboxes/abc/logs"), Route::Logs("abc".into()));
+    }
+
+    /// 控制面票**不签发给客户端**：客户端若能拿到 destroy 票直连网关，就绕开了配额前置检查
+    /// （FR-7.2）与审计落账（FR-7.3）——那两件事只发生在 `/v1` 端点这一侧。
+    #[test]
+    fn mint_ticket_refuses_control_actions() {
+        let gw: SharedGw = Arc::new(Gateway::new_random("http://x".into()));
+        for a in ["pause", "resume", "fork", "destroy", "keepalive", "expose", "unexpose", "exposes"] {
+            let body = format!(r#"{{"action":"{a}"}}"#);
+            assert!(mint_ticket("s", body.as_bytes(), &gw).is_err(), "{a} 不该签发给客户端");
+        }
+        // 数据面照签（零回归）。
+        assert!(mint_ticket("s", br#"{"action":"exec"}"#, &gw).is_ok());
+        assert!(mint_ticket("s", br#"{"action":"port","port":8080}"#, &gw).is_ok());
+    }
+
+    /// 跨节点转发覆盖面（M3 W4 余项）：**凡是依赖 owning 节点进程内状态的路由，都必须可转**。
+    ///
+    /// 判据不是"看着像控制面"，而是：这条路由的实现有没有摸 `Orch::live`（内存里的 lease 句柄、
+    /// ttl 硬顶、后端归属）或节点进程内的暴露注册表。摸了就只有 owning 节点办得了。
+    #[test]
+    fn forwardable_covers_every_owner_bound_route() {
+        let must = [
+            // 数据面：落 guest vsock 通道
+            Route::Exec("s".into()),
+            Route::Logs("s".into()),
+            Route::PutFile("s".into(), "a".into()),
+            Route::GetFile("s".into(), "a".into()),
+            // 控制面：落 Orch::live + 后端进程
+            Route::Pause("s".into()),
+            Route::Resume("s".into()),
+            Route::Fork("s".into()),
+            Route::DeleteSandbox("s".into()),
+            Route::Keepalive("s".into()),
+            // 暴露注册表是节点进程内状态
+            Route::Expose("s".into()),
+            Route::Unexpose("s".into(), 8080),
+            Route::ListExposes("s".into()),
+        ];
+        for r in &must {
+            assert!(forwardable_route(r).is_some(), "{r:?} 依赖 owning 节点，却不可转发");
+        }
+        // 纯读 store 的路由不转：任一副本自足，转发只是白白多一跳。
+        for r in [
+            Route::GetSandbox("s".into()),
+            Route::ListSandboxes,
+            Route::AuditLog,
+            Route::ListTemplates,
+            Route::CreateSandbox,
+            Route::Ticket("s".into()),
+        ] {
+            assert!(forwardable_route(&r).is_none(), "{r:?} 不该被转发");
+        }
+    }
+
+    /// 每条可转路由的 ticket 动作互不相同——共用动作就等于让票在操作之间可替换。
+    #[test]
+    fn forwardable_actions_are_distinct_per_op() {
+        let routes = [
+            Route::Pause("s".into()),
+            Route::Resume("s".into()),
+            Route::Fork("s".into()),
+            Route::DeleteSandbox("s".into()),
+            Route::Keepalive("s".into()),
+            Route::Expose("s".into()),
+            Route::Unexpose("s".into(), 1),
+            Route::ListExposes("s".into()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for r in &routes {
+            let (a, _, _, _) = forwardable_route(r).unwrap();
+            assert!(a.is_control(), "{r:?} 的动作应归控制面（否则会被签发给客户端）");
+            assert!(seen.insert(a.as_str()), "{r:?} 与他人共用动作 {}", a.as_str());
+        }
+    }
+
+    /// unexpose 的 guest 端口必须走**签名**字段（ticket.port），不能落到未签名查询串上。
+    #[test]
+    fn unexpose_port_travels_signed() {
+        let (action, method, port, extra) = forwardable_route(&Route::Unexpose("s".into(), 8080)).unwrap();
+        assert_eq!(action, Action::Unexpose);
+        assert_eq!(method, "DELETE");
+        assert_eq!(port, 8080);
+        assert!(extra.is_empty(), "端口不该出现在未签名的查询串里: {extra}");
     }
 
     #[test]

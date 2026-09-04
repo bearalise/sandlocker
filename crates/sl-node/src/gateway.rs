@@ -28,7 +28,13 @@ fn nonce_key(nonce: &str) -> String {
     format!("gw/nonce/{nonce}")
 }
 
-/// ticket 授权的数据面动作。
+/// ticket 授权的动作。
+///
+/// 前五个是**数据面**（M2 起）：最终都落到 guest 的 vsock 通道上。
+/// 后八个是**控制面**（M3 W4 余项）：落到 owning 节点的 `Orch::live` 表与后端进程上——
+/// 同样只有 owning 节点能受理，故同样经网关中继。**每个操作各占一个动作、动作进签名**，
+/// 于是一张 pause 票不能被改写成 destroy 票（若只用一个笼统的 `ctl` 动作，具体操作就只能
+/// 走未签名的路径/查询串，替换即提权）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Exec,
@@ -38,6 +44,17 @@ pub enum Action {
     /// 流式 exec（NDJSON，M2 流式特性）。M3 W5 余项新增：跨节点时控制面副本据此签票、
     /// 经网关把**未定长的增量响应**中继回客户端（中继全双工，故流不被缓冲住）。
     Stream,
+    // —— 控制面（M3 W4 余项，跨节点生命周期）——
+    Pause,
+    Resume,
+    Fork,
+    Destroy,
+    Keepalive,
+    Expose,
+    /// 取消暴露。guest 端口走 ticket 的 **`port` 字段**（已进签名），不走未签名查询串。
+    Unexpose,
+    /// 列暴露（读，但暴露注册表是**节点进程内**状态，别的副本看不到）。
+    Exposes,
 }
 
 impl Action {
@@ -48,6 +65,14 @@ impl Action {
             Action::Logs => "logs",
             Action::Port => "port",
             Action::Stream => "stream",
+            Action::Pause => "pause",
+            Action::Resume => "resume",
+            Action::Fork => "fork",
+            Action::Destroy => "destroy",
+            Action::Keepalive => "keepalive",
+            Action::Expose => "expose",
+            Action::Unexpose => "unexpose",
+            Action::Exposes => "exposes",
         }
     }
     pub fn from_str(s: &str) -> Option<Action> {
@@ -57,8 +82,22 @@ impl Action {
             "logs" => Some(Action::Logs),
             "port" => Some(Action::Port),
             "stream" => Some(Action::Stream),
+            "pause" => Some(Action::Pause),
+            "resume" => Some(Action::Resume),
+            "fork" => Some(Action::Fork),
+            "destroy" => Some(Action::Destroy),
+            "keepalive" => Some(Action::Keepalive),
+            "expose" => Some(Action::Expose),
+            "unexpose" => Some(Action::Unexpose),
+            "exposes" => Some(Action::Exposes),
             _ => None,
         }
+    }
+    /// 是否**控制面**动作。控制面票只由副本在转发时自签，**绝不签发给客户端**
+    /// （`POST /v1/sandboxes/{id}/ticket` 拒之，见 `api::mint_ticket`）——否则客户端可拿票
+    /// 直连网关执行生命周期操作，绕开配额前置检查与审计落账（FR-7.2/7.3）。
+    pub fn is_control(self) -> bool {
+        !matches!(self, Action::Exec | Action::File | Action::Logs | Action::Port | Action::Stream)
     }
 }
 
@@ -330,6 +369,51 @@ mod tests {
         let q3 = parse_query(&url3);
         assert!(gw.verify(&q3, 1000).is_ok());
         assert!(gw.verify(&q3, 1000).is_err());
+    }
+
+    #[test]
+    fn action_str_roundtrip_and_control_split() {
+        use Action::*;
+        // 每个动作都能原样往返——`from_str` 漏一个，节点侧就把该动作的开流行判为非法。
+        for a in [Exec, File, Logs, Port, Stream, Pause, Resume, Fork, Destroy, Keepalive, Expose, Unexpose, Exposes] {
+            assert_eq!(Action::from_str(a.as_str()), Some(a), "{} 未双向", a.as_str());
+        }
+        // 数据面/控制面的划分：数据面票可签发给客户端，控制面票绝不。
+        for a in [Exec, File, Logs, Port, Stream] {
+            assert!(!a.is_control(), "{} 不该是控制面", a.as_str());
+        }
+        for a in [Pause, Resume, Fork, Destroy, Keepalive, Expose, Unexpose, Exposes] {
+            assert!(a.is_control(), "{} 应是控制面", a.as_str());
+        }
+    }
+
+    #[test]
+    fn verify_rejects_action_tamper() {
+        // **控制面动作进签名**的意义：拿到一张 pause 票，改 action=destroy 用不了。
+        // 若当初用一个笼统的 `ctl` 动作 + 未签名路径来区分操作，这里就会通过。
+        let gw = Gateway::new_random(String::new());
+        let url = gw.mint("sb1", Action::Pause, 0, 60, 1000);
+        let mut q = parse_query(&url);
+        q.insert("action".into(), "destroy".into());
+        assert!(gw.verify(&q, 1000).is_err());
+    }
+
+    #[test]
+    fn control_mint_url_path_matches_action() {
+        // 控制面同样遵守「路由段 == action 名」的契约（api.rs serve_gw_ticket 按此匹配）。
+        let gw = Gateway::new_random(String::new());
+        for (a, seg) in [
+            (Action::Pause, "/gw/pause?"),
+            (Action::Resume, "/gw/resume?"),
+            (Action::Fork, "/gw/fork?"),
+            (Action::Destroy, "/gw/destroy?"),
+            (Action::Keepalive, "/gw/keepalive?"),
+            (Action::Expose, "/gw/expose?"),
+            (Action::Unexpose, "/gw/unexpose?"),
+            (Action::Exposes, "/gw/exposes?"),
+        ] {
+            assert!(gw.mint("sb1", a, 0, 60, 1000).contains(seg), "{} 路由段不符", a.as_str());
+        }
     }
 
     #[test]

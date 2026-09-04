@@ -760,3 +760,8 @@ jobs:
         run: ./target/debug/sl-node --quota-reconcile --etcd http://127.0.0.1:2379
       - name: M3-Q7 保留期+版本钉住对账（过期 GC / 版本兼容矩阵 / 存储配额，真 etcd）
         run: ./target/debug/sl-node --retention-reconcile --etcd http://127.0.0.1:2379
+      # M3-Q3 数据面 + 控制面跨节点中继。此前**只在本地跑过、从未进 CI**——网关拆分那一
+      # 步的活证（真网关 + 两个真节点代理 + mTLS 握手）因此没有回归护栏。verify 脚本自带
+      # 明文/mTLS 两趟 + openssl 造证书验"无客户端证书握手被拒"。
+      - name: M3-Q3 网关数据面/控制面跨节点对账（明文 + mTLS + 强制客户端证书，真 etcd）
+        run: ./scripts/verify-gw-dataplane.sh http://127.0.0.1:2379

@@ -302,6 +302,21 @@ sl-node --serve --etcd http://A:2379 --gw gw:7880 --gw-url http://gw:7879 --gw-t
 要产出的证据（对齐 M3-Q10 判据）：
 
 - 跨节点创建/调度：沙箱落到非本副本的节点上，`/v1/sandboxes` 三副本视图一致。
+- **跨节点生命周期端到端**（M3 W4 余项，至今只验到中继层，端到端要 KVM + 多节点）：
+  在**不持有该沙箱的副本**上依次打 keepalive → pause → resume → fork → destroy，每一步都应
+  正常返回，而不是 404。这条现在是**新代码的唯一端到端缺口**，三节点这一趟必须带回来：
+
+  ```bash
+  SID=$(curl -sX POST http://B:7878/v1/sandboxes -d '{"template":"hello"}' | jq -r .id)
+  # 归属只在 etcd 里（meta JSON 不含 node 字段）——确认归属**不是** C，再全程打 C。
+  etcdctl --endpoints=http://A:2379 get --print-value-only "sandbox/$SID/node"
+  for op in keepalive pause resume fork; do                        # 全部打到 **C**
+    echo "== $op"; curl -si -X POST http://C:7878/v1/sandboxes/$SID/$op -d '{}' | head -1
+  done
+  curl -si -X DELETE http://C:7878/v1/sandboxes/$SID | head -1     # 期望 204，不是 404
+  ```
+
+  同时查 `GET /v1/audit`：跨节点的每一条变更都该在册（转发路径的审计此前是漏的，已修）。
 - 创建/恢复分位达 §8.1 口径（同 `slo-gate.sh`，但样本来自跨节点路径）。
 - 节点故障回收在 SLO 内：杀掉一台，心跳 lease 过期 → leader 回收其名下沙箱的耗时。
 - 选主切换 / 网关副本切换不破坏 SLO。
