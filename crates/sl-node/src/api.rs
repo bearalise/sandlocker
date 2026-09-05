@@ -228,7 +228,9 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     {
         let hb_store = open_store(cfg, db_str)?;
         let node_id_hb = node_id.clone();
-        let meta = format!(r#"{{"addr":"{addr}"}}"#);
+        // 心跳键的值现在带**容量**（cpus/mem_mib）——调度器据此决定往哪台放（sched.rs）。
+        // 随心跳刷新而非只写一次：机器规格可能因重启/内核参数（如 `mem=128G maxcpus=64`）变化。
+        let meta = crate::sched::local_capacity(&addr).to_json();
         // 心跳租约窗 max(tick*3, 15s)；续租周期 ~ttl/3。
         let ttl = std::cmp::max(cfg.tick_secs as i64 * 3, 15);
         let period = std::cmp::max((ttl / 3) as u64, 1);
@@ -240,6 +242,10 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                     Some(l) => sl_store::cluster::heartbeat(hb_store.as_ref(), l).is_ok(),
                     None => false,
                 };
+                // 续租只延长租约，不更新值——容量若变了（重启改内核参数）得重写一次。
+                if alive {
+                    let _ = hb_store.put(&sl_store::cluster::node_key(&node_id_hb), meta.as_bytes(), lease);
+                }
                 if !alive {
                     // 租约丢失（被 sweep/首次注册失败）→ 重新注册，恢复存活。
                     lease = sl_store::cluster::register_node(hb_store.as_ref(), &node_id_hb, meta.as_bytes(), ttl).ok();
@@ -290,6 +296,10 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         }
     });
 
+    // 模板根提前泄漏成 'static：网关监听线程与数据面外拨代理都要它（`/gw/create` 要按模板名
+    // 解析模板目录），两者都是 'static 线程。
+    let troot: &'static Path = Box::leak(template_root.clone().into_boxed_path());
+
     // M2 W10 数据面网关（ADR-22）：独立监听（默认 127.0.0.1:7879），与控制面同进程共享 orch + secret。
     let gw_addr = cfg.gw_addr.clone().unwrap_or_else(|| "127.0.0.1:7879".to_string());
     // M3 W5：集群模式网关走**共享 secret + store 一次性 nonce**（任一副本验任一副本签发的 ticket、
@@ -314,7 +324,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                     for conn in gwl.incoming().flatten() {
                         let (g, s, x) = (Arc::clone(&gw_l), Arc::clone(&sh_l), Arc::clone(&ex_l));
                         thread::spawn(move || {
-                            if let Err(e) = handle_gw_conn(conn, &s, &g, &x) {
+                            if let Err(e) = handle_gw_conn(conn, &s, &g, &x, troot) {
                                 eprintln!("[sandlocker] 网关连接错误: {e}");
                             }
                         });
@@ -337,7 +347,11 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     );
 
     // M3 W5 余项（ADR-22）：集群身份 + 网关基址。`--gw-url` 未给 = 单机，跨节点转发整条关掉（零回归）。
-    let rt: SharedRemote = Arc::new(Remote { node_id: node_id.clone(), gw_url: cfg.gw_url.clone() });
+    let rt: SharedRemote = Arc::new(Remote {
+        node_id: node_id.clone(),
+        gw_url: cfg.gw_url.clone(),
+        sched: crate::sched::Policy { overcommit: cfg.sched_overcommit },
+    });
 
     // M3 W5 余项：节点侧**主动外拨**代理——预拨若干持久连接停在独立网关上，供网关反向借用
     // 服务本节点沙箱的数据面请求。**节点不因此监听任何入站端口**。
@@ -361,7 +375,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                 // 网关已验签并下发 ticket；这里读它复刻的 HTTP 请求，走**与进程内网关同一段**分发。
                 match read_request(&mut ch) {
                     Ok((method, path, _k, body)) => {
-                        if let Err(e) = serve_gw_ticket(&mut ch, &ticket, &method, &path, &body, &sh, &ex) {
+                        if let Err(e) = serve_gw_ticket(&mut ch, &ticket, &method, &path, &body, &sh, &ex, troot) {
                             eprintln!("[sandlocker][gw-agent] 服务 {} 失败: {e}", ticket.sid);
                         }
                     }
@@ -373,7 +387,6 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
         println!("[sandlocker] 数据面外拨就绪 → {gw_node}（node={node_id} pool={}，节点零入站）", cfg.gw_pool);
     }
 
-    let troot: &'static Path = Box::leak(template_root.into_boxed_path());
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -661,6 +674,8 @@ pub(crate) struct Remote {
     pub node_id: String,
     /// 独立网关面向客户端的基址（`http://host:port`，`--gw-url`）。
     pub gw_url: Option<String>,
+    /// 放置策略（`--sched-overcommit`）。
+    pub sched: crate::sched::Policy,
 }
 
 type SharedRemote = Arc<Remote>;
@@ -707,6 +722,39 @@ fn forward_via_gw<S: Read + Write>(
     extra_query: &str,
     body: &[u8],
 ) -> Result<u16, String> {
+    let (code, _) = relay_via_gw(Some(client), rt, gw, sid, action, port, method, extra_query, body)?;
+    Ok(code)
+}
+
+/// 同上，但**缓冲**响应并交回调用方，不直接回灌客户端。
+///
+/// 创建走这条：副本拿到新沙箱 id 之后还要给它打项目归属键（`sandbox/<id>/project`），
+/// 所以响应必须先读到手。响应是一小段 JSON，缓冲无妨——真正不能缓冲的是 exec 流那种
+/// 未定长的增量响应，那条仍走上面的流式路径。
+fn forward_via_gw_buffered(
+    rt: &Remote,
+    gw: &Gateway,
+    sid: &str,
+    action: Action,
+    method: &str,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    relay_via_gw(None::<&mut TcpStream>, rt, gw, sid, action, 0, method, "", body)
+}
+
+/// 中继实现。`client=Some` → 逐块回灌（流不被缓冲住）；`None` → 缓冲整条响应回传。
+#[allow(clippy::too_many_arguments)]
+fn relay_via_gw<S: Read + Write>(
+    mut client: Option<&mut S>,
+    rt: &Remote,
+    gw: &Gateway,
+    sid: &str,
+    action: Action,
+    port: u32,
+    method: &str,
+    extra_query: &str,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
     let base = rt.gw_url.as_deref().ok_or("未配置 --gw-url，无法跨节点转发")?;
     let host_port = base.trim_start_matches("http://").trim_end_matches('/');
     // mint 出的是 `{base}/gw/{path}?...`；这里只要路径+query 部分。
@@ -727,11 +775,12 @@ fn forward_via_gw<S: Read + Write>(
     let mut buf = vec![0u8; 32 * 1024];
     let mut code = 0u16;
     let mut head = Vec::new();
+    let mut collected = Vec::new();
     loop {
         match up.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                // 只从**第一块**里嗅状态码（`HTTP/1.1 <code> ...`），不缓冲整体响应。
+                // 只从**第一块**里嗅状态码（`HTTP/1.1 <code> ...`），流式时不缓冲整体响应。
                 if code == 0 {
                     head.extend_from_slice(&buf[..n.min(64)]);
                     if let Some(c) = String::from_utf8_lossy(&head)
@@ -742,18 +791,111 @@ fn forward_via_gw<S: Read + Write>(
                         code = c;
                     }
                 }
-                client.write_all(&buf[..n]).map_err(|e| format!("回灌客户端失败: {e}"))?;
-                client.flush().ok();
+                match client.as_deref_mut() {
+                    Some(c) => {
+                        c.write_all(&buf[..n]).map_err(|e| format!("回灌客户端失败: {e}"))?;
+                        c.flush().ok();
+                    }
+                    None => collected.extend_from_slice(&buf[..n]),
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("读网关响应失败: {e}")),
         }
     }
     // 网关一字未回（连接被掐）→ 记 502，别谎报 200。
-    Ok(if code == 0 { 502 } else { code })
+    Ok((if code == 0 { 502 } else { code }, collected))
+}
+
+/// 从一小段 JSON 里取某个字符串字段（免去为一次取值反序列化整个响应）。
+fn json_str_field(body: &[u8], key: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let needle = format!("\"{key}\":\"");
+    let rest = text.split_once(&needle)?.1;
+    Some(rest.split('"').next()?.to_string())
+}
+
+/// 从缓冲的 HTTP 响应里取 body（头与体以空行分隔）。
+fn split_http_body(raw: &[u8]) -> &[u8] {
+    raw.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| &raw[i + 4..])
+        .unwrap_or(&[])
 }
 
 // ————————————————————— 分派 / handler —————————————————————
+
+/// 创建请求的放置决策（M3 调度器）。
+///
+/// 返回 `Some(结果)` = 已经把创建转给别的节点并把响应回给了客户端，调用方就此结束；
+/// 返回 `None` = 该在**本节点**建（选中自己 / 未启用集群 / 盘点不出可用节点），调用方照旧走
+/// 本地 `dispatch`。
+///
+/// **未启用集群（无 `--gw-url`）时永远返回 None**——单机行为一字未变。
+///
+/// 盘点失败、没有节点放得下、或选中自己，都退回本地：调度是**优化**，不该成为创建的新故障源。
+/// 唯一的例外是配额——那是**拒绝**语义，必须在建 VM 之前判，且判在本副本（它才知道调用者的项目）。
+fn schedule_create<S: Read + Write>(
+    stream: &mut S,
+    shared: &Shared,
+    rt: &Remote,
+    gw: &Gateway,
+    auth: &SharedAuth,
+    body: &[u8],
+    project: Option<&str>,
+) -> Option<Result<(), String>> {
+    let json = "application/json";
+    if rt.gw_url.is_none() {
+        return None; // 单机：无网关可转，零回归
+    }
+    // 规格取值须与 create_sandbox 的默认值一致，否则按 2c/512M 选节点、实际建出别的规格。
+    let v: serde_json::Value = serde_json::from_slice(if body.is_empty() { b"{}" } else { body }).ok()?;
+    let vcpus = v.get("cpu").and_then(|x| x.as_u64()).unwrap_or(2);
+    let mem = v.get("mem").and_then(|x| x.as_u64()).unwrap_or(512);
+
+    let (nodes, self_id) = {
+        let o = shared.lock().unwrap();
+        (o.survey_nodes().ok()?, rt.node_id.clone())
+    };
+    let target = crate::sched::place(&nodes, vcpus, mem, &self_id, rt.sched)?;
+    if target == self_id {
+        return None; // 就该在本节点建
+    }
+
+    // 配额前置检查（FR-7.2）留在本副本：目标节点收到的是一张不带项目信息的创建票
+    // （见下），它无从判「这个项目还剩多少额度」。ADR-25 要求 create 在建 VM 之前判。
+    if let Some(p) = project {
+        if let Err(e) = crate::quota::check(auth.store.as_ref(), p, vcpus, mem, 0) {
+            let code = quota_status(&e);
+            return Some(write_response(stream, code, json, &err_json(&e)).map(|_| {
+                crate::metrics::metrics().record_api(code);
+            }));
+        }
+    }
+
+    // 转给目标节点。票的 sid 装 `node:<id>`——目标在签名内，改不了（见 gateway::NODE_TARGET_PREFIX）。
+    let sid = format!("{}{target}", crate::gateway::NODE_TARGET_PREFIX);
+    let (code, raw) = match forward_via_gw_buffered(rt, gw, &sid, Action::Create, "POST", body) {
+        Ok(v) => v,
+        Err(e) => {
+            // 转发失败不静默退回本地：本地建会绕过刚做出的放置决策，把实例又堆回这台。
+            eprintln!("[sandlocker] 调度到 {target} 失败: {e}");
+            return Some(write_response(stream, 502, json, &err_json(&format!("调度到节点 {target} 失败: {e}"))));
+        }
+    };
+    crate::metrics::metrics().record_api(code);
+    let resp = split_http_body(&raw).to_vec();
+
+    // 项目归属键由**本副本**补写——目标节点不知道调用者的项目，而把项目塞进转发体属于
+    // 「采信未签名字段」。租约从新沙箱的 meta 键上读（目标节点写的那个），于是回收撤租时
+    // 这个键一并被删，不会留成孤儿。
+    if code == 201 {
+        if let (Some(p), Some(id)) = (project, json_str_field(&resp, "id")) {
+            let _ = shared.lock().unwrap().tag_project(&id, p);
+        }
+    }
+    Some(write_response(stream, code, json, &resp))
+}
 
 /// M3 W7 审计（FR-7.3）：鉴权模式下记录变更操作（append-only）。审计失败不阻断响应。
 ///
@@ -813,6 +955,15 @@ fn handle_conn(
             Err((code, b)) => return write_response(&mut stream, code, json, &b),
         },
     };
+    // 创建请求：先**选一个节点**（M3 调度器）。选中别人就把创建整个转过去。
+    // 这一步之前，沙箱恒落在收到请求的副本上——三副本前挂个轮询 LB 看着像均衡，
+    // 直接打某一台就全堆在那一台。见 sched.rs 模块头。
+    if matches!(route, Route::CreateSandbox) {
+        match schedule_create(&mut stream, shared, rt, gw, auth, &body, project.as_deref()) {
+            Some(r) => return r,
+            None => {} // 选中本节点 / 未启用调度 / 盘点失败 → 走本地路径（下面的 dispatch）
+        }
+    }
     // 沙箱不在本节点 → 经独立网关中继到 owning 节点（数据面 M3 W5 余项，控制面 M3 W4 余项）。
     if let (Some((action, m, port, extra)), Some(id)) = (forwardable_route(&route), route.sandbox_id()) {
         if remote_owner(shared, rt, id).is_some() {
@@ -1153,6 +1304,7 @@ fn handle_gw_conn(
     shared: &Shared,
     gw: &SharedGw,
     exposes: &Exposes,
+    template_root: &Path,
 ) -> Result<(), String> {
     // 网关连接靠 ticket 验签授权（非 API Key），忽略 header 里的 api_key。
     let (method, path, _api_key, body) = read_request(&mut stream)?;
@@ -1163,7 +1315,7 @@ fn handle_gw_conn(
             return write_response(&mut stream, 403, "application/json", &err_json(&format!("ticket 无效: {e}")))
         }
     };
-    serve_gw_ticket(&mut stream, &ticket, &method, &path, &body, shared, exposes)
+    serve_gw_ticket(&mut stream, &ticket, &method, &path, &body, shared, exposes, template_root)
 }
 
 /// 按**已验签**的 ticket 就地服务一次数据面 / 控制面请求（沙箱须在本节点）。
@@ -1178,6 +1330,7 @@ pub(crate) fn serve_gw_ticket<S: Read + Write>(
     body: &[u8],
     shared: &Shared,
     exposes: &Exposes,
+    template_root: &Path,
 ) -> Result<(), String> {
     let json = "application/json";
     let q = parse_query(path);
@@ -1323,6 +1476,15 @@ pub(crate) fn serve_gw_ticket<S: Read + Write>(
         ("/gw/exposes", Action::Exposes) => {
             write_response(stream, 200, json, &list_exposes(&ticket.sid, exposes))
         }
+        // 调度器把创建转到了本节点（`ticket.sid` = `node:<本节点 id>`，目标在签名内）。
+        //
+        // **project 传 None，不是漏了**：调用者的项目只有收到 API 请求的那个副本知道，
+        // 而把它塞进转发体就等于采信一个未签名字段。所以配额前置检查与项目归属键
+        // 都留在发起副本那边（见 `schedule_create`），这里只管把 VM 建出来。
+        ("/gw/create", Action::Create) => match create_sandbox(body, shared, template_root, None) {
+            Ok(v) => write_response(stream, 201, json, &v),
+            Err(e) => write_response(stream, quota_status(&e), json, &err_json(&e)),
+        },
         _ => write_response(stream, 403, json, &err_json("ticket 动作与路径不符")),
     }
 }

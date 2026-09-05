@@ -765,7 +765,7 @@ jobs:
         run: scripts/bench/slo-gate.sh build/bench/results.jsonl
       # 机制断言：跨节点路由通、三副本视图一致、失联回收发生、幸存副本仍可服务。
       # 这四件事与 mode 无关——同机也该成立，不成立就是真坏了。
-      - name: 机制断言（与 mode 无关的四条）
+      - name: 机制断言（与 mode 无关的五条）
         run: |
           F=build/bench/results.jsonl
           fail=0
@@ -776,9 +776,14 @@ jobs:
           need '"view_consistent":true'  "三副本视图不一致"
           need '"xnode_resume_p50_ms"'   "跨节点 pause/resume 一个样本都没取到（跨节点路由不通？）"
           need '"api_available":true'    "杀掉一个节点后幸存副本不可服务"
+          # 放置：创建全打同一个副本，没有调度器时会全落在它头上（distinct_owners=1）。
+          # 同机三守护各自上报**整台机器**的容量，聚合容量因此是虚高的——所以这只验"铺开了"，
+          # 不验容量账目对不对；后者要 multi-host。
+          own=$(grep -o '"distinct_owners":[0-9]*' "$F" | tail -1 | cut -d: -f2)
+          [ -n "$own" ] && [ "$own" -ge 2 ] || { echo "✗ 放置未铺开（distinct_owners=${own:-无}，调度器没生效？）"; fail=1; }
           obs=$(grep -o '"observed_s":-\?[0-9]*' "$F" | tail -1 | cut -d: -f2)
           [ -n "$obs" ] && [ "$obs" != "-1" ] || { echo "✗ 观测窗内未见失联回收（observed_s=${obs:-无})"; fail=1; }
-          [ "$fail" = 0 ] && echo "✓ 集群机制四条全过（mode=single-host，非 M3-Q10 取证）"
+          [ "$fail" = 0 ] && echo "✓ 集群机制五条全过（mode=single-host，非 M3-Q10 取证）"
           exit $fail
       - name: 上传基准结果
         if: always()
@@ -840,3 +845,7 @@ jobs:
       # 明文/mTLS 两趟 + openssl 造证书验"无客户端证书握手被拒"。
       - name: M3-Q3 网关数据面/控制面跨节点对账（明文 + mTLS + 强制客户端证书，真 etcd）
         run: ./scripts/verify-gw-dataplane.sh http://127.0.0.1:2379
+      # M3-Q10 的「跨节点**调度**」那一半。单测验的是排序，这里验的是**闭环**：
+      # 上一次放置写进 store 后，下一次盘点必须看得见——看不见就不是调度器，是随机挑一个。
+      - name: M3-Q10 放置对账（盘点→选点→落账→再盘点闭环 + 容量准入 + 失联退出，真 etcd）
+        run: ./target/debug/sl-node --sched-reconcile --etcd http://127.0.0.1:2379

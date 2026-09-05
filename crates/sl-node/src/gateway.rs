@@ -55,7 +55,18 @@ pub enum Action {
     Unexpose,
     /// 列暴露（读，但暴露注册表是**节点进程内**状态，别的副本看不到）。
     Exposes,
+    /// **在指定节点上创建沙箱**（M3 调度器）。创建时还没有沙箱 id，所以这张票的 `sid` 字段
+    /// 装的是 **`node:<node_id>`** 路由目标（见 [`NODE_TARGET_PREFIX`]）——目标节点因此
+    /// 也在签名内，改不了。
+    Create,
 }
+
+/// ticket 的 `sid` 字段以此开头时，它不是沙箱 id，而是**直接指定的目标节点**。
+///
+/// 网关平时按 `sandbox/<sid>/node` 查归属来路由；但创建请求还没有沙箱，无从查起。
+/// 把目标写进 `sid` 而不是另加一个查询参数，是因为 `sid` **在签名内**——
+/// 换句话说，一张发往节点 A 的创建票不能被改成发往节点 B。
+pub const NODE_TARGET_PREFIX: &str = "node:";
 
 impl Action {
     pub fn as_str(self) -> &'static str {
@@ -73,6 +84,7 @@ impl Action {
             Action::Expose => "expose",
             Action::Unexpose => "unexpose",
             Action::Exposes => "exposes",
+            Action::Create => "create",
         }
     }
     pub fn from_str(s: &str) -> Option<Action> {
@@ -90,6 +102,7 @@ impl Action {
             "expose" => Some(Action::Expose),
             "unexpose" => Some(Action::Unexpose),
             "exposes" => Some(Action::Exposes),
+            "create" => Some(Action::Create),
             _ => None,
         }
     }
@@ -107,6 +120,14 @@ pub struct Ticket {
     pub sid: String,
     pub action: Action,
     pub port: u32,
+}
+
+impl Ticket {
+    /// 这张票是否直指某个节点（`sid` = `node:<node_id>`）；是则返回该 node id。
+    /// 仅创建票会这样——其余票的 `sid` 是真的沙箱 id，由网关查归属键路由。
+    pub fn node_target(&self) -> Option<&str> {
+        self.sid.strip_prefix(NODE_TARGET_PREFIX)
+    }
 }
 
 /// HMAC-SHA256（手写，复用 sha2；守精简依赖不引 hmac crate）。

@@ -185,17 +185,39 @@ say "mode=$MODE（$DISTINCT 个不同主机 / $R 个副本）"
 [ "$MODE" = "single-host" ] && \
   say "⚠️  同机三守护只证明**机制**跑通；M3-Q10 的 SLO 取证须 multi-host（slo-gate 严格档会拒收）"
 
-# ————————————————————— ① 拓扑 + 视图一致 + 归属 —————————————————————
-say "① 建沙箱（经副本 0）+ 查三副本视图一致 ..."
-resp="$(http POST "${REPLICAS[0]}/v1/sandboxes" "{\"template\":\"$TEMPLATE\",\"ttl\":900,\"idle\":900}")"
-if [ "$(code_of "$resp")" != "201" ]; then
-  say "建沙箱失败：$(code_of "$resp") $(body_of "$resp")"
+# ————————————————————— ① 拓扑 + 放置铺开 + 视图一致 —————————————————————
+#
+# **全部创建都打副本 0**。这是判据的关键：若没有调度器，`Orch::register` 会把每个沙箱都
+# 记在收请求的那个副本头上，`distinct_owners` 恒为 1；有调度器则应铺到多个节点上。
+# 只建一个沙箱是看不出区别的——冷启动时所有节点等空，调度器也会（合理地）选中本节点。
+PLACE_N="${CLUSTER_PLACE_N:-3}"
+say "① 经副本 0 连建 $PLACE_N 个沙箱，看放置是否铺开 ..."
+SIDS=(); OWNERS=()
+for i in $(seq 1 "$PLACE_N"); do
+  resp="$(http POST "${REPLICAS[0]}/v1/sandboxes" "{\"template\":\"$TEMPLATE\",\"ttl\":900,\"idle\":900}")"
+  if [ "$(code_of "$resp")" != "201" ]; then
+    say "第 $i 个建沙箱失败：$(code_of "$resp") $(body_of "$resp")"
+    break
+  fi
+  sid="$(body_of "$resp" | grep -oE '"id":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  own="$(etcd_get "sandbox/$sid/node")"
+  SIDS+=("$sid"); OWNERS+=("$own")
+  say "  $sid → ${own:-未知}"
+done
+if [ "${#SIDS[@]}" -eq 0 ]; then
   emit "{\"metric\":\"cluster_topology\",\"mode\":\"$MODE\",\"skipped\":true,\"reason\":\"create-failed\"}"
   exit 0
 fi
-SID="$(body_of "$resp" | grep -oE '"id":"[^"]*"' | head -1 | cut -d'"' -f4)"
-OWNER="$(etcd_get "sandbox/$SID/node")"
-say "沙箱 $SID 归属 ${OWNER:-未知}"
+DISTINCT_OWNERS="$(printf '%s\n' "${OWNERS[@]}" | sort -u | grep -c .)"
+# placement=caller-local 意味着**没有调度器在起作用**——全部落在收请求的那个副本上。
+PLACEMENT="scheduled"; [ "$DISTINCT_OWNERS" -le 1 ] && PLACEMENT="caller-local"
+
+# 后续生命周期/回收都拿第一个沙箱做，其余的先销毁，免得在各节点上白挂到 TTL。
+SID="${SIDS[0]}"; OWNER="${OWNERS[0]}"
+for i in $(seq 1 $(( ${#SIDS[@]} - 1 )) ); do
+  [ "$i" -lt "${#SIDS[@]}" ] && http DELETE "${REPLICAS[0]}/v1/sandboxes/${SIDS[$i]}" >/dev/null
+done
+say "取 $SID（归属 ${OWNER:-未知}）继续；放置铺到 $DISTINCT_OWNERS 个节点（placement=$PLACEMENT）"
 
 VIEW_OK=1
 for r in "${REPLICAS[@]}"; do
@@ -203,15 +225,10 @@ for r in "${REPLICAS[@]}"; do
   [ "$c" = "200" ] || { VIEW_OK=0; say "副本 $r 看不到 $SID（$c）"; }
 done
 
-# 归属是**调度出来的**还是**谁收到请求就落谁身上**？现实是后者：`Orch::register` 直接写本副本
-# 的 node_id，创建路径从不查 `node/` 存活集。这一格如实记录，免得「跨节点创建/调度」被
-# 一份只证明了"另外两个副本看得见"的数据糊弄过去。
-PLACEMENT="caller-local"
-[ -n "$OWNER" ] && [ "$OWNER" != "${NODE_IDS[0]}" ] && PLACEMENT="scheduled"
-
 LEADER="$(etcd_get "cluster/leader")"
 emit "{\"metric\":\"cluster_topology\",\"mode\":\"$MODE\",\"replicas\":$R,\"distinct_hosts\":$DISTINCT,\
 \"view_consistent\":$([ "$VIEW_OK" = 1 ] && echo true || echo false),\"placement\":\"$PLACEMENT\",\
+\"created\":${#SIDS[@]},\"distinct_owners\":$DISTINCT_OWNERS,\
 \"leader\":\"${LEADER:-}\",\"owner\":\"${OWNER:-}\",\"tick_secs\":$TICK}"
 
 # ————————————————————— ② 跨节点生命周期分位 —————————————————————

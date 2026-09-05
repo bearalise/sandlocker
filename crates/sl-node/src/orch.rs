@@ -532,11 +532,22 @@ impl<'a> Orch<'a> {
 
     /// 给沙箱打项目归属键 `sandbox/<id>/project`（同其 lease → 随回收一并删）。M3 W6 多租户。
     pub fn tag_project(&mut self, id: &str, project: &str) -> Result<(), String> {
-        let lease = self.live.get(id).map(|m| m.lease);
+        // 租约优先取本进程的 live 表；**沙箱建在别的节点时**（调度器把创建转走了）本表里没有它，
+        // 退而从 store 里那条 meta 键上读同一个租约。挂对租约要紧——回收是靠撤租连带删键的，
+        // 挂不上租约的项目键会在沙箱消失后留成孤儿，把配额永久算在那个项目头上。
+        let lease = match self.live.get(id).map(|m| m.lease) {
+            Some(l) => Some(l),
+            None => self.store.get(&meta_key(id)).map_err(|e| e.to_string())?.and_then(|kv| kv.lease),
+        };
         self.store
             .put(&format!("sandbox/{id}/project"), project.as_bytes(), lease)
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// 盘点存活节点及其已分配用量（M3 调度器）。见 `sched::survey`。
+    pub fn survey_nodes(&self) -> Result<Vec<crate::sched::NodeLoad>, String> {
+        crate::sched::survey(self.store.as_ref())
     }
 
     /// 列审计条目（M3 W7，FR-7.3）：`project=Some(p)` 只返回 actor==p 的条目，`None` 全部。
