@@ -811,7 +811,7 @@ fn handle_client(
     take_wait: Duration,
 ) -> Result<(), String> {
     sock.set_nodelay(true).ok();
-    let (method, path, _api_key, body) = crate::api::read_request(&mut sock)?;
+    let (method, path, _api_key, _tp, body) = crate::api::read_request(&mut sock)?;
     let json = "application/json";
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

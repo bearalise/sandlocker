@@ -513,6 +513,10 @@ jobs:
           cargo build -p sl-envd --release --target x86_64-unknown-linux-musl
       - name: 单测（sl-proto 契约 / sl-node fcapi+api 路由 / sl-store 窄接口 / sandlocker CLI）
         run: cargo test -p sl-proto -p sl-node -p sl-store -p sandlocker
+      # M3-Q5 追踪导出：起真 HTTP 收集器收一份真 OTLP 载荷。手写 exporter 最容易错的两处
+      # （纳秒写成 JSON number、跨进程 parentSpanId 断链）单测覆盖不到，这里兜住。免 etcd/KVM。
+      - name: M3-Q5 追踪导出对账（真 OTLP/HTTP-JSON 载荷 + 跨进程链路接得上）
+        run: ./target/release/sl-node --otlp-reconcile
       - name: Python SDK 单测（假 daemon + 契约对账，无需 KVM）
         # W9：SDK 纯 stdlib，起进程内假 daemon 模拟 openapi 路由，验请求构造/响应解析 +
         # ROUTES 与 openapi.yaml 对齐（契约漂移防线，替代 codegen）。托管 runner 自带 python3。

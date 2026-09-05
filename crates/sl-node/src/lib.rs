@@ -61,6 +61,8 @@ mod retention;
 // M3 W4 余项补完（M3-Q10）：多节点**放置**。W4 只做了跨节点可见性，创建路径从不查存活
 // 节点集——沙箱落在哪全看客户端打给了谁。见模块头。
 mod sched;
+// M3 W8 余项（M3-Q5）：OTLP/HTTP-JSON 分布式追踪导出。手写，零新增 crate、零 tokio。
+mod trace;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -316,6 +318,7 @@ struct Config {
     quota_reconcile: bool,
     retention_reconcile: bool,
     sched_reconcile: bool,
+    otlp_reconcile: bool,
     /// --sched-overcommit <n>：放置时的内存/CPU 超售倍数（默认 1 = 不超售）。
     ///
     /// >1 表示部署方**主动选择**吃 Firecracker 惰性缺页那份收益（M3-Q9 实测：配置 512MiB 的
@@ -325,6 +328,9 @@ struct Config {
     /// --log-sink <url>：M3 W8 结构化日志转发 sink（Loki/ES/自建收集器）。--serve 时 create/destroy
     /// 生命周期事件以 JSON POST 转发。未设=不转发（零回归）。
     log_sink: Option<String>,
+    /// --otlp-endpoint <base>：OTLP/HTTP 追踪导出基址（如 `http://collector:4318`，
+    /// 也接受写全的 `.../v1/traces`）。不给 = 不追踪，全程 no-op（零回归）。见 trace.rs。
+    otlp_endpoint: Option<String>,
 }
 
 impl Config {
@@ -607,6 +613,18 @@ pub fn cli_main() {
             Ok(()) => println!("[retention] M3-Q7 retention-reconcile PASS"),
             Err(e) => {
                 eprintln!("[retention] M3-Q7 retention-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --otlp-reconcile：M3-Q5 追踪导出对账（真 HTTP 收一份真载荷，验链路与 OTLP 编码）。
+    if cfg.otlp_reconcile {
+        match run_otlp_reconcile() {
+            Ok(()) => println!("[otlp] M3-Q5 otlp-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[otlp] M3-Q5 otlp-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2516,8 +2534,10 @@ fn clone_paths(cfg: &Config) -> Config {
         quota_reconcile: false,
         retention_reconcile: false,
         sched_reconcile: false,
+        otlp_reconcile: false,
         sched_overcommit: 1,
         log_sink: None,
+        otlp_endpoint: None,
 }
 }
 
@@ -2812,6 +2832,172 @@ fn run_retention_reconcile(cfg: &Config) -> Result<(), String> {
     let _ = std::fs::remove_file(format!("{p}-shm"));
     r?;
     println!("[retention] SqliteStore(file) 保留期 GC + 版本兼容矩阵 + 存储配额 PASS");
+    Ok(())
+}
+
+/// M3-Q5 追踪导出对账：起一个**真 HTTP 收集器**，画一条创建形状的链路，收下真载荷再验。
+///
+/// 单测验的是编码函数的输出；这里验的是**整条路**——后台线程真的把批发出去了、发的是
+/// OTLP/HTTP-JSON、父子关系连得上、一次创建落在**同一个 traceId** 下。
+/// 手写 exporter 最容易错的两处（纳秒写成 JSON number、parentSpanId 漏填）都在这里兜住。
+fn run_otlp_reconcile() -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    macro_rules! want {
+        ($c:expr, $m:expr) => {
+            if !$c {
+                return Err($m.into());
+            }
+        };
+    }
+
+    // —— 假 Collector：收一次 POST，把 body 交回来 ——
+    let l = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind 失败: {e}"))?;
+    let addr = l.local_addr().map_err(|e| e.to_string())?;
+    let (tx, rx) = mpsc::channel::<(String, String)>();
+    std::thread::spawn(move || {
+        for mut sock in l.incoming().flatten() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // 读到 header 结束，再按 Content-Length 读满。
+            let head_end = loop {
+                match sock.read(&mut chunk) {
+                    Ok(0) => break buf.len(),
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p;
+                        }
+                    }
+                    Err(_) => break buf.len(),
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let want_len: usize = head
+                .split("\r\n")
+                .find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + 4 + want_len {
+                match sock.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let body = String::from_utf8_lossy(&buf[head_end + 4..]).to_string();
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            let _ = tx.send((head, body));
+        }
+    });
+
+    crate::trace::init(Some(format!("http://{addr}")), "otlp-reconcile-node#1");
+    want!(crate::trace::enabled(), "init 后 enabled() 应为 true");
+
+    // —— 画一条「跨节点创建」形状的链路 ——
+    // 根（API，副本 X）→ schedule → relay.create ──跨进程──→ node.create → 四个分段
+    let mut root = crate::trace::Span::start("POST /v1/sandboxes", crate::trace::SpanKind::Server, None);
+    root.attr("http.request.method", "POST");
+    let trace_id = root.ctx().trace_id.clone();
+    let root_id = root.ctx().span_id.clone();
+
+    let sched = crate::trace::Span::start("schedule", crate::trace::SpanKind::Internal, Some(root.ctx()));
+    sched.end(None);
+
+    let relay = crate::trace::Span::start("relay.create", crate::trace::SpanKind::Client, Some(root.ctx()));
+    let tp = relay.ctx().to_traceparent();
+    relay.end(None);
+
+    // 目标节点侧：只拿到 traceparent 字符串，从它接着画（生产里就是 `/gw/create` 那条路）。
+    let remote = crate::trace::SpanCtx::from_traceparent(&tp).ok_or("traceparent 解析失败")?;
+    let node = crate::trace::Span::start("node.create", crate::trace::SpanKind::Internal, Some(&remote));
+    let node_ctx = node.ctx().clone();
+    let mut at = 1_700_000_000_000_000_000u128;
+    for (n, ms) in [("rootfs.copy", 3u128), ("vmm.api_ready", 40), ("snapshot.load", 12), ("vm.resume", 5)] {
+        at = crate::trace::Span::child_segment(&node_ctx, n, at, ms);
+    }
+    node.end(None);
+    // 一条失败的 span：状态须是 ERROR(2)。
+    let bad = crate::trace::Span::start("node.create", crate::trace::SpanKind::Internal, Some(&remote));
+    bad.end(Some("模板不存在"));
+    root.attr("http.response.status_code", 201u16);
+    root.end(None);
+
+    // —— 收载荷（攒批窗口 2s，给足余量）——
+    let (head, body) = rx.recv_timeout(Duration::from_secs(15)).map_err(|_| "15s 内没收到 OTLP 上报".to_string())?;
+    want!(head.starts_with("POST /v1/traces "), format!("应 POST 到 /v1/traces，实得: {}", head.lines().next().unwrap_or("")));
+    want!(
+        head.to_lowercase().contains("content-type: application/json"),
+        "Content-Type 应为 application/json（OTLP/HTTP-JSON）"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("载荷非合法 JSON: {e}"))?;
+    let rs = &v["resourceSpans"][0];
+    want!(
+        rs["resource"]["attributes"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x["key"] == "service.name" && x["value"]["stringValue"] == "sandlocker"))
+            .unwrap_or(false),
+        "资源属性缺 service.name=sandlocker"
+    );
+    want!(
+        rs["resource"]["attributes"]
+            .as_array()
+            .map(|a| a.iter().any(|x| x["key"] == "service.instance.id"
+                && x["value"]["stringValue"] == "otlp-reconcile-node#1"))
+            .unwrap_or(false),
+        "资源属性缺 service.instance.id=<node id>（跨节点时靠它分辨是哪台机器）"
+    );
+    let spans = rs["scopeSpans"][0]["spans"].as_array().ok_or("载荷里没有 spans 数组")?;
+    want!(spans.len() >= 8, format!("应至少 8 个 span（根+schedule+relay+node+4 分段+失败），实得 {}", spans.len()));
+
+    // ① 全在同一条 trace 上——**这是「全链路」的字面含义**，跨节点那一跳最容易在这里断。
+    for s in spans {
+        want!(
+            s["traceId"] == serde_json::json!(trace_id),
+            format!("span {} 不在同一条 trace 上（{} != {trace_id}）", s["name"], s["traceId"])
+        );
+    }
+    // ② 纳秒是**字符串**。写成 JSON number 会失精度，Collector 静默丢 span。
+    for s in spans {
+        want!(s["startTimeUnixNano"].is_string() && s["endTimeUnixNano"].is_string(), "纳秒时间戳须是字符串");
+    }
+    // ③ 父子关系连得上：schedule/relay 挂根；node.create 挂 relay；四个分段挂 node.create。
+    let find = |n: &str| spans.iter().filter(|s| s["name"] == n).collect::<Vec<_>>();
+    let relay_span = find("relay.create");
+    want!(relay_span.len() == 1, "relay.create 应恰好一个");
+    want!(relay_span[0]["parentSpanId"] == serde_json::json!(root_id), "relay.create 应挂在根上");
+    let relay_id = relay_span[0]["spanId"].as_str().unwrap_or("").to_string();
+    let nodes: Vec<_> = find("node.create");
+    want!(nodes.len() == 2, "node.create 应两个（一成一败）");
+    for n in &nodes {
+        want!(
+            n["parentSpanId"] == serde_json::json!(relay_id),
+            format!("node.create 应挂在 relay.create 之下（跨进程接上），实得 parent={}", n["parentSpanId"])
+        );
+    }
+    let node_id = nodes
+        .iter()
+        .find(|n| n["status"].is_null())
+        .map(|n| n["spanId"].as_str().unwrap_or("").to_string())
+        .ok_or("找不到成功的 node.create")?;
+    for seg in ["rootfs.copy", "vmm.api_ready", "snapshot.load", "vm.resume"] {
+        let sp = find(seg);
+        want!(sp.len() == 1, format!("分段 {seg} 应恰好一个"));
+        want!(sp[0]["parentSpanId"] == serde_json::json!(node_id), format!("分段 {seg} 应挂在 node.create 之下"));
+    }
+    // ④ 失败的 span 带 ERROR 状态；成功的不带。
+    let failed = nodes.iter().find(|n| !n["status"].is_null()).ok_or("失败的 span 没带 status")?;
+    want!(failed["status"]["code"] == 2, "失败 span 的 status.code 应为 2（ERROR）");
+    // ⑤ 一个都没丢。
+    want!(crate::trace::dropped() == 0, format!("不该有丢弃，实得 {}", crate::trace::dropped()));
+
+    println!(
+        "[otlp] OTLP/HTTP-JSON 上报 {} 个 span，同一 traceId + 跨进程父子接得上 + 纳秒为字符串 + ERROR 状态 PASS",
+        spans.len()
+    );
     Ok(())
 }
 
@@ -3415,7 +3601,7 @@ fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
             },
             Arc::new(move |ticket, ch| {
                 let mut ch = ch;
-                let (_m, _p, _k, _b) = match crate::api::read_request(&mut ch) {
+                let (_m, _p, _k, _tp, _b) = match crate::api::read_request(&mut ch) {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -4031,8 +4217,10 @@ fn parse_args() -> Config {
         quota_reconcile: false,
         retention_reconcile: false,
         sched_reconcile: false,
+        otlp_reconcile: false,
         sched_overcommit: 1,
         log_sink: None,
+        otlp_endpoint: None,
 };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -4127,6 +4315,7 @@ fn parse_args() -> Config {
             "--quota-reconcile" => cfg.quota_reconcile = true,
             "--retention-reconcile" => cfg.retention_reconcile = true,
             "--sched-reconcile" => cfg.sched_reconcile = true,
+            "--otlp-reconcile" => cfg.otlp_reconcile = true,
             "--sched-overcommit" => {
                 cfg.sched_overcommit = take().parse().unwrap_or_else(|_| {
                     eprintln!("--sched-overcommit 需正整数");
@@ -4134,6 +4323,7 @@ fn parse_args() -> Config {
                 })
             }
             "--log-sink" => cfg.log_sink = Some(take()),
+            "--otlp-endpoint" => cfg.otlp_endpoint = Some(take()),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),
             "--tick-secs" => {
