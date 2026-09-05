@@ -26,6 +26,27 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **OTLP distributed tracing — M3-Q5 now fully met** — `--otlp-endpoint <url>` exports spans as
+  OTLP/HTTP-JSON, so one sandbox create is **one trace**: `POST /v1/sandboxes` → `schedule` →
+  `relay.create` → `node.create` on the chosen node → `rootfs.copy` / `vmm.api_ready` /
+  `snapshot.load` / `vm.resume`. W8 shipped metrics and a log sink, but those are one log line on
+  one machine; once the scheduler landed a create spans two machines and the segments fall on
+  either side of it, which is exactly what a trace is for.
+  - **Hand-written**, because the official OTel Rust SDK pulls in tokio and this project has been
+    fully synchronous since M1 (ADR-3/D2's async isolation zone). OTLP's HTTP/JSON encoding is a
+    first-class part of the spec — the Collector's default 4318 port speaks it — and writing it
+    needs only ureq and serde_json, both already in the tree. **No new crates.**
+  - W3C `traceparent` is accepted on `/v1` requests, so a caller's trace continues through to the
+    guest coming up; a malformed one is ignored and a fresh trace started, because half an id
+    stitched in produces a chain that never lines up — worse than no trace at all.
+  - The four create segments are **timestamps derived from measured durations** (`CreateOutcome`
+    only records durations), laid out in the order the restore path actually runs them. Each such
+    span carries `sandlocker.segment_from_duration=true`.
+  - Export is best-effort behind a bounded queue and a single background thread, and drops are
+    **visible**: `sandlocker_otlp_spans_dropped_total` on `/metrics`. Telemetry must not take
+    sandboxes down, but a silent drop would let someone read "a segment is missing" as "that step
+    did not happen".
+  - Off unless `--otlp-endpoint` is set; with it unset `Span::start` costs one atomic load.
 - **Multi-node placement — the scheduler (M3-Q10)** — `POST /v1/sandboxes` now surveys the live
   nodes and places the sandbox on one that fits, relaying the create over the same reverse tunnel
   when that is not the receiving replica. Until now W4's "multi-node scheduling" was only

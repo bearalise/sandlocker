@@ -133,6 +133,14 @@ impl Metrics {
         counter(&mut o, "sandlocker_exec_total", "exec 累计", self.exec_total.load(Ordering::Relaxed));
         counter(&mut o, "sandlocker_api_requests_total", "API 请求累计", self.api_total.load(Ordering::Relaxed));
         counter(&mut o, "sandlocker_api_errors_total", "API 错误（>=400）累计", self.api_errors.load(Ordering::Relaxed));
+        // 追踪导出丢弃计数（队列满 / Collector 不可达）。**丢了要能看见**——否则 trace 缺一段
+        // 会被当成"那一步没发生"，比没有追踪更误导。未启用追踪时恒 0。
+        counter(
+            &mut o,
+            "sandlocker_otlp_spans_dropped_total",
+            "OTLP span 丢弃累计（队列满或导出失败）",
+            crate::trace::dropped(),
+        );
         let cur = self.current.load(Ordering::Relaxed).max(0);
         o.push_str("# HELP sandlocker_sandboxes_current 当前存活沙箱数\n# TYPE sandlocker_sandboxes_current gauge\n");
         o.push_str(&format!("sandlocker_sandboxes_current {cur}\n"));

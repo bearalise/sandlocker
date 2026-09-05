@@ -30,6 +30,8 @@ Grafana 策展看板，**零自建前端**——骑在守护自带的可观测�
 - `sandlocker_exec_total`、`sandlocker_api_requests_total` / `_api_errors_total`
 - `sandlocker_create_latency_ms`（histogram，分位由 `histogram_quantile()` 端算）
 - `sandlocker_exec_latency_ms`（histogram）
+- `sandlocker_otlp_spans_dropped_total`（追踪导出丢弃累计——非 0 说明 trace 有缺口，
+  别把"缺了一段"读成"那一步没发生"）
 - `sandlocker_build_info{node="addr#pid",version="..."}`（恒为 1 的 gauge，信息在标签上）——
   集群部署里用它按节点拆分；`scripts/bench/bench-cluster.sh` 也靠它问出各副本的身份
   （守护常绑 `0.0.0.0` 或藏在 LB 后面，URL 里的主机名与 node_id 对不上）

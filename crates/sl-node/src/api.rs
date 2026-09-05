@@ -191,6 +191,12 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
     if let Some(sink) = &cfg.log_sink {
         println!("[sandlocker] 结构化日志转发已开启：sink={sink}");
     }
+    // M3 W8 余项（M3-Q5）：OTLP/HTTP 分布式追踪导出（--otlp-endpoint）。node_id 进资源属性，
+    // Collector 侧据此分辨这一段发生在哪台机器上——跨节点创建的两半就是靠它拼起来的。
+    crate::trace::init(cfg.otlp_endpoint.clone(), &node_id);
+    if let Some(ep) = &cfg.otlp_endpoint {
+        println!("[sandlocker] 分布式追踪已开启：OTLP/HTTP → {ep}");
+    }
 
     // M3 W2/W4（M3-Q2）：leader 选举门控。
     //   - 单机 SQLite（无 --etcd）：ADR-17「单机无选主」→ 恒 leader（零回归）。
@@ -374,7 +380,7 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
                 let mut ch = ch;
                 // 网关已验签并下发 ticket；这里读它复刻的 HTTP 请求，走**与进程内网关同一段**分发。
                 match read_request(&mut ch) {
-                    Ok((method, path, _k, body)) => {
+                    Ok((method, path, _k, _tp, body)) => {
                         if let Err(e) = serve_gw_ticket(&mut ch, &ticket, &method, &path, &body, &sh, &ex, troot) {
                             eprintln!("[sandlocker][gw-agent] 服务 {} 失败: {e}", ticket.sid);
                         }
@@ -411,6 +417,15 @@ pub fn serve(cfg: &Config) -> Result<(), String> {
 
 /// 读一个请求：解析请求行 `(method, path)` + 按 `Content-Length` 精确读 body。
 /// 从 header 段取 API Key：优先 `Authorization: Bearer <t>`，其次 `X-API-Key: <t>`。
+/// 取一个请求头的值（大小写不敏感）。
+fn extract_header(head: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    text.split("\r\n").find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
 fn extract_api_key(head: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(head);
     for line in text.split("\r\n") {
@@ -429,9 +444,13 @@ fn extract_api_key(head: &[u8]) -> Option<String> {
     None
 }
 
+/// 返回 `(method, path, api_key, traceparent, body)`。
+///
+/// `traceparent` 是 W3C 追踪上下文头（M3-Q5）：给了就**接着调用方那条 trace** 往下画，
+/// 于是"用户点一次按钮"到"guest 起来了"是同一条链路；没给就自成一条新 trace。
 pub(crate) fn read_request<S: Read>(
     stream: &mut S,
-) -> Result<(String, String, Option<String>, Vec<u8>), String> {
+) -> Result<(String, String, Option<String>, Option<String>, Vec<u8>), String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let head_end = loop {
@@ -450,6 +469,7 @@ pub(crate) fn read_request<S: Read>(
     let head = &buf[..head_end];
     let (method, path) = parse_request_line(head)?;
     let api_key = extract_api_key(head);
+    let traceparent = extract_header(head, "traceparent");
     let want = head_end + 4 + content_length(head);
     while buf.len() < want {
         let n = stream.read(&mut chunk).map_err(|e| format!("读请求体失败: {e}"))?;
@@ -459,7 +479,7 @@ pub(crate) fn read_request<S: Read>(
         buf.extend_from_slice(&chunk[..n]);
     }
     let body = buf[head_end + 4..].to_vec();
-    Ok((method, path, api_key, body))
+    Ok((method, path, api_key, traceparent, body))
 }
 
 fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
@@ -726,23 +746,11 @@ fn forward_via_gw<S: Read + Write>(
     Ok(code)
 }
 
-/// 同上，但**缓冲**响应并交回调用方，不直接回灌客户端。
+/// 中继实现。`client=Some` → 逐块回灌（流不被缓冲住）；`None` → **缓冲**整条响应回传。
 ///
-/// 创建走这条：副本拿到新沙箱 id 之后还要给它打项目归属键（`sandbox/<id>/project`），
+/// 创建走缓冲那条：副本拿到新沙箱 id 之后还要给它打项目归属键（`sandbox/<id>/project`），
 /// 所以响应必须先读到手。响应是一小段 JSON，缓冲无妨——真正不能缓冲的是 exec 流那种
-/// 未定长的增量响应，那条仍走上面的流式路径。
-fn forward_via_gw_buffered(
-    rt: &Remote,
-    gw: &Gateway,
-    sid: &str,
-    action: Action,
-    method: &str,
-    body: &[u8],
-) -> Result<(u16, Vec<u8>), String> {
-    relay_via_gw(None::<&mut TcpStream>, rt, gw, sid, action, 0, method, "", body)
-}
-
-/// 中继实现。`client=Some` → 逐块回灌（流不被缓冲住）；`None` → 缓冲整条响应回传。
+/// 未定长的增量响应。
 #[allow(clippy::too_many_arguments)]
 fn relay_via_gw<S: Read + Write>(
     mut client: Option<&mut S>,
@@ -835,6 +843,7 @@ fn split_http_body(raw: &[u8]) -> &[u8] {
 ///
 /// 盘点失败、没有节点放得下、或选中自己，都退回本地：调度是**优化**，不该成为创建的新故障源。
 /// 唯一的例外是配额——那是**拒绝**语义，必须在建 VM 之前判，且判在本副本（它才知道调用者的项目）。
+#[allow(clippy::too_many_arguments)]
 fn schedule_create<S: Read + Write>(
     stream: &mut S,
     shared: &Shared,
@@ -843,7 +852,8 @@ fn schedule_create<S: Read + Write>(
     auth: &SharedAuth,
     body: &[u8],
     project: Option<&str>,
-) -> Option<Result<(), String>> {
+    parent: &crate::trace::SpanCtx,
+) -> Option<(u16, Result<(), String>)> {
     let json = "application/json";
     if rt.gw_url.is_none() {
         return None; // 单机：无网关可转，零回归
@@ -853,36 +863,67 @@ fn schedule_create<S: Read + Write>(
     let vcpus = v.get("cpu").and_then(|x| x.as_u64()).unwrap_or(2);
     let mem = v.get("mem").and_then(|x| x.as_u64()).unwrap_or(512);
 
+    // 放置本身是一个 span：候选几台、选了谁、为什么——查"为什么落在这台"时要的就是这个。
+    let mut sp = crate::trace::Span::start("schedule", crate::trace::SpanKind::Internal, Some(parent));
     let (nodes, self_id) = {
         let o = shared.lock().unwrap();
-        (o.survey_nodes().ok()?, rt.node_id.clone())
+        match o.survey_nodes() {
+            Ok(n) => (n, rt.node_id.clone()),
+            Err(e) => {
+                sp.end(Some(&format!("盘点失败: {e}")));
+                return None;
+            }
+        }
     };
-    let target = crate::sched::place(&nodes, vcpus, mem, &self_id, rt.sched)?;
+    sp.attr("sandlocker.candidates", nodes.len());
+    let target = match crate::sched::place(&nodes, vcpus, mem, &self_id, rt.sched) {
+        Some(t) => t,
+        None => {
+            sp.attr("sandlocker.placement", "none-fit");
+            sp.end(None);
+            return None;
+        }
+    };
+    sp.attr("sandlocker.target", &target);
     if target == self_id {
+        sp.attr("sandlocker.placement", "local");
+        sp.end(None);
         return None; // 就该在本节点建
     }
+    sp.attr("sandlocker.placement", "remote");
+    sp.end(None);
 
     // 配额前置检查（FR-7.2）留在本副本：目标节点收到的是一张不带项目信息的创建票
     // （见下），它无从判「这个项目还剩多少额度」。ADR-25 要求 create 在建 VM 之前判。
     if let Some(p) = project {
         if let Err(e) = crate::quota::check(auth.store.as_ref(), p, vcpus, mem, 0) {
             let code = quota_status(&e);
-            return Some(write_response(stream, code, json, &err_json(&e)).map(|_| {
-                crate::metrics::metrics().record_api(code);
-            }));
+            crate::metrics::metrics().record_api(code);
+            return Some((code, write_response(stream, code, json, &err_json(&e))));
         }
     }
 
     // 转给目标节点。票的 sid 装 `node:<id>`——目标在签名内，改不了（见 gateway::NODE_TARGET_PREFIX）。
+    //
+    // **追踪上下文随查询串过去**（`&tp=<traceparent>`）：这一跳是本项目自己的中继，`p=` 早就
+    // 这么走了；用查询串而不是 HTTP 头，是为了让节点侧从既有的 `parse_query(path)` 就能拿到，
+    // 不必给 `serve_gw_ticket` 再加一个参数。trace 上下文不承载权限，未签名无碍——最坏的
+    // 后果是链路对不上，不是越权。
+    let mut relay = crate::trace::Span::start("relay.create", crate::trace::SpanKind::Client, Some(parent));
+    relay.attr("sandlocker.target", &target);
+    let tp = format!("&tp={}", relay.ctx().to_traceparent());
     let sid = format!("{}{target}", crate::gateway::NODE_TARGET_PREFIX);
-    let (code, raw) = match forward_via_gw_buffered(rt, gw, &sid, Action::Create, "POST", body) {
+    let (code, raw) = match relay_via_gw(None::<&mut TcpStream>, rt, gw, &sid, Action::Create, 0, "POST", &tp, body) {
         Ok(v) => v,
         Err(e) => {
             // 转发失败不静默退回本地：本地建会绕过刚做出的放置决策，把实例又堆回这台。
             eprintln!("[sandlocker] 调度到 {target} 失败: {e}");
-            return Some(write_response(stream, 502, json, &err_json(&format!("调度到节点 {target} 失败: {e}"))));
+            relay.end(Some(&e));
+            return Some((502, write_response(stream, 502, json, &err_json(&format!("调度到节点 {target} 失败: {e}")))));
         }
     };
+    relay.attr("http.response.status_code", code);
+    relay.end(if code >= 400 { Some("远端创建失败") } else { None });
     crate::metrics::metrics().record_api(code);
     let resp = split_http_body(&raw).to_vec();
 
@@ -894,7 +935,7 @@ fn schedule_create<S: Read + Write>(
             let _ = shared.lock().unwrap().tag_project(&id, p);
         }
     }
-    Some(write_response(stream, code, json, &resp))
+    Some((code, write_response(stream, code, json, &resp)))
 }
 
 /// M3 W7 审计（FR-7.3）：鉴权模式下记录变更操作（append-only）。审计失败不阻断响应。
@@ -926,7 +967,7 @@ fn handle_conn(
     rt: &SharedRemote,
 ) -> Result<(), String> {
     let json = "application/json";
-    let (method, path, api_key, body) = read_request(&mut stream)?;
+    let (method, path, api_key, traceparent, body) = read_request(&mut stream)?;
     // 流式 exec：需劫持本连接（NDJSON 边收边发、无 Content-Length），不进 dispatch/write_response 一次性路径。
     if let Some(id) = parse_exec_stream(&method, &path) {
         // exec stream = 对沙箱的 Write 操作，同样过鉴权 + 跨项目门控。
@@ -955,34 +996,102 @@ fn handle_conn(
             Err((code, b)) => return write_response(&mut stream, code, json, &b),
         },
     };
+    // M3-Q5 全链路 trace 的**根**：一个请求一个 SERVER span。带了 traceparent 就接着调用方
+    // 那条 trace 画（于是"用户点一次按钮"到"guest 起来了"是同一条链路），没带就自成一条。
+    // 未配 --otlp-endpoint 时这里只有一次原子读（零回归）。
+    let mut root = crate::trace::Span::start(
+        &format!("{method} {}", route_name(&route)),
+        crate::trace::SpanKind::Server,
+        traceparent.as_deref().and_then(crate::trace::SpanCtx::from_traceparent).as_ref(),
+    );
+    root.attr("http.request.method", &method).attr("url.path", path.split('?').next().unwrap_or(""));
+    if let Some(id) = route.sandbox_id() {
+        root.attr("sandlocker.sandbox_id", id);
+    }
+    if let Some(p) = project.as_deref() {
+        root.attr("sandlocker.project", p);
+    }
+    root.attr("sandlocker.node", &rt.node_id);
     // 创建请求：先**选一个节点**（M3 调度器）。选中别人就把创建整个转过去。
     // 这一步之前，沙箱恒落在收到请求的副本上——三副本前挂个轮询 LB 看着像均衡，
     // 直接打某一台就全堆在那一台。见 sched.rs 模块头。
     if matches!(route, Route::CreateSandbox) {
-        match schedule_create(&mut stream, shared, rt, gw, auth, &body, project.as_deref()) {
-            Some(r) => return r,
+        match schedule_create(&mut stream, shared, rt, gw, auth, &body, project.as_deref(), root.ctx()) {
+            Some((code, r)) => {
+                record_audit(auth, &route, project.as_deref(), code);
+                end_root(root, code);
+                return r;
+            }
             None => {} // 选中本节点 / 未启用调度 / 盘点失败 → 走本地路径（下面的 dispatch）
         }
     }
     // 沙箱不在本节点 → 经独立网关中继到 owning 节点（数据面 M3 W5 余项，控制面 M3 W4 余项）。
     if let (Some((action, m, port, extra)), Some(id)) = (forwardable_route(&route), route.sandbox_id()) {
         if remote_owner(shared, rt, id).is_some() {
+            // 中继这一跳自己是一个 CLIENT span，并把上下文带过去（`&tp=`）——目标节点上
+            // 接得住的（目前是 fork）会接着画，接不住的至少也被这一跳的耗时覆盖住。
+            let mut relay =
+                crate::trace::Span::start("relay", crate::trace::SpanKind::Client, Some(root.ctx()));
+            relay.attr("sandlocker.action", action.as_str());
+            let extra = format!("{extra}&tp={}", relay.ctx().to_traceparent());
             let code = forward_via_gw(&mut stream, rt, gw, id, action, port, m, &extra, &body)?;
+            relay.attr("http.response.status_code", code);
+            relay.end(if code >= 400 { Some("远端失败") } else { None });
             crate::metrics::metrics().record_api(code);
             // 响应已由 forward_via_gw 逐块回灌，这里只补审计。**此前转发路径直接 return，
             // 于是跨节点的 exec/put_file 一条审计都不落**——FR-7.3 要求变更操作条条在册，
             // 而"在不在本节点"不该改变这一点。
             record_audit(auth, &route, project.as_deref(), code);
+            end_root(root, code);
             return Ok(());
         }
     }
-    let (code, ctype, resp) = dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref());
+    let (code, ctype, resp) =
+        dispatch(&method, &path, &body, shared, template_root, gw, exposes, project.as_deref(), root.ctx());
     // M3 W8 可观测：记 API 请求量/错误（/metrics 抓取本身不计入，避免自噪声）。
     if !matches!(route, Route::Metrics) {
         crate::metrics::metrics().record_api(code);
     }
     record_audit(auth, &route, project.as_deref(), code);
+    end_root(root, code);
     write_response(&mut stream, code, ctype, &resp)
+}
+
+/// 收尾根 span：把状态码记上，>=400 记 ERROR。
+///
+/// handle_conn 有好几个出口，每个都得收尾——**漏掉一个的后果不是少一条 span，而是那条
+/// trace 永远"未完成"**，在 Collector 里表现为一段悬着的链路。
+fn end_root(mut root: crate::trace::Span, code: u16) {
+    root.attr("http.response.status_code", code);
+    let err = if code >= 400 { Some(format!("HTTP {code}")) } else { None };
+    root.end(err.as_deref());
+}
+
+/// 路由的稳定名字（span 名不能带沙箱 id，否则每个沙箱一个 span 名，基数爆炸）。
+fn route_name(r: &Route) -> &'static str {
+    match r {
+        Route::CreateSandbox => "/v1/sandboxes",
+        Route::ListSandboxes => "/v1/sandboxes",
+        Route::GetSandbox(_) => "/v1/sandboxes/{id}",
+        Route::DeleteSandbox(_) => "/v1/sandboxes/{id}",
+        Route::Keepalive(_) => "/v1/sandboxes/{id}/keepalive",
+        Route::Pause(_) => "/v1/sandboxes/{id}/pause",
+        Route::Resume(_) => "/v1/sandboxes/{id}/resume",
+        Route::Fork(_) => "/v1/sandboxes/{id}/fork",
+        Route::Ticket(_) => "/v1/sandboxes/{id}/ticket",
+        Route::Expose(_) => "/v1/sandboxes/{id}/expose",
+        Route::Unexpose(_, _) => "/v1/sandboxes/{id}/expose/{port}",
+        Route::ListExposes(_) => "/v1/sandboxes/{id}/exposes",
+        Route::Exec(_) => "/v1/sandboxes/{id}/exec",
+        Route::PutFile(_, _) | Route::GetFile(_, _) => "/v1/sandboxes/{id}/files/{path}",
+        Route::Logs(_) => "/v1/sandboxes/{id}/logs",
+        Route::ListTemplates => "/v1/templates",
+        Route::BuildTemplate => "/v1/templates:build",
+        Route::ListBackends => "/v1/backends",
+        Route::AuditLog => "/v1/audit",
+        Route::Metrics => "/metrics",
+        Route::NotFound => "unknown",
+    }
 }
 
 /// 错误 → HTTP 状态：QUOTA_EXCEEDED→429、UNSUPPORTED_BY_BACKEND→409、其余→400。
@@ -996,6 +1105,7 @@ fn quota_status(e: &str) -> u16 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     method: &str,
     path: &str,
@@ -1005,6 +1115,7 @@ fn dispatch(
     gw: &SharedGw,
     exposes: &Exposes,
     project: Option<&str>,
+    parent: &crate::trace::SpanCtx,
 ) -> (u16, &'static str, Vec<u8>) {
     let route = parse_route(method, path);
     let json = "application/json";
@@ -1013,7 +1124,7 @@ fn dispatch(
             Ok(v) => (200, json, v),
             Err(e) => (400, json, err_json(&e)),
         },
-        Route::CreateSandbox => match create_sandbox(body, shared, template_root, project) {
+        Route::CreateSandbox => match create_sandbox(body, shared, template_root, project, parent) {
             Ok(v) => (201, json, v),
             Err(e) => (quota_status(&e), json, err_json(&e)),
         },
@@ -1074,7 +1185,7 @@ fn dispatch(
                 Err(e) => (404, json, err_json(&e)),
             }
         }
-        Route::Fork(id) => match fork_sandbox(&id, body, shared, project) {
+        Route::Fork(id) => match fork_sandbox(&id, body, shared, project, parent) {
             Ok(v) => (201, json, v),
             Err(e) => (quota_status(&e), json, err_json(&e)),
         },
@@ -1145,7 +1256,13 @@ fn resolve_template(orch: &Orch, template_root: &Path, name: &str) -> Result<Pat
     Ok(dir)
 }
 
-fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path, project: Option<&str>) -> Result<Vec<u8>, String> {
+fn create_sandbox(
+    body: &[u8],
+    shared: &Shared,
+    template_root: &Path,
+    project: Option<&str>,
+    parent: &crate::trace::SpanCtx,
+) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("请求体非 JSON: {e}"))?;
     let name = v.get("template").and_then(|x| x.as_str()).ok_or("缺 template 字段")?;
     let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
@@ -1189,12 +1306,50 @@ fn create_sandbox(body: &[u8], shared: &Shared, template_root: &Path, project: O
         network,
     };
 
+    // 真正建 VM 的这一段：`node.create` span，其下再按 CreateOutcome 的分段铺开
+    // copy/api-ready/load/resume——M3-Q5 判据里「API→调度→节点→boot→ready」的后半段。
+    let mut node_span = crate::trace::Span::start("node.create", crate::trace::SpanKind::Internal, Some(parent));
+    node_span.attr("sandlocker.template", name).attr("sandlocker.vcpus", cpu).attr("sandlocker.mem_mib", mem);
+    let span_start = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
     // 建走恢复（~130ms），全程持锁——单机 MVP 串行（如实标注）。
     let mut o = shared.lock().unwrap();
     // M3 W7 配额（FR-7.2）：create 前置检查——投影用量超项目限额即 QUOTA_EXCEEDED（先于建 VM）。
-    o.check_quota(project, spec.vcpus, spec.mem_mib)?;
-    let dir = resolve_template(&o, template_root, name)?;
-    let out = o.create_in(&dir, &spec)?;
+    if let Err(e) = o.check_quota(project, spec.vcpus, spec.mem_mib) {
+        node_span.end(Some(&e));
+        return Err(e);
+    }
+    let dir = match resolve_template(&o, template_root, name) {
+        Ok(d) => d,
+        Err(e) => {
+            node_span.end(Some(&e));
+            return Err(e);
+        }
+    };
+    let out = match o.create_in(&dir, &spec) {
+        Ok(v) => v,
+        Err(e) => {
+            node_span.end(Some(&e));
+            return Err(e);
+        }
+    };
+    // 分段是**量出来的时长**，没有各自的起止时刻，按恢复路径的真实顺序铺开（见 Span::child_segment）。
+    {
+        let c = node_span.ctx().clone();
+        let mut at = span_start;
+        at = crate::trace::Span::child_segment(&c, "rootfs.copy", at, out.copy_ms);
+        at = crate::trace::Span::child_segment(&c, "vmm.api_ready", at, out.api_ready_ms);
+        at = crate::trace::Span::child_segment(&c, "snapshot.load", at, out.load_ms);
+        let _ = crate::trace::Span::child_segment(&c, "vm.resume", at, out.resume_ms);
+    }
+    node_span
+        .attr("sandlocker.sandbox_id", &out.id)
+        .attr("sandlocker.pool_hit", out.pool_hit || out.hot_hit)
+        .attr("sandlocker.total_ms", out.total_ms);
+    node_span.end(None);
     // M3 W8 可观测：创建延迟 + 池命中入指标；结构化事件转发 sink（带分段时序=创建链路 span 分解）。
     crate::metrics::metrics().record_create(out.total_ms, out.pool_hit || out.hot_hit);
     crate::logsink::emit(format!(
@@ -1307,7 +1462,7 @@ fn handle_gw_conn(
     template_root: &Path,
 ) -> Result<(), String> {
     // 网关连接靠 ticket 验签授权（非 API Key），忽略 header 里的 api_key。
-    let (method, path, _api_key, body) = read_request(&mut stream)?;
+    let (method, path, _api_key, _tp, body) = read_request(&mut stream)?;
     let q = parse_query(&path);
     let ticket = match gw.verify(&q, now_unix()) {
         Ok(t) => t,
@@ -1411,7 +1566,12 @@ pub(crate) fn serve_gw_ticket<S: Read + Write>(
         }
         ("/gw/fork", Action::Fork) => {
             let project = shared.lock().unwrap().sandbox_project(&ticket.sid).unwrap_or(None);
-            match fork_sandbox(&ticket.sid, body, shared, project.as_deref()) {
+            // 同 /gw/create：接回发起副本那条 trace（跨节点 fork 也该是一条链路）。
+            let ctx = q
+                .get("tp")
+                .and_then(|t| crate::trace::SpanCtx::from_traceparent(t))
+                .unwrap_or_else(crate::trace::SpanCtx::root);
+            match fork_sandbox(&ticket.sid, body, shared, project.as_deref(), &ctx) {
                 Ok(v) => write_response(stream, 201, json, &v),
                 Err(e) => write_response(stream, quota_status(&e), json, &err_json(&e)),
             }
@@ -1481,26 +1641,54 @@ pub(crate) fn serve_gw_ticket<S: Read + Write>(
         // **project 传 None，不是漏了**：调用者的项目只有收到 API 请求的那个副本知道，
         // 而把它塞进转发体就等于采信一个未签名字段。所以配额前置检查与项目归属键
         // 都留在发起副本那边（见 `schedule_create`），这里只管把 VM 建出来。
-        ("/gw/create", Action::Create) => match create_sandbox(body, shared, template_root, None) {
-            Ok(v) => write_response(stream, 201, json, &v),
-            Err(e) => write_response(stream, quota_status(&e), json, &err_json(&e)),
-        },
+        ("/gw/create", Action::Create) => {
+            // 追踪上下文随查询串过来（`tp=`，见 schedule_create）——**接着发起副本那条 trace 画**，
+            // 于是"API 在副本 X、VM 建在节点 Y"的一次创建在 Collector 里是一条完整链路，
+            // 而不是两台机器上各一条对不上的记录。没带就自成一条。
+            let ctx = q
+                .get("tp")
+                .and_then(|t| crate::trace::SpanCtx::from_traceparent(t))
+                .unwrap_or_else(crate::trace::SpanCtx::root);
+            match create_sandbox(body, shared, template_root, None, &ctx) {
+                Ok(v) => write_response(stream, 201, json, &v),
+                Err(e) => write_response(stream, quota_status(&e), json, &err_json(&e)),
+            }
+        }
         _ => write_response(stream, 403, json, &err_json("ticket 动作与路径不符")),
     }
 }
 
 /// fork（M2-Q5）：从（已 pause 的）父沙箱派生新实例，reinit 得独立身份。ttl/idle 可选（缺省 300）；
 /// 后端继承父（经 orch 内部路由），无需 template。返回新 sandbox JSON（含 forked_from）。
-fn fork_sandbox(id: &str, body: &[u8], shared: &Shared, project: Option<&str>) -> Result<Vec<u8>, String> {
+fn fork_sandbox(
+    id: &str,
+    body: &[u8],
+    shared: &Shared,
+    project: Option<&str>,
+    parent: &crate::trace::SpanCtx,
+) -> Result<Vec<u8>, String> {
     let v: serde_json::Value = serde_json::from_slice(if body.is_empty() { b"{}" } else { body })
         .map_err(|e| format!("请求体非 JSON: {e}"))?;
     let ttl = v.get("ttl").and_then(|x| x.as_i64()).unwrap_or(300);
     let idle = v.get("idle").and_then(|x| x.as_i64()).unwrap_or(ttl);
     let spec = SandboxSpec { ttl_secs: ttl, idle_secs: idle, ..Default::default() };
+    let mut node_span = crate::trace::Span::start("node.fork", crate::trace::SpanKind::Internal, Some(parent));
+    node_span.attr("sandlocker.parent_sandbox_id", id);
     let mut o = shared.lock().unwrap();
     // M3 W7 配额（FR-7.2）：fork 前置检查（fork 也占并发/资源额度，ADR-25）。
-    o.check_quota(project, spec.vcpus, spec.mem_mib)?;
-    let out = o.fork(id, &spec)?;
+    if let Err(e) = o.check_quota(project, spec.vcpus, spec.mem_mib) {
+        node_span.end(Some(&e));
+        return Err(e);
+    }
+    let out = match o.fork(id, &spec) {
+        Ok(v) => v,
+        Err(e) => {
+            node_span.end(Some(&e));
+            return Err(e);
+        }
+    };
+    node_span.attr("sandlocker.sandbox_id", &out.id).attr("sandlocker.total_ms", out.total_ms);
+    node_span.end(None);
     crate::metrics::metrics().record_create(out.total_ms, out.pool_hit || out.hot_hit);
     // 子沙箱继承父项目归属（配额累计 + 跨项目隔离）。
     if let Some(p) = project {
