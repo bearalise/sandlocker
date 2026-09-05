@@ -207,19 +207,24 @@ if [ -n "$CLUSTER_MODE" ]; then
     row "三副本视图一致" "$([ "$_vc" = "true" ] && echo 1)" 1 ge ""
     _av="$(sfield cluster_failover api_available)"
     row "幸存副本仍可服务" "$([ "$_av" = "true" ] && echo 1)" 1 ge ""
+    # 跨节点**放置**（M3-Q10 判据里「跨节点创建/调度」的调度那一半）。
+    # 基准把创建**全部打给同一个副本**：没有调度器时它们会全落在那一个副本上（=1），
+    # 有调度器则应铺开。所以这一行才是「调度成立」的证据，而不是"另外两个副本看得见"。
+    row "跨节点放置（落在几个节点）" "$(field cluster_topology distinct_owners)" 2 ge "个"
   else
     printf '%-34s %10s %10s   %s\n' "跨节点恢复 P50" "$(field cluster_xnode xnode_resume_p50_ms)ms" "${RESTORE_P50_MS}ms" "**不认**（非 multi-host）"
     printf '%-34s %10s %10s   %s\n' "节点失联回收（派生预算）" "$(field cluster_reclaim observed_s)s" "$(field cluster_reclaim budget_s)s" "**不认**（非 multi-host）"
     if [ "$STRICT" = "1" ]; then FAIL=$((FAIL+2)); else SKIP=$((SKIP+2)); fi
   fi
 
-  # 归属是**调度出来的**还是**谁收到请求就落谁身上**。M3-Q10 判据写的是「跨节点创建/**调度**」，
-  # 而创建路径从不查存活节点集，`Orch::register` 直接写本副本的 node_id。这一行必须显示，
-  # 否则一张全 PASS 的表会被读成「调度成立」，而证据只到「另外两个副本看得见」。
+  # placement 是对上面那一行的人话解释。caller-local 只有两种可能：调度器没起作用，
+  # 或者集群小到所有创建都合理地落在了本节点——两种都不能算「跨节点调度」已验证。
   _pl="$(sfield cluster_topology placement)"
+  _cn="$(field cluster_topology created)"
   if [ "$_pl" = "caller-local" ]; then
-    printf '%s\n' "注：placement=caller-local —— 沙箱恒落在**收到创建请求的那个副本**上；"
-    printf '%s\n' "    尚无按存活节点集选放置的调度器。M3-Q10 的「跨节点调度」这一半未实现。"
+    printf '%s\n' "注：placement=caller-local —— ${_cn:-?} 个沙箱**全落在收到创建请求的那个副本**上。"
+    printf '%s\n' "    要么调度器没生效（未配 --gw-url？盘点不到节点容量？），要么样本太少。"
+    printf '%s\n' "    「跨节点调度」这一半在这份数据里**没有得到验证**。"
   fi
   _ro="$(field cluster_xnode relay_overhead_p50_ms)"
   [ -n "$_ro" ] && printf '%s\n' "备查：跨节点中继开销 P50 = ${_ro}ms（跨节点 − 本地基线）"

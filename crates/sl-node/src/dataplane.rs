@@ -824,12 +824,17 @@ fn handle_client(
             return crate::api::write_response(&mut sock, 403, json, &crate::api::err_json(&format!("ticket 无效: {e}")))
         }
     };
-    // ② 查归属节点（etcd `sandbox/<sid>/node`）——网关自己不持任何沙箱状态，故无粘滞。
-    let owner = match owner_of(store, &ticket.sid)? {
-        Some(o) => o,
-        None => {
-            return crate::api::write_response(&mut sock, 404, json, &crate::api::err_json("未知沙箱或已回收"))
-        }
+    // ② 定目标节点。两种来源：
+    //    - **创建票**：还没有沙箱，目标节点直接写在签名过的 `sid` 里（`node:<id>`，调度器定的）。
+    //    - 其余票：查归属键 `sandbox/<sid>/node`——网关自己不持任何沙箱状态，故无粘滞。
+    let owner = match ticket.node_target() {
+        Some(n) => n.to_string(),
+        None => match owner_of(store, &ticket.sid)? {
+            Some(o) => o,
+            None => {
+                return crate::api::write_response(&mut sock, 404, json, &crate::api::err_json("未知沙箱或已回收"))
+            }
+        },
     };
     // ③ 借一条该节点的空闲外拨连接。
     let ch = match pool.take(&owner, take_wait) {

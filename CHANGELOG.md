@@ -26,6 +26,35 @@ review: `docs/design/M2出口评审.md`.
 ### Added
 
 #### M3 Beta (clustering + multi-tenancy)
+- **Multi-node placement — the scheduler (M3-Q10)** — `POST /v1/sandboxes` now surveys the live
+  nodes and places the sandbox on one that fits, relaying the create over the same reverse tunnel
+  when that is not the receiving replica. Until now W4's "multi-node scheduling" was only
+  cross-node *visibility*: `Orch::register` wrote its own node id and the create path never
+  consulted the live-node set, so a sandbox landed wherever the client happened to aim. Three
+  replicas behind a round-robin load balancer looked balanced; pointing at one replica piled
+  everything onto one machine.
+  - **Most free memory wins; vCPU is admission only.** The M3-Q9 bare-metal run settled this —
+    density always stopped on memory, never on CPU.
+  - **Accounted at configured memory, not measured usage.** A 512 MiB idle instance only faults in
+    about 19 MB, and accounting at that rate would fit an order of magnitude more — but PRD §8.1's
+    footnote says that lazy-fault gain is explicitly not an SLO commitment. Opt in with
+    `--sched-overcommit <n>` and own the OOM risk.
+  - Node capacity now rides on the heartbeat key. A node that reports no capacity is **excluded**
+    rather than treated as empty — unreadable capacity is not infinite capacity — so a rolling
+    upgrade just takes old nodes out of the running until they come back.
+  - The create ticket carries `node:<node_id>` in its **signed** `sid` field, since there is no
+    sandbox id yet to look an owner up by. A create ticket aimed at node A cannot be rewritten to
+    aim at node B.
+  - Quota pre-check and the project tag stay on the originating replica: only it knows the caller's
+    project, and putting the project in the relayed body would mean trusting an unsigned field.
+    `tag_project` now falls back to reading the lease off the sandbox's meta key, so the project key
+    on a remotely-created sandbox is still attached to the right lease and disappears with it.
+  - Placement gives way rather than failing: survey error, nothing fits, or self selected all fall
+    back to a local create. A relay *failure* does not — it returns 502, because building locally
+    would silently undo the placement decision that was just made.
+  - `bench-cluster.sh` now aims every create at one replica and records `distinct_owners`;
+    `slo-gate.sh` gates on it (≥2). One sandbox proves nothing — on a cold cluster the scheduler
+    correctly picks the local node.
 - **`bench-cluster` — the M3-Q10 (3-node cluster SLO) evidence harness** — `scripts/bench/bench-cluster.sh`
   measures four things in one run: topology + three-replica view consistency, cross-node lifecycle
   percentiles (pause/resume issued at a replica that does *not* own the sandbox, with the owning

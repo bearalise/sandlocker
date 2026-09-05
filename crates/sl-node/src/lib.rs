@@ -58,6 +58,9 @@ pub mod dataplane;
 mod snapcrypt;
 // M3 W10（ADR-16 / M3-Q7）：快照保留期 GC + 版本钉住（模板/内核/VMM 三元组 + 兼容矩阵）。
 mod retention;
+// M3 W4 余项补完（M3-Q10）：多节点**放置**。W4 只做了跨节点可见性，创建路径从不查存活
+// 节点集——沙箱落在哪全看客户端打给了谁。见模块头。
+mod sched;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -250,7 +253,8 @@ struct Config {
     /// 反向借用做跨节点 exec/logs/文件/端口/流式 exec。**节点仍零入站端口**。
     gw_node_endpoint: Option<String>,
     /// --gw-url <base>：网关**面向客户端**的基址（如 `http://gw:7879`）。控制面副本据此签发
-    /// 签名 URL，并在沙箱不在本节点时把 /v1 请求经网关转到 owning 节点。缺省则不做跨节点转发。
+    /// 签名 URL，并在沙箱不在本节点时把 /v1 请求经网关转到 owning 节点。缺省则不做跨节点转发，
+    /// **也不做跨节点放置**（调度器需要这条通道把创建转给选中的节点）。
     gw_url: Option<String>,
     /// --gw-pool <n>：节点维持的**空闲**外拨连接数（网关随时可借的余量，默认 8）。
     gw_pool: usize,
@@ -311,6 +315,13 @@ struct Config {
     /// 默认 SQLite 临时文件；--etcd 则真 etcd。随后退出。
     quota_reconcile: bool,
     retention_reconcile: bool,
+    sched_reconcile: bool,
+    /// --sched-overcommit <n>：放置时的内存/CPU 超售倍数（默认 1 = 不超售）。
+    ///
+    /// >1 表示部署方**主动选择**吃 Firecracker 惰性缺页那份收益（M3-Q9 实测：配置 512MiB 的
+    /// 空闲实例只落约 19MB 物理页）。PRD §8.1 脚注写明这份收益「不作为 SLO 承诺」——取决于
+    /// 同模板占比与脏页率——所以它只能是显式选项，不能是默认。开了就要自己担 OOM 的风险。
+    sched_overcommit: u32,
     /// --log-sink <url>：M3 W8 结构化日志转发 sink（Loki/ES/自建收集器）。--serve 时 create/destroy
     /// 生命周期事件以 JSON POST 转发。未设=不转发（零回归）。
     log_sink: Option<String>,
@@ -596,6 +607,18 @@ pub fn cli_main() {
             Ok(()) => println!("[retention] M3-Q7 retention-reconcile PASS"),
             Err(e) => {
                 eprintln!("[retention] M3-Q7 retention-reconcile FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --sched-reconcile：M3-Q10 放置对账（盘点 → 选点 → 落账 → 再盘点，负载反馈闭合）。
+    if cfg.sched_reconcile {
+        match run_sched_reconcile(&cfg) {
+            Ok(()) => println!("[sched] M3-Q10 sched-reconcile PASS"),
+            Err(e) => {
+                eprintln!("[sched] M3-Q10 sched-reconcile FAIL: {e}");
                 std::process::exit(1);
             }
         }
@@ -2492,6 +2515,8 @@ fn clone_paths(cfg: &Config) -> Config {
         max_storage: 0,
         quota_reconcile: false,
         retention_reconcile: false,
+        sched_reconcile: false,
+        sched_overcommit: 1,
         log_sink: None,
 }
 }
@@ -2787,6 +2812,131 @@ fn run_retention_reconcile(cfg: &Config) -> Result<(), String> {
     let _ = std::fs::remove_file(format!("{p}-shm"));
     r?;
     println!("[retention] SqliteStore(file) 保留期 GC + 版本兼容矩阵 + 存储配额 PASS");
+    Ok(())
+}
+
+/// M3-Q10 放置对账（M3 调度器）：**盘点 → 选点 → 落账 → 再盘点** 这个闭环在真 store 上成立。
+///
+/// 单测用手搓的 `NodeLoad` 验排序，验不到闭环——而闭环才是「调度器」与「随机挑一个」的区别：
+/// 上一次放置必须被下一次**看见**，否则实例照样会堆在同一台。这里在真 store（SQLite / 真 etcd）
+/// 上跑完整循环：写心跳键（带容量）→ place → 按结果写 meta + 归属键 → 重新 survey → 再 place。
+fn run_sched_reconcile(cfg: &Config) -> Result<(), String> {
+    use crate::sched::{place, survey, Capacity, Policy};
+    use sl_store::{SqliteStore, Store};
+
+    fn asserts(store: &dyn Store) -> Result<(), String> {
+        macro_rules! want {
+            ($c:expr, $m:expr) => {
+                if !$c {
+                    return Err($m.into());
+                }
+            };
+        }
+        for pfx in ["sandbox/", "node/"] {
+            for kv in store.list(pfx).map_err(|e| e.to_string())? {
+                let _ = store.delete(&kv.key);
+            }
+        }
+
+        // 三个等大的节点（8 vCPU / 8 GiB），外加一个**不自报容量**的老节点。
+        for id in ["sc-a", "sc-b", "sc-c"] {
+            let cap = Capacity { addr: id.into(), cpus: 8, mem_mib: 8192 };
+            sl_store::cluster::register_node(store, id, cap.to_json().as_bytes(), 3600)
+                .map_err(|e| e.to_string())?;
+        }
+        sl_store::cluster::register_node(store, "sc-legacy", br#"{"addr":"old"}"#, 3600)
+            .map_err(|e| e.to_string())?;
+
+        // ① 闭环：连放 6 个 2c/2048M 的沙箱，每次都从 store 重新盘点。
+        //    每台放得下 4 个（8192/2048），6 个应铺开而不是全堆在发起副本头上。
+        let (vcpus, mem) = (2u64, 2048u64);
+        let mut placed: Vec<String> = Vec::new();
+        for i in 0..6 {
+            let nodes = survey(store)?;
+            let target = place(&nodes, vcpus, mem, "sc-a", Policy::default())
+                .ok_or_else(|| format!("第 {i} 个沙箱无处可放（不该发生）"))?;
+            let sid = format!("sc-s{i}");
+            store
+                .put(&format!("sandbox/{sid}/meta"), format!(r#"{{"vcpus":{vcpus},"mem_mib":{mem}}}"#).as_bytes(), None)
+                .map_err(|e| e.to_string())?;
+            store
+                .put(&sl_store::cluster::sandbox_node_key(&sid), target.as_bytes(), None)
+                .map_err(|e| e.to_string())?;
+            placed.push(target);
+        }
+        let distinct: std::collections::HashSet<&String> = placed.iter().collect();
+        want!(
+            distinct.len() == 3,
+            format!("6 个沙箱应铺到 3 个节点上，实得 {:?}（闭环没闭上？）", placed)
+        );
+        // 均衡到每台 2 个：任一台超过 3 个就说明上一次放置没被下一次看见。
+        for id in ["sc-a", "sc-b", "sc-c"] {
+            let n = placed.iter().filter(|p| p.as_str() == id).count();
+            want!(n == 2, format!("{id} 应分到 2 个，实得 {n}（{placed:?}）"));
+        }
+
+        // ② 老节点（未自报容量）自始至终没被选中——读不到容量不等于容量无限。
+        want!(!placed.iter().any(|p| p == "sc-legacy"), "未自报容量的节点不该被选中");
+
+        // ③ 用量确实记在了正确的节点头上（survey 从真 store 读回来的账）。
+        let nodes = survey(store)?;
+        for id in ["sc-a", "sc-b", "sc-c"] {
+            let n = nodes.iter().find(|n| n.id == id).ok_or_else(|| format!("盘点里缺 {id}"))?;
+            want!(
+                n.sandboxes == 2 && n.used_mem_mib == 4096 && n.used_vcpus == 4,
+                format!("{id} 用量应为 2 台/4c/4096M，实得 {}/{}c/{}M", n.sandboxes, n.used_vcpus, n.used_mem_mib)
+            );
+        }
+
+        // ④ 放满即拒：再要一个 8 GiB 的，三台都放不下 → None（调用方据此退回本地或报错，
+        //    绝不能悄悄塞给一台其实满了的机器）。
+        want!(place(&nodes, 1, 8192, "sc-a", Policy::default()).is_none(), "放不下时应返回 None");
+        // 但显式超售就放得下——超售是部署方的选择，不是默认。
+        want!(place(&nodes, 1, 8192, "sc-a", Policy { overcommit: 2 }).is_some(), "超售后应放得下");
+
+        // ⑤ 节点失联 → 心跳键消失 → 立刻退出候选（无需任何额外通知）。
+        let _ = store.delete(&sl_store::cluster::node_key("sc-b"));
+        let nodes = survey(store)?;
+        want!(!nodes.iter().any(|n| n.id == "sc-b"), "失联节点应从盘点里消失");
+        want!(
+            place(&nodes, 2, 512, "sc-a", Policy::default()).as_deref() != Some("sc-b"),
+            "失联节点不该再被选中"
+        );
+
+        for pfx in ["sandbox/", "node/"] {
+            for kv in store.list(pfx).map_err(|e| e.to_string())? {
+                let _ = store.delete(&kv.key);
+            }
+        }
+        Ok(())
+    }
+
+    if let Some(ep) = &cfg.etcd {
+        #[cfg(feature = "cluster")]
+        {
+            let store = sl_store::etcd::EtcdStore::connect(ep).map_err(|e| e.to_string())?;
+            asserts(&store)?;
+            println!("[sched] EtcdStore({ep}) 盘点→选点→落账→再盘点闭环 + 容量准入 + 失联退出 PASS");
+            return Ok(());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            return Err(format!("--sched-reconcile --etcd {ep} 需以 `--features cluster` 构建"));
+        }
+    }
+
+    let path = std::env::temp_dir().join(format!("sl-sched-{}.db", std::process::id()));
+    let p = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&p);
+    let r = {
+        let store = SqliteStore::open(&p).map_err(|e| e.to_string())?;
+        asserts(&store)
+    };
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{p}{suffix}"));
+    }
+    r?;
+    println!("[sched] SqliteStore(file) 盘点→选点→落账→再盘点闭环 + 容量准入 + 失联退出 PASS");
     Ok(())
 }
 
@@ -3411,6 +3561,24 @@ fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
     let (c7, _, _) = http_get(&client_addr, &swapped)?;
     want!(c7 == 403, format!("pause 票改写成 destroy 应 403，实得 {c7}"));
 
+    // ⑪ **创建票直投节点**（M3 调度器）：创建时还没有沙箱，票的 sid 装 `node:<id>`，
+    //    网关据此直接路由，**不查归属键**。这里刻意用一个从未写过归属键的 id 来证明这点。
+    for want_node in ["dp-node-b", "dp-node-a"] {
+        let sid = format!("{}{want_node}", crate::gateway::NODE_TARGET_PREFIX);
+        let (code, body, _) = http_get(&client_addr, &rel(signer.mint(&sid, Action::Create, 0, 60, now)))?;
+        want!(code == 200, format!("创建票投 {want_node} 应 200，实得 {code}: {body}"));
+        want!(
+            body.contains(&format!("{want_node}:{sid}:create:0:")),
+            format!("创建票应直达 {want_node}（且不经归属键），实得: {body}")
+        );
+    }
+    // 目标节点未接入 → 503（与沙箱路径同样有界失败，不挂死、也不悄悄换一台建）。
+    let (c8, _, _) = http_get(
+        &client_addr,
+        &rel(signer.mint(&format!("{}dp-node-c", crate::gateway::NODE_TARGET_PREFIX), Action::Create, 0, 60, now)),
+    )?;
+    want!(c8 == 503, format!("创建票投未接入节点应 503，实得 {c8}"));
+
     // 收尾清理。
     for sid in ["dp-s1", "dp-s2", "dp-orphan"] {
         let _ = admin.delete(&sl_store::cluster::sandbox_node_key(sid));
@@ -3427,7 +3595,7 @@ fn run_gw_dataplane_reconcile(cfg: &Config) -> Result<(), String> {
     let transport = if secure { "mTLS" } else { "明文" };
     println!(
         "[gw-dataplane] {backend} / {transport}：按归属路由 + 无粘滞 + 一次性 + 篡改拒 + 未知 404 + \
-未接入 503 + 逐块全双工 + 控制面八动作按归属路由 + 动作不可替换{} PASS",
+未接入 503 + 逐块全双工 + 控制面八动作按归属路由 + 动作不可替换 + 创建票直投节点{} PASS",
         if secure { " + 明文连接被拒" } else { "" }
     );
     Ok(())
@@ -3862,6 +4030,8 @@ fn parse_args() -> Config {
         max_storage: 0,
         quota_reconcile: false,
         retention_reconcile: false,
+        sched_reconcile: false,
+        sched_overcommit: 1,
         log_sink: None,
 };
     let mut args = std::env::args().skip(1);
@@ -3956,6 +4126,13 @@ fn parse_args() -> Config {
             "--max-storage" => cfg.max_storage = take().parse().unwrap_or(0),
             "--quota-reconcile" => cfg.quota_reconcile = true,
             "--retention-reconcile" => cfg.retention_reconcile = true,
+            "--sched-reconcile" => cfg.sched_reconcile = true,
+            "--sched-overcommit" => {
+                cfg.sched_overcommit = take().parse().unwrap_or_else(|_| {
+                    eprintln!("--sched-overcommit 需正整数");
+                    std::process::exit(2);
+                })
+            }
             "--log-sink" => cfg.log_sink = Some(take()),
             "--serve" => cfg.serve = true,
             "--addr" => cfg.serve_addr = Some(take()),

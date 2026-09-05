@@ -337,15 +337,14 @@ SLO_STRICT=1 scripts/bench/slo-gate.sh build/bench/results.jsonl
 - `CLUSTER_KILL_SSH` **与 `CLUSTER_REPLICAS` 同序**，用于「杀掉沙箱归属节点」那一步
   （`pkill -9 -x sl-node`）。条目数对不上脚本会拒绝执行，免得杀错机器。不给的话失联回收
   那一行会记成未测，严格档即失败。
-- 分位样本量 `CLUSTER_N`（默认 10）。
+- 分位样本量 `CLUSTER_N`（默认 10）；放置样本量 `CLUSTER_PLACE_N`（默认 3，须 ≥ 节点数才看得出铺开）。
 
 ### 7.3 收工前确认这几点
 
 - `mode=multi-host`（不是 single-host——否则这趟白跑）
-- `placement`：目前必然是 `caller-local`。**沙箱恒落在收到创建请求的那个副本上，没有调度器**
-  （创建路径从不查存活节点集）。M3-Q10 判据里「跨节点创建/**调度**」的调度那一半尚未实现，
-  这一行会被 `slo-gate.sh` 显式打印出来——出口评审时要按这个如实讲，不能拿一张全 PASS 的表
-  当成「调度成立」。
+- `placement=scheduled` 且 `distinct_owners ≥ 2`。基准把创建**全部打给同一个副本**，所以
+  这一行才是「跨节点调度成立」的证据；若是 `caller-local`（全落在一个节点上），多半是漏配
+  `--gw-url`（没有它就没有放置）或节点没上报容量。`slo-gate.sh` 会把原因提示打出来。
 - `cluster_reclaim.observed_s` 不是 `-1`（`-1` = 观测窗内没等到回收）。
 - 顺手把 §7.4 的跨节点生命周期手测也跑一遍（脚本只覆盖 pause/resume，其余五个没覆盖）。
 
